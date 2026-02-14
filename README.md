@@ -2,7 +2,7 @@
 
 [![Hex.pm](https://img.shields.io/hexpm/v/x402.svg)](https://hex.pm/packages/x402)
 [![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/x402)
-[![CI](https://github.com/cardotrejos/x402/actions/workflows/ci.yml/badge.svg)](https://github.com/cardotrejos/x402/actions)
+[![CI](https://github.com/cardotrejos/x402/actions/workflows/ci.yml/badge.svg)](https://github.com/cardotrejos/x402/actions/workflows/ci.yml)
 [![Coverage](https://coveralls.io/repos/github/cardotrejos/x402/badge.svg?branch=main)](https://coveralls.io/github/cardotrejos/x402?branch=main)
 
 **The Elixir SDK for the [x402](https://x402.org) HTTP payment protocol.**

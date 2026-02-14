@@ -26,18 +26,24 @@ defmodule X402.MixProject do
       docs: docs(),
 
       # Testing
-      test_coverage: [tool: ExCoveralls],
-      preferred_cli_env: [
-        coveralls: :test,
-        "coveralls.detail": :test,
-        "coveralls.html": :test,
-        "coveralls.github": :test
-      ],
+      test_coverage: [tool: ExCoveralls, minimum_coverage: 90],
 
       # Dialyzer
       dialyzer: [
         plt_file: {:no_warn, "priv/plts/project.plt"},
         plt_add_apps: [:mix]
+      ]
+    ]
+  end
+
+  def cli do
+    [
+      preferred_envs: [
+        coveralls: :test,
+        "coveralls.detail": :test,
+        "coveralls.html": :test,
+        "coveralls.github": :test,
+        ci: :test
       ]
     ]
   end
@@ -141,7 +147,7 @@ defmodule X402.MixProject do
         "dialyzer"
       ],
       ci: [
-        "compile --warnings-as-errors --no-optional-deps",
+        "compile --warnings-as-errors",
         "format --check-formatted",
         "credo --strict",
         "test --cover"
