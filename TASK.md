@@ -1,37 +1,67 @@
-# Task: Build the Facilitator Client
+# Task: X402.Plug.PaymentGate
 
-Read CLAUDE.md for coding standards. This is an Elixir LIBRARY following Dashbit/Jose Valim conventions.
+Build a drop-in Plug middleware for x402 payment gating.
 
-## Modules to create:
+## Read First
+- CLAUDE.md — all coding standards
+- lib/x402/ — existing protocol types and facilitator client
+- mix.exs — deps and project config
 
-### 1. lib/x402/facilitator.ex — X402.Facilitator (GenServer)
-- start_link/1 with NimbleOptions validation for: :name, :url (default "https://x402.org/facilitator"), :finch (required), :max_retries (default 2), :retry_backoff_ms (default 100), :receive_timeout_ms (default 5000)
-- verify/2 and verify/3: verify payment payload against requirements via facilitator /verify
-- settle/2 and settle/3: settle payment via facilitator /settle  
-- child_spec/1 for supervision tree integration
-- Returns {:ok, %{status: integer, body: map}} or {:error, %X402.Facilitator.Error{}}
-- Emits telemetry events via :telemetry.span
+## Requirements
 
-### 2. lib/x402/facilitator/http.ex — X402.Facilitator.HTTP
-- Pure HTTP transport functions (no GenServer state)
-- request/5: makes the actual Finch HTTP request
-- Retry logic with exponential backoff for transient errors (408, 429, 500, 502, 503, 504)
-- Structured error types
+### X402.Plug.PaymentGate
+A Plug that:
+1. Accepts NimbleOptions config: `:facilitator` (facilitator pid/name), `:routes` (list of route configs)
+2. Each route config: `%{method: :get|:post|etc, path: "/api/resource", price: "0.01", network: "base-sepolia", asset: "USDC", receiver: "0x..."}`
+3. On matching request WITHOUT payment header → respond 402 with X402.PaymentRequired JSON
+4. On matching request WITH `x-payment` header → decode, verify via facilitator, settle on success
+5. On non-matching request → pass through (call next plug)
+6. Emit telemetry events: `[:x402, :plug, :pass_through]`, `[:x402, :plug, :payment_required]`, `[:x402, :plug, :payment_verified]`, `[:x402, :plug, :payment_rejected]`
 
-### 3. lib/x402/facilitator/error.ex — X402.Facilitator.Error
-- Defexception with fields: type, status, body, reason, retryable, attempt
-- Nice message/1 implementation
+### Route Matching
+- Support exact path match and glob patterns (e.g., "/api/*")
+- Method matching (or `:any` for all methods)
+- Path params should be normalized (strip trailing slash)
 
-## Tests (use Bypass to mock HTTP):
-- Successful verify and settle
-- HTTP errors (400, 401, 500)
-- Transient errors with retry
-- Timeout handling
-- Invalid JSON responses
+### Response Format
+402 response body (JSON):
+```json
+{
+  "x402Version": 1,
+  "accepts": [{
+    "scheme": "exact",
+    "network": "base-sepolia",
+    "maxAmountRequired": "0.01",
+    "resource": "/api/resource",
+    "description": "Payment required",
+    "mimeType": "application/json",
+    "payTo": "0x...",
+    "maxTimeoutSeconds": 60,
+    "extra": {}
+  }],
+  "error": ""
+}
+```
+
+### Tests (comprehensive)
+- Route matching (exact, glob, method filtering)
+- 402 response format correctness
+- Payment verification flow (mock facilitator)
+- Pass-through for non-gated routes
+- Invalid payment header handling
+- Telemetry event emission
 - NimbleOptions validation errors
 
-Test files: test/x402/facilitator_test.exs, test/x402/facilitator/http_test.exs
-Create test/support/test_helpers.ex with shared Bypass setup.
+### Quality Gates
+- mix compile --warnings-as-errors
+- mix compile --no-optional-deps --warnings-as-errors (Plug is optional!)
+- mix test — 0 failures
+- mix format --check-formatted
+- mix credo --strict — 0 issues
+- Every public function has @spec and @doc
+- Every module has @moduledoc
 
-Run mix test && mix compile --warnings-as-errors. Commit when passing.
-When finished, run: openclaw system event --text "Done: x402 facilitator client" --mode now
+### Dependencies
+Add `plug` as optional dependency in mix.exs if not already present.
+
+When done, run: openclaw system event --text "Done: x402 plug payment gate" --mode now
