@@ -242,6 +242,151 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
+  test "rejects empty x-payment header" do
+    facilitator = start_mock_facilitator()
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", "")
+
+    result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
+    body = Jason.decode!(result_conn.resp_body)
+
+    assert result_conn.status == 402
+    assert body["error"] == "invalid payment header"
+    refute_received {:verify_called, _payload, _requirements}
+  end
+
+  test "rejects when settlement fails" do
+    settle_failure = fn _payment_payload, _requirements -> {:error, :settlement_failed} end
+    facilitator = start_mock_facilitator(settle: settle_failure)
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_payment_header())
+
+    result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
+
+    assert result_conn.status == 402
+    body = Jason.decode!(result_conn.resp_body)
+    assert body["error"] == "payment verification failed"
+  end
+
+  test "rejects when verify returns non-200 status" do
+    facilitator =
+      start_mock_facilitator(verify: {:ok, %{status: 400, body: %{"error" => "invalid"}}})
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_payment_header())
+
+    result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
+
+    assert result_conn.status == 402
+    body = Jason.decode!(result_conn.resp_body)
+    assert body["error"] == "facilitator rejected payment"
+  end
+
+  test "rejects when settle returns non-200 status" do
+    facilitator =
+      start_mock_facilitator(settle: {:ok, %{status: 500, body: %{"error" => "failed"}}})
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_payment_header())
+
+    result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
+
+    assert result_conn.status == 402
+    body = Jason.decode!(result_conn.resp_body)
+    assert body["error"] == "facilitator rejected payment"
+  end
+
+  test "rejects payment with missing required fields" do
+    facilitator = start_mock_facilitator()
+
+    # Encode JSON with missing required fields (no transactionHash, no scheme)
+    header =
+      %{"network" => "base-sepolia"}
+      |> Jason.encode!()
+      |> Base.encode64()
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", header)
+
+    result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
+
+    assert result_conn.status == 402
+    body = Jason.decode!(result_conn.resp_body)
+    assert body["error"] == "invalid payment payload"
+    refute_received {:verify_called, _payload, _requirements}
+  end
+
+  test "rejection_error for invalid_json in payment header" do
+    facilitator = start_mock_facilitator()
+
+    # Valid base64 but not valid JSON
+    header = Base.encode64("not json at all")
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", header)
+
+    result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
+
+    assert result_conn.status == 402
+    body = Jason.decode!(result_conn.resp_body)
+    assert body["error"] == "invalid payment header"
+    refute_received {:verify_called, _payload, _requirements}
+  end
+
+  test "handles multiple routes with first match winning" do
+    route1 = Map.put(@route, :path, "/api/resource")
+    route2 = Map.put(@route, :path, "/api/*")
+
+    conn = conn(:get, "/api/resource")
+    result_conn = run_request(conn, routes: [route1, route2], facilitator: self())
+
+    assert result_conn.status == 402
+    body = Jason.decode!(result_conn.resp_body)
+    assert body["accepts"] |> List.first() |> Map.fetch!("resource") == "/api/resource"
+  end
+
+  test "normalize_method handles all HTTP methods" do
+    for {method_string, method_atom} <- [
+          {"DELETE", :delete},
+          {"HEAD", :head},
+          {"OPTIONS", :options},
+          {"PATCH", :patch},
+          {"PUT", :put},
+          {"TRACE", :trace}
+        ] do
+      route = Map.put(@route, :method, method_atom)
+
+      conn = Plug.Test.conn(method_string, "/api/resource")
+      result_conn = run_request(conn, routes: [route], facilitator: self())
+      assert result_conn.status == 402
+    end
+  end
+
+  test "normalize_path handles root path" do
+    route = Map.put(@route, :path, "/")
+
+    conn = conn(:get, "/")
+    result_conn = run_request(conn, routes: [route], facilitator: self())
+    assert result_conn.status == 402
+  end
+
+  test "unknown method normalizes to :any" do
+    route = Map.put(@route, :method, :any)
+
+    # Use a custom method (non-standard)
+    conn = Plug.Test.conn("PURGE", "/api/resource")
+    result_conn = run_request(conn, routes: [route], facilitator: self())
+    assert result_conn.status == 402
+  end
+
   defp run_request(conn, opts) do
     conn
     |> PaymentGate.call(PaymentGate.init(opts))
