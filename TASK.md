@@ -1,67 +1,92 @@
-# Task: X402.Plug.PaymentGate
+# Task: CI/Coverage Setup
 
-Build a drop-in Plug middleware for x402 payment gating.
+Set up GitHub Actions CI and code coverage for the x402 Elixir library.
 
 ## Read First
 - CLAUDE.md — all coding standards
-- lib/x402/ — existing protocol types and facilitator client
-- mix.exs — deps and project config
+- mix.exs — current project config
 
 ## Requirements
 
-### X402.Plug.PaymentGate
-A Plug that:
-1. Accepts NimbleOptions config: `:facilitator` (facilitator pid/name), `:routes` (list of route configs)
-2. Each route config: `%{method: :get|:post|etc, path: "/api/resource", price: "0.01", network: "base-sepolia", asset: "USDC", receiver: "0x..."}`
-3. On matching request WITHOUT payment header → respond 402 with X402.PaymentRequired JSON
-4. On matching request WITH `x-payment` header → decode, verify via facilitator, settle on success
-5. On non-matching request → pass through (call next plug)
-6. Emit telemetry events: `[:x402, :plug, :pass_through]`, `[:x402, :plug, :payment_required]`, `[:x402, :plug, :payment_verified]`, `[:x402, :plug, :payment_rejected]`
-
-### Route Matching
-- Support exact path match and glob patterns (e.g., "/api/*")
-- Method matching (or `:any` for all methods)
-- Path params should be normalized (strip trailing slash)
-
-### Response Format
-402 response body (JSON):
-```json
-{
-  "x402Version": 1,
-  "accepts": [{
-    "scheme": "exact",
-    "network": "base-sepolia",
-    "maxAmountRequired": "0.01",
-    "resource": "/api/resource",
-    "description": "Payment required",
-    "mimeType": "application/json",
-    "payTo": "0x...",
-    "maxTimeoutSeconds": 60,
-    "extra": {}
-  }],
-  "error": ""
-}
+### 1. mix ci alias
+Add a `ci` alias to mix.exs that runs all quality checks in order:
+```elixir
+defp aliases do
+  [
+    ci: [
+      "compile --warnings-as-errors",
+      "format --check-formatted",
+      "credo --strict",
+      "test --cover"
+    ]
+  ]
+end
 ```
 
-### Tests (comprehensive)
-- Route matching (exact, glob, method filtering)
-- 402 response format correctness
-- Payment verification flow (mock facilitator)
-- Pass-through for non-gated routes
-- Invalid payment header handling
-- Telemetry event emission
-- NimbleOptions validation errors
+### 2. Fix preferred_cli_env deprecation
+Move `preferred_cli_env` from `project/0` to a new `cli/0` function in mix.exs:
+```elixir
+def cli do
+  [preferred_envs: [coveralls: :test, "coveralls.detail": :test, "coveralls.html": :test, "coveralls.github": :test, ci: :test]]
+end
+```
+
+### 3. GitHub Actions CI (.github/workflows/ci.yml)
+```yaml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        elixir: ['1.19']
+        otp: ['27']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+      - run: mix credo --strict
+      - run: mix test
+      - run: mix compile --no-optional-deps --warnings-as-errors
+        name: Compile without optional deps
+```
+
+### 4. ExCoveralls Configuration
+Ensure excoveralls is properly configured in mix.exs with minimum coverage of 90%.
+Add to project config:
+```elixir
+test_coverage: [tool: ExCoveralls, minimum_coverage: 90],
+```
+
+### 5. README Badge
+Add CI badge to README.md:
+```markdown
+[![CI](https://github.com/cardotrejos/x402/actions/workflows/ci.yml/badge.svg)](https://github.com/cardotrejos/x402/actions/workflows/ci.yml)
+```
 
 ### Quality Gates
 - mix compile --warnings-as-errors
-- mix compile --no-optional-deps --warnings-as-errors (Plug is optional!)
-- mix test — 0 failures
 - mix format --check-formatted
 - mix credo --strict — 0 issues
-- Every public function has @spec and @doc
-- Every module has @moduledoc
+- The CI workflow YAML must be valid
 
-### Dependencies
-Add `plug` as optional dependency in mix.exs if not already present.
-
-When done, run: openclaw system event --text "Done: x402 plug payment gate" --mode now
+When done, run: openclaw system event --text "Done: x402 ci coverage" --mode now
