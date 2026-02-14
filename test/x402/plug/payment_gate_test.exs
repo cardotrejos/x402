@@ -359,6 +359,7 @@ defmodule X402.Plug.PaymentGateTest do
           {"HEAD", :head},
           {"OPTIONS", :options},
           {"PATCH", :patch},
+          {"POST", :post},
           {"PUT", :put},
           {"TRACE", :trace}
         ] do
@@ -368,6 +369,20 @@ defmodule X402.Plug.PaymentGateTest do
       result_conn = run_request(conn, routes: [route], facilitator: self())
       assert result_conn.status == 402
     end
+  end
+
+  test "rejects invalid payload reason from facilitator verify" do
+    facilitator = start_mock_facilitator(verify: {:error, :invalid_payload})
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_payment_header())
+
+    result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
+
+    assert result_conn.status == 402
+    body = Jason.decode!(result_conn.resp_body)
+    assert body["error"] == "invalid payment payload"
   end
 
   test "normalize_path handles root path" do
