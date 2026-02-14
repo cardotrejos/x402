@@ -94,6 +94,25 @@ defmodule X402.Plug.PaymentGateTest do
     assert gated_conn.status == 402
   end
 
+  test "matches HEAD requests for root path routes" do
+    head_root_route = %{Map.put(@route, :method, :head) | path: "/"}
+
+    result_conn = run_request(conn(:head, "/"), routes: [head_root_route], facilitator: self())
+
+    assert result_conn.status == 402
+    assert result_conn.halted
+  end
+
+  test "normalizes additional HTTP methods including fallback to :any" do
+    methods = ["DELETE", "OPTIONS", "PATCH", "POST", "TRACE", "CUSTOM"]
+
+    for method <- methods do
+      result_conn = run_request(conn(method, "/public"), routes: [@route], facilitator: self())
+      assert result_conn.status == 200
+      assert result_conn.resp_body == "ok"
+    end
+  end
+
   test "returns 402 response body in required x402 format" do
     conn = conn(:get, "/api/resource")
     result_conn = run_request(conn, routes: [@route], facilitator: self())
@@ -163,6 +182,101 @@ defmodule X402.Plug.PaymentGateTest do
 
     assert result_conn.status == 402
     refute_received {:settle_called, _payload, _requirements}
+  end
+
+  test "rejects when facilitator verification returns non-success status" do
+    facilitator =
+      start_mock_facilitator(verify: {:ok, %{status: 409, body: %{"error" => "conflict"}}})
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_payment_header())
+
+    result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
+    body = Jason.decode!(result_conn.resp_body)
+
+    assert result_conn.status == 402
+    assert body["error"] == "facilitator rejected payment"
+    refute_received {:settle_called, _payload, _requirements}
+  end
+
+  test "rejects when facilitator settlement fails" do
+    facilitator = start_mock_facilitator(settle: {:error, :settlement_failed})
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_payment_header())
+
+    result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
+    body = Jason.decode!(result_conn.resp_body)
+
+    assert result_conn.status == 402
+    assert body["error"] == "payment verification failed"
+    assert_receive {:verify_called, _payload, _requirements}
+    assert_receive {:settle_called, _payload, _requirements}
+  end
+
+  test "rejects malformed x-payment header and emits telemetry reason metadata" do
+    handler_id = "payment-gate-malformed-#{System.unique_integer([:positive, :monotonic])}"
+    parent = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:x402, :plug, :payment_rejected],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:telemetry_event, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", "")
+
+    result_conn = run_request(conn, routes: [@route], facilitator: self())
+    body = Jason.decode!(result_conn.resp_body)
+
+    assert result_conn.status == 402
+    assert body["error"] == "invalid payment header"
+
+    assert_receive {:telemetry_event, [:x402, :plug, :payment_rejected], %{count: 1},
+                    %{path: "/api/resource", reason: :invalid_payment_header}}
+  end
+
+  test "maps invalid_json, invalid_payload, and missing_fields reasons to payment payload errors" do
+    invalid_json_header = Base.encode64("{")
+
+    invalid_json_conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", invalid_json_header)
+      |> run_request(routes: [@route], facilitator: self())
+
+    assert invalid_json_conn.status == 402
+    assert Jason.decode!(invalid_json_conn.resp_body)["error"] == "invalid payment header"
+
+    invalid_payload_facilitator = start_mock_facilitator(verify: {:error, :invalid_payload})
+
+    invalid_payload_conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_payment_header())
+      |> run_request(routes: [@route], facilitator: invalid_payload_facilitator)
+
+    assert invalid_payload_conn.status == 402
+    assert Jason.decode!(invalid_payload_conn.resp_body)["error"] == "invalid payment payload"
+
+    missing_fields_facilitator =
+      start_mock_facilitator(verify: {:error, {:missing_fields, ["network"]}})
+
+    missing_fields_conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_payment_header())
+      |> run_request(routes: [@route], facilitator: missing_fields_facilitator)
+
+    assert missing_fields_conn.status == 402
+    assert Jason.decode!(missing_fields_conn.resp_body)["error"] == "invalid payment payload"
   end
 
   test "emits pass_through, payment_required, payment_verified, and payment_rejected telemetry events" do
