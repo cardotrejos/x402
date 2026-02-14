@@ -1,42 +1,32 @@
-# Task: Final Polish for Hex.pm Publish
+# Task: Dialyzer Setup and Fix All Warnings
 
 ## Goal
-Prepare x402 library for publishing to Hex.pm. Everything must be ready for `mix hex.publish`.
+Add Dialyzer to the x402 library, fix all warnings, and add PLT caching to CI.
 
 ## Steps
 
-1. **mix.exs package metadata**: Add/verify all hex.pm fields:
-   - `description` (one-line summary)
-   - `package` with `licenses: ["MIT"]`, `links`, `files`, `maintainers`
-   - `source_url` pointing to GitHub
-   - `homepage_url` pointing to docs or GitHub
-   - Verify `name: "x402"` is correct
+1. **Add dialyxir dependency**: Add `{:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}` to mix.exs
 
-2. **Verify mix hex.build works**: Run `mix hex.build` and check output for warnings
+2. **Run dialyzer**: `mix dialyzer` — fix ALL warnings. Common issues:
+   - Missing specs (add @spec)
+   - Type mismatches
+   - Unreachable patterns
+   - Invalid callbacks
 
-3. **README badges**: Add badges for:
-   - Hex.pm version: `[![Hex.pm](https://img.shields.io/hexpm/v/x402.svg)](https://hex.pm/packages/x402)`
-   - Hex.pm downloads: `[![Downloads](https://img.shields.io/hexpm/dt/x402.svg)](https://hex.pm/packages/x402)`
-   - CI status (already exists)
-   - License badge
+3. **PLT caching in CI**: Update `.github/workflows/ci.yml` to:
+   - Add a `dialyzer` step/job
+   - Cache PLT files (`_build/dev/dialyzer_*.plt*` or similar)
+   - Run `mix dialyzer --format github`
 
-4. **mix compile --no-optional-deps --warnings-as-errors**: Must pass (Finch is optional!)
+4. **Add mix dialyzer to mix ci alias** (or as separate check)
 
-5. **ExDoc extras**: Verify `docs` config in mix.exs includes:
-   - `main: "readme"` or `main: "X402"`
-   - `extras: ["README.md", "CHANGELOG.md", "LICENSE"]`
-   - `source_ref` pointing to main branch
-
-6. **CHANGELOG.md**: Create with initial 0.1.0 entry listing all features
-
-7. **LICENSE**: Verify MIT license file exists
-
-8. **Run ALL quality gates**:
+5. **Run ALL quality gates**:
    - `mix compile --warnings-as-errors`
    - `mix compile --no-optional-deps --warnings-as-errors`
    - `mix test` (0 failures)
    - `mix format --check-formatted`
    - `mix credo --strict`
+   - `mix dialyzer` (0 warnings)
 
 ## Completion
-When done, run: `openclaw system event --text "Done: x402 hex publish prep" --mode now`
+When done, run: `openclaw system event --text "Done: x402 dialyzer" --mode now`

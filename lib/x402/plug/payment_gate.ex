@@ -12,6 +12,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @behaviour Plug
 
     alias X402.Facilitator
+    alias X402.Facilitator.Error
     alias X402.PaymentSignature
 
     import Plug.Conn, only: [get_req_header: 2, halt: 1, put_resp_content_type: 2, send_resp: 3]
@@ -244,8 +245,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec ensure_success_status(%{status: integer()}) ::
-            :ok | {:error, {:unexpected_facilitator_status, integer()}}
+    @spec ensure_success_status(%{status: non_neg_integer(), body: map()}) ::
+            :ok | {:error, {:unexpected_facilitator_status, non_neg_integer()}}
     defp ensure_success_status(%{status: status}) when status in 200..299, do: :ok
 
     defp ensure_success_status(%{status: status}),
@@ -317,7 +318,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp normalize_path("/"), do: "/"
     defp normalize_path(path), do: String.trim_trailing(path, "/")
 
-    @spec rejection_error(term()) :: String.t()
+    @spec rejection_error(
+            :invalid_payment_header
+            | PaymentSignature.decode_and_validate_error()
+            | {:unexpected_facilitator_status, non_neg_integer()}
+            | Error.t()
+            | term()
+          ) :: String.t()
     defp rejection_error(:invalid_payment_header), do: "invalid payment header"
     defp rejection_error(:invalid_base64), do: "invalid payment header"
     defp rejection_error(:invalid_json), do: "invalid payment header"

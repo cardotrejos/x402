@@ -151,7 +151,8 @@ defmodule X402.MixProject do
         "compile --warnings-as-errors",
         "format --check-formatted",
         "credo --strict",
-        "test --cover"
+        "test --cover",
+        "cmd env MIX_ENV=dev mix dialyzer"
       ]
     ]
   end
