@@ -22,7 +22,7 @@ defmodule X402.MixProject do
       # Docs
       name: "X402",
       source_url: @source_url,
-      homepage_url: "https://x402.org",
+      homepage_url: @source_url,
       docs: docs(),
 
       # Testing
@@ -88,25 +88,26 @@ defmodule X402.MixProject do
   defp package do
     [
       name: "x402",
-      licenses: ["Apache-2.0"],
+      licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
         "x402 Protocol" => "https://x402.org",
         "Docs" => "https://docs.x402.org"
       },
       maintainers: ["Ricardo Trejos"],
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
+      files: ~w(lib guides .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      source_ref: "v#{@version}",
+      source_ref: "main",
       source_url: @source_url,
       extras: [
         "README.md": [title: "Overview"],
         "CHANGELOG.md": [title: "Changelog"],
+        LICENSE: [title: "License"],
         "guides/getting-started.md": [title: "Getting Started"],
         "guides/plug-integration.md": [title: "Plug/Phoenix Integration"]
       ],

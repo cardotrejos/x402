@@ -1,92 +1,42 @@
-# Task: CI/Coverage Setup
+# Task: Final Polish for Hex.pm Publish
 
-Set up GitHub Actions CI and code coverage for the x402 Elixir library.
+## Goal
+Prepare x402 library for publishing to Hex.pm. Everything must be ready for `mix hex.publish`.
 
-## Read First
-- CLAUDE.md — all coding standards
-- mix.exs — current project config
+## Steps
 
-## Requirements
+1. **mix.exs package metadata**: Add/verify all hex.pm fields:
+   - `description` (one-line summary)
+   - `package` with `licenses: ["MIT"]`, `links`, `files`, `maintainers`
+   - `source_url` pointing to GitHub
+   - `homepage_url` pointing to docs or GitHub
+   - Verify `name: "x402"` is correct
 
-### 1. mix ci alias
-Add a `ci` alias to mix.exs that runs all quality checks in order:
-```elixir
-defp aliases do
-  [
-    ci: [
-      "compile --warnings-as-errors",
-      "format --check-formatted",
-      "credo --strict",
-      "test --cover"
-    ]
-  ]
-end
-```
+2. **Verify mix hex.build works**: Run `mix hex.build` and check output for warnings
 
-### 2. Fix preferred_cli_env deprecation
-Move `preferred_cli_env` from `project/0` to a new `cli/0` function in mix.exs:
-```elixir
-def cli do
-  [preferred_envs: [coveralls: :test, "coveralls.detail": :test, "coveralls.html": :test, "coveralls.github": :test, ci: :test]]
-end
-```
+3. **README badges**: Add badges for:
+   - Hex.pm version: `[![Hex.pm](https://img.shields.io/hexpm/v/x402.svg)](https://hex.pm/packages/x402)`
+   - Hex.pm downloads: `[![Downloads](https://img.shields.io/hexpm/dt/x402.svg)](https://hex.pm/packages/x402)`
+   - CI status (already exists)
+   - License badge
 
-### 3. GitHub Actions CI (.github/workflows/ci.yml)
-```yaml
-name: CI
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+4. **mix compile --no-optional-deps --warnings-as-errors**: Must pass (Finch is optional!)
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        elixir: ['1.19']
-        otp: ['27']
-    steps:
-      - uses: actions/checkout@v4
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: ${{ matrix.elixir }}
-          otp-version: ${{ matrix.otp }}
-      - name: Cache deps
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-            _build
-          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
-          restore-keys: ${{ runner.os }}-mix-
-      - run: mix deps.get
-      - run: mix compile --warnings-as-errors
-      - run: mix format --check-formatted
-      - run: mix credo --strict
-      - run: mix test
-      - run: mix compile --no-optional-deps --warnings-as-errors
-        name: Compile without optional deps
-```
+5. **ExDoc extras**: Verify `docs` config in mix.exs includes:
+   - `main: "readme"` or `main: "X402"`
+   - `extras: ["README.md", "CHANGELOG.md", "LICENSE"]`
+   - `source_ref` pointing to main branch
 
-### 4. ExCoveralls Configuration
-Ensure excoveralls is properly configured in mix.exs with minimum coverage of 90%.
-Add to project config:
-```elixir
-test_coverage: [tool: ExCoveralls, minimum_coverage: 90],
-```
+6. **CHANGELOG.md**: Create with initial 0.1.0 entry listing all features
 
-### 5. README Badge
-Add CI badge to README.md:
-```markdown
-[![CI](https://github.com/cardotrejos/x402/actions/workflows/ci.yml/badge.svg)](https://github.com/cardotrejos/x402/actions/workflows/ci.yml)
-```
+7. **LICENSE**: Verify MIT license file exists
 
-### Quality Gates
-- mix compile --warnings-as-errors
-- mix format --check-formatted
-- mix credo --strict — 0 issues
-- The CI workflow YAML must be valid
+8. **Run ALL quality gates**:
+   - `mix compile --warnings-as-errors`
+   - `mix compile --no-optional-deps --warnings-as-errors`
+   - `mix test` (0 failures)
+   - `mix format --check-formatted`
+   - `mix credo --strict`
 
-When done, run: openclaw system event --text "Done: x402 ci coverage" --mode now
+## Completion
+When done, run: `openclaw system event --text "Done: x402 hex publish prep" --mode now`
