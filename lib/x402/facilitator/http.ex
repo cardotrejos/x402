@@ -117,7 +117,12 @@ defmodule X402.Facilitator.HTTP do
     end
   end
 
-  defp maybe_retry({:error, %Error{retryable: true}}, %{retry_backoff_ms: backoff} = ctx, attempt, max_attempts)
+  defp maybe_retry(
+         {:error, %Error{retryable: true}},
+         %{retry_backoff_ms: backoff} = ctx,
+         attempt,
+         max_attempts
+       )
        when attempt < max_attempts do
     :timer.sleep(backoff_ms(backoff, attempt))
     do_request(ctx, attempt + 1, max_attempts)

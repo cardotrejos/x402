@@ -56,6 +56,9 @@ defmodule X402.MixProject do
       # HTTP client (optional — users can bring their own)
       {:finch, "~> 0.19", optional: true},
 
+      # Plug integration (optional — users can bring their own web stack)
+      {:plug, "~> 1.14", optional: true},
+
       # JSON encoding/decoding
       {:jason, "~> 1.2"},
 
