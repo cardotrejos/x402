@@ -29,19 +29,16 @@ defmodule X402.Facilitator.HTTP do
          {:ok, receive_timeout_ms} <- fetch_non_negative_integer(opts, :receive_timeout_ms, 5_000),
          {:ok, finch_module} <- ensure_finch_module(),
          {:ok, encoded_payload} <- Jason.encode(payload) do
-      max_attempts = max_retries + 1
-      url = join_url(base_url, path)
+      ctx = %{
+        finch_module: finch_module,
+        finch_name: finch_name,
+        url: join_url(base_url, path),
+        payload: encoded_payload,
+        receive_timeout_ms: receive_timeout_ms,
+        retry_backoff_ms: retry_backoff_ms
+      }
 
-      do_request(
-        finch_module,
-        finch_name,
-        url,
-        encoded_payload,
-        receive_timeout_ms,
-        retry_backoff_ms,
-        1,
-        max_attempts
-      )
+      do_request(ctx, 1, max_retries + 1)
     else
       {:error, %Error{} = error} ->
         {:error, error}
@@ -57,56 +54,27 @@ defmodule X402.Facilitator.HTTP do
     end
   end
 
-  defp do_request(
-         finch_module,
-         finch_name,
-         url,
-         encoded_payload,
-         receive_timeout_ms,
-         retry_backoff_ms,
-         attempt,
-         max_attempts
-       ) do
-    result =
-      perform_request(
-        finch_module,
-        finch_name,
-        url,
-        encoded_payload,
-        receive_timeout_ms,
-        attempt
-      )
-
-    maybe_retry(
-      result,
-      finch_module,
-      finch_name,
-      url,
-      encoded_payload,
-      receive_timeout_ms,
-      retry_backoff_ms,
-      attempt,
-      max_attempts
-    )
+  # Bundles retry-related context to keep function arity ≤ 8.
+  defp do_request(%{} = ctx, attempt, max_attempts) do
+    result = perform_request(ctx, attempt)
+    maybe_retry(result, ctx, attempt, max_attempts)
   end
 
   defp perform_request(
-         finch_module,
-         finch_name,
-         url,
-         encoded_payload,
-         receive_timeout_ms,
+         %{
+           finch_module: finch_module,
+           finch_name: finch_name,
+           url: url,
+           payload: encoded_payload,
+           receive_timeout_ms: receive_timeout_ms
+         },
          attempt
        ) do
-    request = apply(finch_module, :build, [:post, url, @json_headers, encoded_payload])
+    request = finch_module.build(:post, url, @json_headers, encoded_payload)
 
     response =
       try do
-        apply(finch_module, :request, [
-          request,
-          finch_name,
-          [receive_timeout: receive_timeout_ms]
-        ])
+        finch_module.request(request, finch_name, receive_timeout: receive_timeout_ms)
       catch
         :exit, reason -> {:error, reason}
       end
@@ -149,57 +117,17 @@ defmodule X402.Facilitator.HTTP do
     end
   end
 
-  defp maybe_retry(
-         {:error, %Error{retryable: true} = _error},
-         finch_module,
-         finch_name,
-         url,
-         encoded_payload,
-         receive_timeout_ms,
-         retry_backoff_ms,
-         attempt,
-         max_attempts
-       )
+  defp maybe_retry({:error, %Error{retryable: true}}, %{retry_backoff_ms: backoff} = ctx, attempt, max_attempts)
        when attempt < max_attempts do
-    :timer.sleep(backoff_ms(retry_backoff_ms, attempt))
-
-    do_request(
-      finch_module,
-      finch_name,
-      url,
-      encoded_payload,
-      receive_timeout_ms,
-      retry_backoff_ms,
-      attempt + 1,
-      max_attempts
-    )
+    :timer.sleep(backoff_ms(backoff, attempt))
+    do_request(ctx, attempt + 1, max_attempts)
   end
 
-  defp maybe_retry(
-         {:error, %Error{} = error},
-         _finch_module,
-         _finch_name,
-         _url,
-         _encoded_payload,
-         _receive_timeout_ms,
-         _retry_backoff_ms,
-         _attempt,
-         _max_attempts
-       ) do
+  defp maybe_retry({:error, %Error{} = error}, _ctx, _attempt, _max_attempts) do
     {:error, error}
   end
 
-  defp maybe_retry(
-         {:ok, _response} = ok,
-         _finch_module,
-         _finch_name,
-         _url,
-         _encoded_payload,
-         _receive_timeout_ms,
-         _retry_backoff_ms,
-         _attempt,
-         _max_attempts
-       ) do
+  defp maybe_retry({:ok, _response} = ok, _ctx, _attempt, _max_attempts) do
     ok
   end
 
