@@ -7,6 +7,13 @@ Code.compile_string("""
 defmodule X402.Hooks do
   @moduledoc false
 
+  @callback before_verify(term(), term()) :: term()
+  @callback after_verify(term(), term()) :: term()
+  @callback on_verify_failure(term(), term()) :: term()
+  @callback before_settle(term(), term()) :: term()
+  @callback after_settle(term(), term()) :: term()
+  @callback on_settle_failure(term(), term()) :: term()
+
   @required_callbacks [
     :before_verify,
     :after_verify,
