@@ -378,9 +378,8 @@ defmodule X402.Facilitator do
 
   defp validate_upto_payment(payload, requirements) do
     with {:ok, max_price} <- extract_max_price(payload, requirements),
-         {:ok, payment_value} <- extract_payment_value(payload),
-         :ok <- ensure_not_exceeds(payment_value, max_price) do
-      :ok
+         {:ok, payment_value} <- extract_payment_value(payload) do
+      ensure_not_exceeds(payment_value, max_price)
     end
   end
 
