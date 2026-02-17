@@ -23,7 +23,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
       doc: "Registered name for the ETS cache process."
     ],
     ttl_ms: [
-      type: :non_neg_integer,
+      type: :pos_integer,
       default: @default_ttl_ms,
       doc: "Time-to-live for entries in milliseconds."
     ],
@@ -123,7 +123,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   def init(opts) do
     ttl_ms = Keyword.fetch!(opts, :ttl_ms)
     cleanup_interval_ms = Keyword.fetch!(opts, :cleanup_interval_ms)
-    table = :ets.new(__MODULE__, [:set, :private, read_concurrency: true])
+    table = :ets.new(__MODULE__, [:set, :private])
 
     state = %{
       table: table,
