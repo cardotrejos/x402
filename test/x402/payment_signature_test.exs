@@ -42,7 +42,7 @@ defmodule X402.PaymentSignatureTest do
     end
   end
 
-  describe "validate/1" do
+  describe "validate/1 and validate/2" do
     test "returns ok for complete payload" do
       payload = %{
         "transactionHash" => "0xabc",
@@ -76,9 +76,52 @@ defmodule X402.PaymentSignatureTest do
       assert PaymentSignature.validate(payload) ==
                {:error, {:missing_fields, ["scheme", "transactionHash"]}}
     end
+
+    test "accepts upto payments below maxPrice" do
+      payload = %{
+        "transactionHash" => "0xabc",
+        "network" => "eip155:8453",
+        "scheme" => "upto",
+        "payerWallet" => "0x1111111111111111111111111111111111111111",
+        "value" => "9"
+      }
+
+      requirements = %{"scheme" => "upto", "maxPrice" => "10"}
+
+      assert PaymentSignature.validate(payload, requirements) == {:ok, payload}
+    end
+
+    test "accepts upto payments equal to maxPrice" do
+      payload = %{
+        "transactionHash" => "0xabc",
+        "network" => "eip155:8453",
+        "scheme" => "upto",
+        "payerWallet" => "0x1111111111111111111111111111111111111111",
+        "value" => "10"
+      }
+
+      requirements = %{"scheme" => "upto", "maxPrice" => "10"}
+
+      assert PaymentSignature.validate(payload, requirements) == {:ok, payload}
+    end
+
+    test "rejects upto payments above maxPrice" do
+      payload = %{
+        "transactionHash" => "0xabc",
+        "network" => "eip155:8453",
+        "scheme" => "upto",
+        "payerWallet" => "0x1111111111111111111111111111111111111111",
+        "value" => "11"
+      }
+
+      requirements = %{"scheme" => "upto", "maxPrice" => "10"}
+
+      assert PaymentSignature.validate(payload, requirements) ==
+               {:error, {:value_exceeds_max_price, "11", "10"}}
+    end
   end
 
-  describe "decode_and_validate/1" do
+  describe "decode_and_validate/1 and decode_and_validate/2" do
     test "returns ok for valid encoded payload" do
       payload = %{
         "transactionHash" => "0xabc",
@@ -102,6 +145,21 @@ defmodule X402.PaymentSignatureTest do
 
       assert PaymentSignature.decode_and_validate(encoded) ==
                {:error, {:missing_fields, ["payerWallet", "scheme", "transactionHash"]}}
+    end
+
+    test "validates upto amount bounds when requirements are provided" do
+      payload = %{
+        "transactionHash" => "0xabc",
+        "network" => "eip155:8453",
+        "scheme" => "upto",
+        "payerWallet" => "0x1111111111111111111111111111111111111111",
+        "value" => "11"
+      }
+
+      encoded = payload |> Jason.encode!() |> Base.encode64()
+
+      assert PaymentSignature.decode_and_validate(encoded, %{"maxPrice" => "10"}) ==
+               {:error, {:value_exceeds_max_price, "11", "10"}}
     end
   end
 end

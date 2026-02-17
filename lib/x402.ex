@@ -86,7 +86,11 @@ defmodule X402 do
       }}
   """
   @spec validate_payment_signature(map()) ::
-          {:ok, map()} | {:error, :invalid_payload | {:missing_fields, [String.t()]}}
+          {:ok, map()}
+          | {:error,
+             :invalid_payload
+             | {:missing_fields, [String.t()]}
+             | {:value_exceeds_max_price, String.t(), String.t()}}
   defdelegate validate_payment_signature(payload), to: PaymentSignature, as: :validate
 
   @doc since: "0.1.0", group: :verification
@@ -107,7 +111,11 @@ defmodule X402 do
   @spec decode_and_validate_payment_signature(String.t()) ::
           {:ok, map()}
           | {:error,
-             :invalid_base64 | :invalid_json | :invalid_payload | {:missing_fields, [String.t()]}}
+             :invalid_base64
+             | :invalid_json
+             | :invalid_payload
+             | {:missing_fields, [String.t()]}
+             | {:value_exceeds_max_price, String.t(), String.t()}}
   defdelegate decode_and_validate_payment_signature(header),
     to: PaymentSignature,
     as: :decode_and_validate

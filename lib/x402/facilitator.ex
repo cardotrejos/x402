@@ -1,6 +1,11 @@
 defmodule X402.Facilitator do
   @moduledoc """
   Stateful client for x402 facilitator verify and settle operations.
+
+  Requirement payloads are normalized before requests:
+
+  - `"exact"` uses `"maxAmountRequired"`
+  - `"upto"` uses `"maxPrice"`
   """
 
   use GenServer
@@ -47,7 +52,9 @@ defmodule X402.Facilitator do
   @typedoc "Facilitator server identifier accepted by `GenServer.call/3`."
   @type server :: GenServer.server()
 
+  @type scheme :: :exact | :upto | "exact" | "upto"
   @type response :: {:ok, %{status: non_neg_integer(), body: map()}} | {:error, Error.t()}
+  @type requirements :: map()
 
   @type state :: %{
           url: String.t(),
@@ -93,10 +100,12 @@ defmodule X402.Facilitator do
 
   @doc """
   Verifies a payment using the default facilitator process name.
+
+  Requirement maps are scheme-normalized before the request is sent.
   """
   @doc group: :verification
   @doc since: "0.1.0"
-  @spec verify(map(), map()) :: response()
+  @spec verify(map(), requirements()) :: response()
   def verify(payment_payload, requirements)
       when is_map(payment_payload) and is_map(requirements) do
     verify(@default_name, payment_payload, requirements)
@@ -104,21 +113,26 @@ defmodule X402.Facilitator do
 
   @doc """
   Verifies a payment using the given facilitator process.
+
+  Requirement maps are scheme-normalized before the request is sent.
   """
   @doc group: :verification
   @doc since: "0.1.0"
-  @spec verify(server(), map(), map()) :: response()
+  @spec verify(server(), map(), requirements()) :: response()
   def verify(server, payment_payload, requirements)
       when is_map(payment_payload) and is_map(requirements) do
-    GenServer.call(server, {:verify, payment_payload, requirements})
+    normalized_requirements = normalize_requirements(requirements, payment_payload)
+    GenServer.call(server, {:verify, payment_payload, normalized_requirements})
   end
 
   @doc """
   Settles a payment using the default facilitator process name.
+
+  Requirement maps are scheme-normalized before the request is sent.
   """
   @doc group: :verification
   @doc since: "0.1.0"
-  @spec settle(map(), map()) :: response()
+  @spec settle(map(), requirements()) :: response()
   def settle(payment_payload, requirements)
       when is_map(payment_payload) and is_map(requirements) do
     settle(@default_name, payment_payload, requirements)
@@ -126,13 +140,16 @@ defmodule X402.Facilitator do
 
   @doc """
   Settles a payment using the given facilitator process.
+
+  Requirement maps are scheme-normalized before the request is sent.
   """
   @doc group: :verification
   @doc since: "0.1.0"
-  @spec settle(server(), map(), map()) :: response()
+  @spec settle(server(), map(), requirements()) :: response()
   def settle(server, payment_payload, requirements)
       when is_map(payment_payload) and is_map(requirements) do
-    GenServer.call(server, {:settle, payment_payload, requirements})
+    normalized_requirements = normalize_requirements(requirements, payment_payload)
+    GenServer.call(server, {:settle, payment_payload, normalized_requirements})
   end
 
   @impl true
@@ -198,5 +215,98 @@ defmodule X402.Facilitator do
       retryable: error.retryable,
       attempt: error.attempt
     }
+  end
+
+  @spec normalize_requirements(requirements(), map()) :: requirements()
+  defp normalize_requirements(requirements, payment_payload) do
+    case normalize_scheme(requirement_scheme(requirements, payment_payload)) do
+      "exact" ->
+        requirements
+        |> put_scheme("exact")
+        |> normalize_exact_amount()
+
+      "upto" ->
+        requirements
+        |> put_scheme("upto")
+        |> normalize_upto_amount()
+
+      nil ->
+        requirements
+    end
+  end
+
+  @spec requirement_scheme(requirements(), map()) :: scheme() | nil
+  defp requirement_scheme(requirements, payment_payload) do
+    first_present_value(requirements, ["scheme", :scheme]) ||
+      first_present_value(payment_payload, ["scheme", :scheme])
+  end
+
+  @spec put_scheme(requirements(), "exact" | "upto") :: requirements()
+  defp put_scheme(requirements, scheme) do
+    requirements
+    |> Map.put("scheme", scheme)
+    |> Map.delete(:scheme)
+  end
+
+  @spec normalize_exact_amount(requirements()) :: requirements()
+  defp normalize_exact_amount(requirements) do
+    amount =
+      first_present_value(requirements, ["maxAmountRequired", :maxAmountRequired, "price", :price])
+
+    requirements =
+      requirements
+      |> Map.delete(:maxAmountRequired)
+      |> Map.delete("price")
+      |> Map.delete(:price)
+      |> Map.delete("maxPrice")
+      |> Map.delete(:maxPrice)
+
+    case amount do
+      nil -> requirements
+      value -> Map.put(requirements, "maxAmountRequired", value)
+    end
+  end
+
+  @spec normalize_upto_amount(requirements()) :: requirements()
+  defp normalize_upto_amount(requirements) do
+    amount =
+      first_present_value(requirements, [
+        "maxPrice",
+        :maxPrice,
+        "price",
+        :price,
+        "maxAmountRequired",
+        :maxAmountRequired
+      ])
+
+    requirements =
+      requirements
+      |> Map.delete(:maxPrice)
+      |> Map.delete("price")
+      |> Map.delete(:price)
+      |> Map.delete("maxAmountRequired")
+      |> Map.delete(:maxAmountRequired)
+
+    case amount do
+      nil -> requirements
+      value -> Map.put(requirements, "maxPrice", value)
+    end
+  end
+
+  @spec normalize_scheme(term()) :: "exact" | "upto" | nil
+  defp normalize_scheme("exact"), do: "exact"
+  defp normalize_scheme("upto"), do: "upto"
+  defp normalize_scheme(:exact), do: "exact"
+  defp normalize_scheme(:upto), do: "upto"
+  defp normalize_scheme(_value), do: nil
+
+  @spec first_present_value(map(), [String.t() | atom()]) :: term() | nil
+  defp first_present_value(map, keys) do
+    Enum.find_value(keys, fn key ->
+      case Map.fetch(map, key) do
+        {:ok, value} -> value
+        :error -> nil
+      end
+    end)
   end
 end

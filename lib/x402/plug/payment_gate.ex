@@ -7,6 +7,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     response with x402 payment requirements. Requests with `x-payment` are
     decoded, verified, and settled with the configured facilitator before the
     request is allowed to continue through the plug pipeline.
+
+    Route definitions support both x402 schemes:
+
+    - `:exact` (default) where `price` maps to `"maxAmountRequired"`
+    - `:upto` where `price` maps to `"maxPrice"`
     """
 
     @behaviour Plug
@@ -33,7 +38,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       price: [
         type: :string,
         required: true,
-        doc: "Maximum amount required for this route."
+        doc: "Price for this route (`maxAmountRequired` for `:exact`, `maxPrice` for `:upto`)."
+      ],
+      scheme: [
+        type: {:in, [:exact, :upto]},
+        default: :exact,
+        doc: "x402 scheme for this route."
       ],
       network: [
         type: :string,
@@ -77,6 +87,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             matcher: :exact | :glob,
             path: String.t(),
             glob_regex: Regex.t() | nil,
+            scheme: :exact | :upto,
             price: String.t(),
             network: String.t(),
             asset: String.t(),
@@ -163,7 +174,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp verify_and_settle(conn, facilitator, route, request_method, request_path, header) do
       requirements = facilitator_requirements(route, request_path)
 
-      with {:ok, payment_payload} <- PaymentSignature.decode_and_validate(header),
+      with {:ok, payment_payload} <- PaymentSignature.decode_and_validate(header, requirements),
            {:ok, verify_response} <-
              Facilitator.verify(facilitator, payment_payload, requirements),
            :ok <- ensure_success_status(verify_response),
@@ -195,6 +206,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         matcher: matcher,
         path: normalized_path,
         glob_regex: glob_regex(matcher, normalized_path),
+        scheme: Map.get(route, :scheme, :exact),
         price: Map.fetch!(route, :price),
         network: Map.fetch!(route, :network),
         asset: Map.fetch!(route, :asset),
@@ -254,18 +266,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec facilitator_requirements(compiled_route(), String.t()) :: map()
     defp facilitator_requirements(route, request_path) do
-      %{
-        "scheme" => "exact",
-        "network" => route.network,
-        "asset" => route.asset,
-        "maxAmountRequired" => route.price,
-        "resource" => request_path,
-        "description" => "Payment required",
-        "mimeType" => "application/json",
-        "payTo" => route.receiver,
-        "maxTimeoutSeconds" => 60,
-        "extra" => %{}
-      }
+      route
+      |> requirement_base(request_path)
+      |> put_requirement_amount(route)
     end
 
     @spec payment_required_response(Plug.Conn.t(), compiled_route(), String.t(), String.t()) ::
@@ -290,10 +293,17 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec accept_entry(compiled_route(), String.t()) :: map()
     defp accept_entry(route, request_path) do
+      route
+      |> requirement_base(request_path)
+      |> put_requirement_amount(route)
+    end
+
+    @spec requirement_base(compiled_route(), String.t()) :: map()
+    defp requirement_base(route, request_path) do
       %{
-        "scheme" => "exact",
+        "scheme" => scheme_string(route.scheme),
         "network" => route.network,
-        "maxAmountRequired" => route.price,
+        "asset" => route.asset,
         "resource" => request_path,
         "description" => "Payment required",
         "mimeType" => "application/json",
@@ -302,6 +312,18 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         "extra" => %{}
       }
     end
+
+    @spec put_requirement_amount(map(), compiled_route()) :: map()
+    defp put_requirement_amount(requirement, route) do
+      case route.scheme do
+        :upto -> Map.put(requirement, "maxPrice", route.price)
+        :exact -> Map.put(requirement, "maxAmountRequired", route.price)
+      end
+    end
+
+    @spec scheme_string(:exact | :upto) :: String.t()
+    defp scheme_string(:exact), do: "exact"
+    defp scheme_string(:upto), do: "upto"
 
     @spec normalize_method(String.t()) :: atom()
     defp normalize_method("DELETE"), do: :delete
@@ -330,6 +352,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error(:invalid_json), do: "invalid payment header"
     defp rejection_error(:invalid_payload), do: "invalid payment payload"
     defp rejection_error({:missing_fields, _fields}), do: "invalid payment payload"
+
+    defp rejection_error({:value_exceeds_max_price, _value, _max_price}),
+      do: "invalid payment payload"
 
     defp rejection_error({:unexpected_facilitator_status, _status}),
       do: "facilitator rejected payment"

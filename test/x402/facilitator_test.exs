@@ -61,6 +61,64 @@ defmodule X402.FacilitatorTest do
              Facilitator.settle(facilitator, payment_payload, requirements)
   end
 
+  test "verify/3 normalizes upto scheme requirements", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    payment_payload = %{"scheme" => "upto", "signature" => "abc"}
+    requirements = %{scheme: :upto, price: "0.03", network: "eip155:8453"}
+
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+      decoded = Jason.decode!(body)
+
+      assert decoded["payload"] == payment_payload
+      assert decoded["requirements"]["scheme"] == "upto"
+      assert decoded["requirements"]["maxPrice"] == "0.03"
+      refute Map.has_key?(decoded["requirements"], "price")
+
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    assert {:ok, %{status: 200, body: %{"verified" => true}}} =
+             Facilitator.verify(facilitator, payment_payload, requirements)
+  end
+
+  test "settle/3 normalizes exact scheme requirements from price", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    payment_payload = %{"scheme" => "exact", "tx" => "0xdeadbeef"}
+    requirements = %{scheme: :exact, price: "0.05", network: "eip155:8453"}
+
+    Bypass.expect(bypass, "POST", "/settle", fn conn ->
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+      decoded = Jason.decode!(body)
+
+      assert decoded["payload"] == payment_payload
+      assert decoded["requirements"]["scheme"] == "exact"
+      assert decoded["requirements"]["maxAmountRequired"] == "0.05"
+      refute Map.has_key?(decoded["requirements"], "price")
+
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    assert {:ok, %{status: 200, body: %{"settled" => true}}} =
+             Facilitator.settle(facilitator, payment_payload, requirements)
+  end
+
   test "verify/2 and settle/2 use default registered name", %{
     bypass: bypass,
     finch: finch,
