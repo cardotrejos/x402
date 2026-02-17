@@ -19,22 +19,22 @@
 **Goal:** Parity with the latest x402 spec extensions.
 
 ### Payment-Identifier (Idempotency)
-- [ ] `X402.Extensions.PaymentIdentifier` — encode/decode payment ID in payloads
-- [ ] Cache behaviour (`X402.Extensions.PaymentIdentifier.Cache`)
-- [ ] Default ETS adapter (no deps)
+- [x] `X402.Extensions.PaymentIdentifier` — encode/decode payment ID in payloads
+- [x] Cache behaviour (`X402.Extensions.PaymentIdentifier.Cache`)
+- [x] Default ETS adapter (no deps)
 - [ ] Optional Redis adapter (via Redix)
 - [ ] Plug integration — auto-deduplicate in PaymentGate
 - [ ] Configurable TTL per route
 
 ### Lifecycle Hooks
-- [ ] `before_verify/2` — inspect/transform payment before facilitator call
-- [ ] `after_settle/2` — post-settlement logic (logging, webhooks, analytics)
-- [ ] `on_reject/2` — custom handling for failed/invalid payments
-- [ ] Hook behaviour + default no-op implementation
-- [ ] Plug option: `hooks: MyApp.PaymentHooks`
+- [x] `before_verify/2` — inspect/transform payment before facilitator call
+- [x] `after_settle/2` — post-settlement logic (logging, webhooks, analytics)
+- [x] `on_reject/2` — custom handling for failed/invalid payments
+- [x] Hook behaviour + default no-op implementation
+- [x] Plug option: `hooks: MyApp.PaymentHooks`
 
 ### "upto" Scheme
-- [ ] Encode/decode "upto" scheme in PaymentRequired
+- [x] Encode/decode "upto" scheme in PaymentRequired
 - [ ] Max-price bidding validation in PaymentSignature
 - [ ] Facilitator client support for upto verification
 - [ ] Tests + docs

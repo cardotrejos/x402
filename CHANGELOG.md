@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-02-17
+
+### Added
+
+- **SIWX (Sign-In-With-X)** — Repeat access without repayment (#14)
+  - `X402.Extensions.SIWX` — CAIP-122 message construction and EIP-4361 (SIWE) format
+  - `X402.Extensions.SIWX.Verifier` — behaviour for signature verification
+  - `X402.Extensions.SIWX.Verifier.Default` — EVM signature verification via `ex_secp256k1`
+  - `X402.Extensions.SIWX.Storage` — behaviour for access record persistence
+  - `X402.Extensions.SIWX.ETSStorage` — default ETS adapter with TTL and periodic cleanup
+  - `SIGN-IN-WITH-X` header encode/decode
+- **"upto" Scheme** — Max-price bidding for flexible payments (#13)
+  - `PaymentRequired` encode/decode for `"upto"` scheme with `maxPrice`
+  - `PaymentSignature` validation: payment value ≤ maxPrice
+  - Facilitator client support for upto verification with hooks
+  - `PaymentGate` Plug route config supports upto scheme
+- **Payment Identifier** — Idempotency extension (#12)
+  - `X402.Extensions.PaymentIdentifier` — encode/decode payment IDs in payloads
+  - `X402.Extensions.PaymentIdentifier.Cache` — behaviour for deduplication cache
+  - `X402.Extensions.PaymentIdentifier.ETSCache` — default ETS adapter with TTL
+- **Lifecycle Hooks** — Behaviour-based hooks for verify/settle (#10)
+  - `before_verify/2`, `after_verify/2`, `before_settle/2`, `after_settle/2`
+  - `on_verify_failure/2`, `on_settle_failure/2`
+  - Context struct with request metadata, result, and error tracking
+
+### Changed
+
+- `ex_secp256k1` and `ex_keccak` are now optional dependencies (only needed for SIWX)
+- ETS storage uses `:protected` access with direct reads bypassing GenServer for better concurrency
+
+### Fixed
+
+- Credo strict compliance: implicit `try`, redundant `with` clauses
+- Dialyzer: unreachable pattern matches in PaymentIdentifier and SIWX Verifier
+
 ## [0.1.0] - 2026-02-14
 
 ### Added
