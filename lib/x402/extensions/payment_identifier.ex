@@ -59,7 +59,6 @@ defmodule X402.Extensions.PaymentIdentifier do
       {:error, :missing_payment_id} -> {:error, :missing_payment_id}
       {:error, :invalid_payment_id} -> {:error, :invalid_payment_id}
       {:error, %Jason.DecodeError{}} -> {:error, :invalid_json}
-      _other -> {:error, :invalid_json}
     end
   end
 
