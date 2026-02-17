@@ -273,9 +273,8 @@ defmodule X402.Facilitator do
     success_context = %{context | result: result, error: nil}
 
     with {:ok, %Context{} = after_context} <-
-           run_after_hook(hooks_module, operation, success_context, metadata),
-         {:ok, final_result} <- finalized_result(after_context, result, callback) do
-      {:ok, final_result}
+           run_after_hook(hooks_module, operation, success_context, metadata) do
+      finalized_result(after_context, result, callback)
     end
   end
 
@@ -358,13 +357,11 @@ defmodule X402.Facilitator do
   defp finalized_error(error, _fallback), do: error
 
   defp invoke_hook(hooks_module, callback, context, metadata) do
-    try do
-      {:ok, apply(hooks_module, callback, [context, metadata])}
-    rescue
-      error -> {:error, {:exception, error}}
-    catch
-      kind, reason -> {:error, {kind, reason}}
-    end
+    {:ok, apply(hooks_module, callback, [context, metadata])}
+  rescue
+    error -> {:error, {:exception, error}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   defp before_callback(:verify), do: :before_verify
