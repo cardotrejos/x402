@@ -71,9 +71,9 @@ defmodule X402.MixProject do
       # Option validation (Dashbit style)
       {:nimble_options, "~> 1.0"},
 
-      # EVM signature verification
-      {:ex_secp256k1, "~> 0.8.0"},
-      {:ex_keccak, "~> 0.7.8"},
+      # EVM signature verification (optional — only needed for SIWX)
+      {:ex_secp256k1, "~> 0.8.0", optional: true},
+      {:ex_keccak, "~> 0.7.8", optional: true},
 
       # Documentation
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},

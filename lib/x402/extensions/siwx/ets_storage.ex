@@ -4,6 +4,9 @@ defmodule X402.Extensions.SIWX.ETSStorage do
 
   Records are stored in an ETS table keyed by `{address, resource}` and cleaned
   up periodically by the GenServer process.
+
+  Reads bypass the GenServer and go directly to ETS for better concurrency.
+  Writes are serialized through the GenServer to ensure consistency.
   """
 
   use GenServer
@@ -63,11 +66,9 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   @doc since: "0.3.0"
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) when is_list(opts) do
-    validated_opts = NimbleOptions.validate!(opts, @start_link_options_schema)
-
     %{
-      id: Keyword.fetch!(validated_opts, :name),
-      start: {__MODULE__, :start_link, [validated_opts]},
+      id: Keyword.get(opts, :name, @default_name),
+      start: {__MODULE__, :start_link, [opts]},
       type: :worker,
       restart: :permanent,
       shutdown: 5_000
@@ -78,24 +79,37 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   @doc """
   Fetches an access record for a wallet/resource pair from the default server.
 
-  Expired records are lazily deleted and return `{:error, :not_found}`.
+  Reads go directly to ETS for better concurrency. Expired records return
+  `{:error, :not_found}`.
   """
   @impl true
   @spec get(String.t(), String.t()) ::
           {:ok, X402.Extensions.SIWX.Storage.access_record()} | {:error, :not_found}
-  def get(address, resource), do: get(@default_name, address, resource)
+  def get(address, resource), do: get(@default_table, address, resource)
 
   @doc since: "0.3.0"
   @doc """
-  Fetches an access record from a specific storage server.
+  Fetches an access record from a specific storage table.
+
+  Reads bypass the GenServer and go directly to ETS for better concurrency
+  under high read load.
   """
-  @spec get(server(), String.t(), String.t()) ::
+  @spec get(atom(), String.t(), String.t()) ::
           {:ok, X402.Extensions.SIWX.Storage.access_record()} | {:error, :not_found}
-  def get(server, address, resource) when is_binary(address) and is_binary(resource) do
-    GenServer.call(server, {:get, address, resource})
+  def get(table, address, resource) when is_atom(table) and is_binary(address) and is_binary(resource) do
+    key = {address, resource}
+    now = now_ms()
+
+    case :ets.lookup(table, key) do
+      [{^key, payment_proof, expires_at_ms}] when expires_at_ms > now ->
+        {:ok, %{payment_proof: payment_proof, expires_at_ms: expires_at_ms}}
+
+      _other ->
+        {:error, :not_found}
+    end
   end
 
-  def get(_server, _address, _resource), do: {:error, :not_found}
+  def get(_table, _address, _resource), do: {:error, :not_found}
 
   @doc since: "0.3.0"
   @doc """
@@ -147,9 +161,8 @@ defmodule X402.Extensions.SIWX.ETSStorage do
     :ets.new(table, [
       :named_table,
       :set,
-      :public,
-      {:read_concurrency, true},
-      {:write_concurrency, true}
+      :protected,
+      {:read_concurrency, true}
     ])
 
     schedule_cleanup(cleanup_interval_ms)
@@ -163,29 +176,7 @@ defmodule X402.Extensions.SIWX.ETSStorage do
 
   @impl true
   @spec handle_call(term(), GenServer.from(), state()) ::
-          {:reply, {:ok, X402.Extensions.SIWX.Storage.access_record()} | {:error, :not_found},
-           state()}
-          | {:reply, :ok | {:error, term()}, state()}
-  def handle_call({:get, address, resource}, _from, state) do
-    key = {address, resource}
-    now = now_ms()
-
-    result =
-      case :ets.lookup(state.table, key) do
-        [{^key, payment_proof, expires_at_ms}] when expires_at_ms > now ->
-          {:ok, %{payment_proof: payment_proof, expires_at_ms: expires_at_ms}}
-
-        [{^key, _payment_proof, _expires_at_ms}] ->
-          :ets.delete(state.table, key)
-          {:error, :not_found}
-
-        [] ->
-          {:error, :not_found}
-      end
-
-    {:reply, result, state}
-  end
-
+          {:reply, :ok | {:error, term()}, state()}
   def handle_call({:put, address, resource, payment_proof, ttl_ms}, _from, state) do
     key = {address, resource}
     expires_at_ms = now_ms() + ttl_ms
