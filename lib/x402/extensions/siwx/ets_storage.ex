@@ -96,7 +96,8 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   """
   @spec get(atom(), String.t(), String.t()) ::
           {:ok, X402.Extensions.SIWX.Storage.access_record()} | {:error, :not_found}
-  def get(table, address, resource) when is_atom(table) and is_binary(address) and is_binary(resource) do
+  def get(table, address, resource)
+      when is_atom(table) and is_binary(address) and is_binary(resource) do
     key = {address, resource}
     now = now_ms()
 
