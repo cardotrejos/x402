@@ -71,6 +71,10 @@ defmodule X402.MixProject do
       # Option validation (Dashbit style)
       {:nimble_options, "~> 1.0"},
 
+      # EVM signature verification (optional — only needed for SIWX)
+      {:ex_secp256k1, "~> 0.8.0", optional: true},
+      {:ex_keccak, "~> 0.7.8", optional: true},
+
       # Documentation
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
 
@@ -133,6 +137,13 @@ defmodule X402.MixProject do
         ],
         Utilities: [
           X402.Wallet
+        ],
+        Extensions: [
+          X402.Extensions.SIWX,
+          X402.Extensions.SIWX.Verifier,
+          X402.Extensions.SIWX.Verifier.Default,
+          X402.Extensions.SIWX.Storage,
+          X402.Extensions.SIWX.ETSStorage
         ]
       ],
       groups_for_docs: [
