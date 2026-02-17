@@ -241,18 +241,20 @@ defmodule X402.Facilitator do
     case run_before_hook(hooks_module, operation, context, metadata) do
       {:cont, %Context{} = before_context} ->
         result =
-          HTTP.request(
-            state.finch,
-            state.url,
-            endpoint,
-            %{
-              payload: before_context.payload,
-              requirements: before_context.requirements
-            },
-            max_retries: state.max_retries,
-            retry_backoff_ms: state.retry_backoff_ms,
-            receive_timeout_ms: state.receive_timeout_ms
-          )
+          with :ok <- validate_scheme_payment(before_context.payload, before_context.requirements) do
+            HTTP.request(
+              state.finch,
+              state.url,
+              endpoint,
+              %{
+                payload: before_context.payload,
+                requirements: before_context.requirements
+              },
+              max_retries: state.max_retries,
+              retry_backoff_ms: state.retry_backoff_ms,
+              receive_timeout_ms: state.receive_timeout_ms
+            )
+          end
 
         handle_operation_result(hooks_module, operation, before_context, result, metadata)
 
@@ -363,6 +365,146 @@ defmodule X402.Facilitator do
   catch
     kind, reason -> {:error, {kind, reason}}
   end
+
+  defp validate_scheme_payment(payload, requirements) do
+    case map_value(requirements, {"scheme", :scheme}) || map_value(payload, {"scheme", :scheme}) do
+      "upto" ->
+        validate_upto_payment(payload, requirements)
+
+      _scheme ->
+        :ok
+    end
+  end
+
+  defp validate_upto_payment(payload, requirements) do
+    with {:ok, max_price} <- extract_max_price(payload, requirements),
+         {:ok, payment_value} <- extract_payment_value(payload) do
+      ensure_not_exceeds(payment_value, max_price)
+    end
+  end
+
+  defp extract_max_price(payload, requirements) do
+    value =
+      first_present([
+        map_value(requirements, {"maxPrice", :maxPrice}),
+        map_value(requirements, {"maxAmountRequired", :maxAmountRequired}),
+        map_value(payload, {"maxPrice", :maxPrice}),
+        map_value(payload, {"maxAmountRequired", :maxAmountRequired})
+      ])
+
+    case value do
+      nil ->
+        {:error, {:invalid_upto_payment, :missing_max_price}}
+
+      max_price ->
+        case parse_decimal(max_price) do
+          {:ok, parsed} -> {:ok, parsed}
+          :error -> {:error, {:invalid_upto_payment, :invalid_max_price}}
+        end
+    end
+  end
+
+  defp extract_payment_value(payload) do
+    value =
+      first_present([
+        map_value(payload, {"value", :value}),
+        nested_map_value(payload, [{"payload", :payload}, {"value", :value}]),
+        nested_map_value(payload, [
+          {"payload", :payload},
+          {"authorization", :authorization},
+          {"value", :value}
+        ]),
+        nested_map_value(payload, [{"authorization", :authorization}, {"value", :value}])
+      ])
+
+    case value do
+      nil ->
+        {:error, {:invalid_upto_payment, :missing_payment_value}}
+
+      payment_value ->
+        case parse_decimal(payment_value) do
+          {:ok, parsed} -> {:ok, parsed}
+          :error -> {:error, {:invalid_upto_payment, :invalid_payment_value}}
+        end
+    end
+  end
+
+  defp ensure_not_exceeds(payment_value, max_price) do
+    case compare_decimal(payment_value, max_price) do
+      :gt -> {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
+      _comparison -> :ok
+    end
+  end
+
+  defp compare_decimal({left_value, left_scale}, {right_value, right_scale})
+       when left_scale == right_scale do
+    compare_integer(left_value, right_value)
+  end
+
+  defp compare_decimal({left_value, left_scale}, {right_value, right_scale})
+       when left_scale > right_scale do
+    compare_integer(left_value, right_value * Integer.pow(10, left_scale - right_scale))
+  end
+
+  defp compare_decimal({left_value, left_scale}, {right_value, right_scale}) do
+    compare_integer(left_value * Integer.pow(10, right_scale - left_scale), right_value)
+  end
+
+  defp compare_integer(left, right) when left < right, do: :lt
+  defp compare_integer(left, right) when left > right, do: :gt
+  defp compare_integer(_left, _right), do: :eq
+
+  defp parse_decimal(value) when is_integer(value) and value >= 0, do: {:ok, {value, 0}}
+  defp parse_decimal(value) when is_binary(value), do: parse_decimal_string(String.trim(value))
+  defp parse_decimal(_value), do: :error
+
+  defp parse_decimal_string(""), do: :error
+
+  defp parse_decimal_string(value) do
+    cond do
+      Regex.match?(~r/^\d+$/, value) ->
+        {:ok, {String.to_integer(value), 0}}
+
+      Regex.match?(~r/^\d+\.\d+$/, value) ->
+        [whole, fraction] = String.split(value, ".", parts: 2)
+        normalized_fraction = String.trim_trailing(fraction, "0")
+
+        case normalized_fraction do
+          "" ->
+            {:ok, {String.to_integer(whole), 0}}
+
+          fraction_digits ->
+            digits = whole <> fraction_digits
+            {:ok, {String.to_integer(digits), String.length(fraction_digits)}}
+        end
+
+      true ->
+        :error
+    end
+  end
+
+  defp nested_map_value(map, [key]) when is_map(map), do: map_value(map, key)
+
+  defp nested_map_value(map, [key | rest]) when is_map(map) do
+    case map_value(map, key) do
+      %{} = nested -> nested_map_value(nested, rest)
+      _other -> nil
+    end
+  end
+
+  defp nested_map_value(_not_map, _keys), do: nil
+
+  defp map_value(map, {string_key, atom_key}) do
+    case Map.fetch(map, string_key) do
+      {:ok, value} ->
+        value
+
+      :error ->
+        Map.get(map, atom_key)
+    end
+  end
+
+  defp first_present(values), do: Enum.find(values, &(not is_nil(&1)))
 
   defp before_callback(:verify), do: :before_verify
   defp before_callback(:settle), do: :before_settle

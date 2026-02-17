@@ -111,6 +111,27 @@ defmodule X402.FacilitatorTest do
     def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
   end
 
+  defmodule UptoAdjustingHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata) do
+      {:cont, %Context{context | payload: Map.put(context.payload, "value", "9")}}
+    end
+
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+
+    def before_settle(%Context{} = context, _metadata) do
+      {:cont, %Context{context | payload: Map.put(context.payload, "value", "9")}}
+    end
+
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
   setup :setup_bypass
   setup :setup_finch
 
@@ -378,6 +399,101 @@ defmodule X402.FacilitatorTest do
 
     assert {:error, %Error{type: :http_error, status: 400, retryable: false}} =
              Facilitator.verify(facilitator, %{}, %{})
+  end
+
+  test "verify/3 rejects upto payments above maxPrice before HTTP request", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    parent = self()
+
+    Bypass.stub(bypass, "POST", "/verify", fn conn ->
+      send(parent, :verify_http_called)
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    assert {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}} =
+             Facilitator.verify(
+               facilitator,
+               %{"value" => "11"},
+               %{"scheme" => "upto", "maxPrice" => "10"}
+             )
+
+    refute_receive :verify_http_called
+  end
+
+  test "settle/3 rejects upto payments above maxPrice before HTTP request", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    parent = self()
+
+    Bypass.stub(bypass, "POST", "/settle", fn conn ->
+      send(parent, :settle_http_called)
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    assert {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}} =
+             Facilitator.settle(
+               facilitator,
+               %{"value" => "11"},
+               %{"scheme" => "upto", "maxPrice" => "10"}
+             )
+
+    refute_receive :settle_http_called
+  end
+
+  test "upto validation respects before hooks for verify and settle", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert %{"payload" => %{"value" => "9"}} = Jason.decode!(body)
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    Bypass.expect(bypass, "POST", "/settle", fn conn ->
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert %{"payload" => %{"value" => "9"}} = Jason.decode!(body)
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         hooks: UptoAdjustingHooks}
+      )
+
+    assert {:ok, %{status: 200, body: %{"verified" => true}}} =
+             Facilitator.verify(
+               facilitator,
+               %{"value" => "11"},
+               %{"scheme" => "upto", "maxPrice" => "10"}
+             )
+
+    assert {:ok, %{status: 200, body: %{"settled" => true}}} =
+             Facilitator.settle(
+               facilitator,
+               %{"value" => "11"},
+               %{"scheme" => "upto", "maxPrice" => "10"}
+             )
   end
 
   test "emits telemetry span events", %{

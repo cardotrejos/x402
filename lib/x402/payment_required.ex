@@ -8,6 +8,7 @@ defmodule X402.PaymentRequired do
 
   alias X402.Telemetry
 
+  @type scheme :: String.t()
   @type encode_error :: :invalid_payload | :invalid_json
   @type decode_error :: :invalid_base64 | :invalid_json
 
@@ -39,7 +40,9 @@ defmodule X402.PaymentRequired do
   """
   @spec encode(map()) :: {:ok, String.t()} | {:error, encode_error()}
   def encode(payload) when is_map(payload) do
-    case Jason.encode(payload) do
+    normalized_payload = normalize_payload(payload)
+
+    case Jason.encode(normalized_payload) do
       {:ok, json} ->
         result = {:ok, Base.encode64(json)}
         Telemetry.emit(:payment_required, :encode, :ok, %{header: header_name()})
@@ -85,7 +88,7 @@ defmodule X402.PaymentRequired do
     with {:ok, json} <- decode_base64(value),
          {:ok, decoded} <- Jason.decode(json),
          true <- is_map(decoded) do
-      result = {:ok, decoded}
+      result = {:ok, normalize_payload(decoded)}
       Telemetry.emit(:payment_required, :decode, :ok, %{header: header_name()})
       result
     else
@@ -132,5 +135,92 @@ defmodule X402.PaymentRequired do
       {:ok, decoded} -> {:ok, decoded}
       :error -> {:error, :invalid_base64}
     end
+  end
+
+  @spec normalize_payload(map()) :: map()
+  defp normalize_payload(payload) do
+    payload
+    |> normalize_upto_entry()
+    |> normalize_accepts_entries()
+  end
+
+  @spec normalize_upto_entry(map()) :: map()
+  defp normalize_upto_entry(payload) do
+    case scheme(payload) do
+      "upto" -> replace_amount_key(payload)
+      :upto -> replace_amount_key(payload)
+      _scheme -> payload
+    end
+  end
+
+  @spec normalize_accepts_entries(map()) :: map()
+  defp normalize_accepts_entries(payload) do
+    case map_value(payload, {"accepts", :accepts}) do
+      accepts when is_list(accepts) ->
+        normalized =
+          Enum.map(accepts, fn
+            %{} = entry -> normalize_upto_entry(entry)
+            other -> other
+          end)
+
+        map_put(payload, {"accepts", :accepts}, normalized)
+
+      _other ->
+        payload
+    end
+  end
+
+  @spec replace_amount_key(map()) :: map()
+  defp replace_amount_key(payload) do
+    case map_value(payload, {"maxPrice", :maxPrice}) do
+      nil ->
+        case map_value(payload, {"maxAmountRequired", :maxAmountRequired}) do
+          nil ->
+            payload
+
+          legacy_max_amount ->
+            payload
+            |> map_put({"maxPrice", :maxPrice}, legacy_max_amount)
+            |> map_delete({"maxAmountRequired", :maxAmountRequired})
+        end
+
+      _max_price ->
+        payload
+    end
+  end
+
+  @spec scheme(map()) :: scheme() | atom() | nil
+  defp scheme(payload), do: map_value(payload, {"scheme", :scheme})
+
+  @spec map_value(map(), {String.t(), atom()}) :: term()
+  defp map_value(map, {string_key, atom_key}) do
+    case Map.fetch(map, string_key) do
+      {:ok, value} ->
+        value
+
+      :error ->
+        Map.get(map, atom_key)
+    end
+  end
+
+  @spec map_put(map(), {String.t(), atom()}, term()) :: map()
+  defp map_put(map, {string_key, atom_key}, value) do
+    cond do
+      Map.has_key?(map, string_key) ->
+        Map.put(map, string_key, value)
+
+      Map.has_key?(map, atom_key) ->
+        Map.put(map, atom_key, value)
+
+      true ->
+        Map.put(map, string_key, value)
+    end
+  end
+
+  @spec map_delete(map(), {String.t(), atom()}) :: map()
+  defp map_delete(map, {string_key, atom_key}) do
+    map
+    |> Map.delete(string_key)
+    |> Map.delete(atom_key)
   end
 end

@@ -85,6 +85,8 @@ defmodule X402.Plug.PaymentGateTest do
     receiver: "0x1111111111111111111111111111111111111111"
   }
 
+  @upto_route Map.put(@route, :scheme, "upto")
+
   test "passes through non-gated routes" do
     conn = conn(:get, "/public")
     result_conn = run_request(conn, routes: [@route], facilitator: self())
@@ -144,6 +146,18 @@ defmodule X402.Plug.PaymentGateTest do
     assert accept["extra"] == %{}
   end
 
+  test "returns 402 response with maxPrice for upto scheme routes" do
+    conn = conn(:get, "/api/resource")
+    result_conn = run_request(conn, routes: [@upto_route], facilitator: self())
+    body = Jason.decode!(result_conn.resp_body)
+    [accept] = body["accepts"]
+
+    assert result_conn.status == 402
+    assert accept["scheme"] == "upto"
+    assert accept["maxPrice"] == "0.01"
+    refute Map.has_key?(accept, "maxAmountRequired")
+  end
+
   test "verifies and settles valid payments before pass-through" do
     facilitator = start_mock_facilitator()
 
@@ -185,6 +199,43 @@ defmodule X402.Plug.PaymentGateTest do
     assert_receive {:verify_called, _payload, requirements, TrackingHooks}
     assert requirements["resource"] == "/api/resource"
     assert_receive {:settle_called, _payload, ^requirements, TrackingHooks}
+  end
+
+  test "verifies and settles valid upto payments before pass-through" do
+    facilitator = start_mock_facilitator()
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_upto_payment_header("0.009"))
+
+    result_conn = run_request(conn, routes: [@upto_route], facilitator: facilitator)
+
+    assert result_conn.status == 200
+
+    assert_receive {:verify_called, payload, requirements, hooks_module}
+    assert payload["scheme"] == "upto"
+    assert payload["value"] == "0.009"
+    assert requirements["scheme"] == "upto"
+    assert requirements["maxPrice"] == "0.01"
+    refute Map.has_key?(requirements, "maxAmountRequired")
+    assert hooks_module == nil
+
+    assert_receive {:settle_called, _payload, ^requirements, ^hooks_module}
+  end
+
+  test "rejects upto payments when value exceeds route maxPrice" do
+    facilitator = start_mock_facilitator()
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_upto_payment_header("0.02"))
+
+    result_conn = run_request(conn, routes: [@upto_route], facilitator: facilitator)
+    body = Jason.decode!(result_conn.resp_body)
+
+    assert result_conn.status == 402
+    assert body["error"] == "invalid payment payload"
+    refute_received {:verify_called, _payload, _requirements, _hooks_module}
   end
 
   test "rejects invalid x-payment header values" do
@@ -294,6 +345,10 @@ defmodule X402.Plug.PaymentGateTest do
 
     assert_raise NimbleOptions.ValidationError, fn ->
       PaymentGate.init(routes: [@route], hooks: :not_a_hook_module)
+    end
+
+    assert_raise NimbleOptions.ValidationError, fn ->
+      PaymentGate.init(routes: [Map.put(@route, :scheme, "invalid")])
     end
   end
 
@@ -472,6 +527,18 @@ defmodule X402.Plug.PaymentGateTest do
       "network" => "base-sepolia",
       "scheme" => "exact",
       "payerWallet" => "0x1111111111111111111111111111111111111111"
+    }
+    |> Jason.encode!()
+    |> Base.encode64()
+  end
+
+  defp valid_upto_payment_header(value) do
+    %{
+      "transactionHash" => "0xabc",
+      "network" => "base-sepolia",
+      "scheme" => "upto",
+      "payerWallet" => "0x1111111111111111111111111111111111111111",
+      "value" => value
     }
     |> Jason.encode!()
     |> Base.encode64()
