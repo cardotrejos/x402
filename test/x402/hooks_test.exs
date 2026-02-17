@@ -25,7 +25,7 @@ defmodule X402.HooksTest do
   end
 
   test "validate_module/1 accepts modules implementing X402.Hooks" do
-    assert :ok = Hooks.validate_module(ValidHooks)
+    assert {:ok, ValidHooks} = Hooks.validate_module(ValidHooks)
   end
 
   test "validate_module/1 rejects modules missing required callbacks" do
