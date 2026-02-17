@@ -39,7 +39,6 @@ defmodule X402.Extensions.SIWX.Verifier.Default do
     else
       {:error, :recovery_failure} -> {:ok, false}
       {:error, reason} -> {:error, reason}
-      reason when is_atom(reason) -> {:error, reason}
     end
   end
 
