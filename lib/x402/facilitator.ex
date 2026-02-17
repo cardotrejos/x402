@@ -261,10 +261,16 @@ defmodule X402.Facilitator do
     end
   end
 
-  defp handle_operation_result(hooks_module, operation, context, {:ok, result}, metadata)
+  defp handle_operation_result(
+         hooks_module,
+         operation,
+         %Context{} = context,
+         {:ok, result},
+         metadata
+       )
        when is_map(result) do
     callback = after_callback(operation)
-    success_context = %Context{context | result: result, error: nil}
+    success_context = %{context | result: result, error: nil}
 
     with {:ok, %Context{} = after_context} <-
            run_after_hook(hooks_module, operation, success_context, metadata),
@@ -273,8 +279,14 @@ defmodule X402.Facilitator do
     end
   end
 
-  defp handle_operation_result(hooks_module, operation, context, {:error, error}, metadata) do
-    failure_context = %Context{context | result: nil, error: error}
+  defp handle_operation_result(
+         hooks_module,
+         operation,
+         %Context{} = context,
+         {:error, error},
+         metadata
+       ) do
+    failure_context = %{context | result: nil, error: error}
     run_failure_hook(hooks_module, operation, failure_context, error, metadata)
   end
 
