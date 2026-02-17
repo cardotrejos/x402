@@ -123,7 +123,10 @@ defmodule X402.MixProject do
         ],
         "Facilitator Client": [
           X402.Facilitator,
-          X402.Facilitator.HTTP
+          X402.Facilitator.HTTP,
+          X402.Hooks,
+          X402.Hooks.Context,
+          X402.Hooks.Default
         ],
         "Plug Integration": [
           X402.Plug.PaymentGate
