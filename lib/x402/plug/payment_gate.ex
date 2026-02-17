@@ -18,6 +18,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     alias X402.Facilitator
     alias X402.Facilitator.Error
+    alias X402.Hooks
+    alias X402.Hooks.Default
     alias X402.PaymentSignature
 
     import Plug.Conn, only: [get_req_header: 2, halt: 1, put_resp_content_type: 2, send_resp: 3]
@@ -68,6 +70,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         default: Facilitator,
         doc: "Facilitator server pid/name used for verification and settlement."
       ],
+      hooks: [
+        type: {:custom, Hooks, :validate_module, []},
+        default: Default,
+        doc: "Lifecycle hook module implementing `X402.Hooks`."
+      ],
       routes: [
         type: {:list, {:map, @route_schema}},
         required: true,
@@ -78,6 +85,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @typedoc "Configuration map produced by `init/1`."
     @type options :: %{
             facilitator: Facilitator.server(),
+            hooks: module(),
             routes: [compiled_route()]
           }
 
@@ -108,6 +116,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
       %{
         facilitator: Keyword.fetch!(validated_opts, :facilitator),
+        hooks: Keyword.fetch!(validated_opts, :hooks),
         routes:
           validated_opts
           |> Keyword.fetch!(:routes)
@@ -120,7 +129,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     Gates matching requests behind x402 payment verification.
     """
     @spec call(Plug.Conn.t(), options()) :: Plug.Conn.t()
-    def call(%Plug.Conn{} = conn, %{facilitator: facilitator, routes: routes}) do
+    def call(%Plug.Conn{} = conn, %{facilitator: facilitator, hooks: hooks, routes: routes}) do
       request_path = normalize_path(conn.request_path)
       request_method = normalize_method(conn.method)
 
@@ -130,18 +139,19 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           conn
 
         route ->
-          handle_payment_gate(conn, facilitator, route, request_method, request_path)
+          handle_payment_gate(conn, facilitator, hooks, route, request_method, request_path)
       end
     end
 
     @spec handle_payment_gate(
             Plug.Conn.t(),
             Facilitator.server(),
+            module(),
             compiled_route(),
             atom(),
             String.t()
           ) :: Plug.Conn.t()
-    defp handle_payment_gate(conn, facilitator, route, request_method, request_path) do
+    defp handle_payment_gate(conn, facilitator, hooks, route, request_method, request_path) do
       case payment_header(conn) do
         :missing ->
           emit(:payment_required, %{method: request_method, path: request_path, route: route.path})
@@ -149,7 +159,15 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           payment_required_response(conn, route, request_path, "")
 
         {:ok, header} ->
-          verify_and_settle(conn, facilitator, route, request_method, request_path, header)
+          verify_and_settle(
+            conn,
+            facilitator,
+            hooks,
+            route,
+            request_method,
+            request_path,
+            header
+          )
 
         {:error, reason} ->
           emit(:payment_rejected, %{
@@ -166,20 +184,21 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec verify_and_settle(
             Plug.Conn.t(),
             Facilitator.server(),
+            module(),
             compiled_route(),
             atom(),
             String.t(),
             String.t()
           ) :: Plug.Conn.t()
-    defp verify_and_settle(conn, facilitator, route, request_method, request_path, header) do
+    defp verify_and_settle(conn, facilitator, hooks, route, request_method, request_path, header) do
       requirements = facilitator_requirements(route, request_path)
 
       with {:ok, payment_payload} <- PaymentSignature.decode_and_validate(header, requirements),
            {:ok, verify_response} <-
-             Facilitator.verify(facilitator, payment_payload, requirements),
+             facilitator_verify(facilitator, payment_payload, requirements, hooks),
            :ok <- ensure_success_status(verify_response),
            {:ok, settle_response} <-
-             Facilitator.settle(facilitator, payment_payload, requirements),
+             facilitator_settle(facilitator, payment_payload, requirements, hooks),
            :ok <- ensure_success_status(settle_response) do
         emit(:payment_verified, %{method: request_method, path: request_path, route: route.path})
         conn
@@ -194,6 +213,26 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
           payment_required_response(conn, route, request_path, rejection_error(reason))
       end
+    end
+
+    @spec facilitator_verify(Facilitator.server(), map(), map(), module()) ::
+            Facilitator.response()
+    defp facilitator_verify(facilitator, payment_payload, requirements, Default) do
+      Facilitator.verify(facilitator, payment_payload, requirements)
+    end
+
+    defp facilitator_verify(facilitator, payment_payload, requirements, hooks) do
+      Facilitator.verify(facilitator, payment_payload, requirements, hooks)
+    end
+
+    @spec facilitator_settle(Facilitator.server(), map(), map(), module()) ::
+            Facilitator.response()
+    defp facilitator_settle(facilitator, payment_payload, requirements, Default) do
+      Facilitator.settle(facilitator, payment_payload, requirements)
+    end
+
+    defp facilitator_settle(facilitator, payment_payload, requirements, hooks) do
+      Facilitator.settle(facilitator, payment_payload, requirements, hooks)
     end
 
     @spec compile_route(map()) :: compiled_route()
@@ -344,6 +383,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             :invalid_payment_header
             | PaymentSignature.decode_and_validate_error()
             | {:unexpected_facilitator_status, non_neg_integer()}
+            | Hooks.hook_error()
             | Error.t()
             | term()
           ) :: String.t()
