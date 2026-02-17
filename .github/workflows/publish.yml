@@ -29,7 +29,8 @@ jobs:
       - run: mix compile
 
       - name: Publish to Hex.pm
-        run: mix hex.publish --yes
+        run: |
+          mix hex.publish --yes 2>&1 || mix hex.publish --yes --replace
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
