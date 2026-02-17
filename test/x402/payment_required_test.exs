@@ -27,6 +27,24 @@ defmodule X402.PaymentRequiredTest do
     test "returns invalid_json for non-encodable map values" do
       assert PaymentRequired.encode(%{"bad" => self()}) == {:error, :invalid_json}
     end
+
+    test "encodes an upto payload with maxPrice" do
+      payload = %{"scheme" => "upto", "maxPrice" => "100"}
+
+      assert {:ok, encoded} = PaymentRequired.encode(payload)
+      assert {:ok, ^payload} = PaymentRequired.decode(encoded)
+    end
+
+    test "normalizes legacy upto payload key to maxPrice while encoding" do
+      legacy_payload = %{"scheme" => "upto", "maxAmountRequired" => "100"}
+
+      assert {:ok, encoded} = PaymentRequired.encode(legacy_payload)
+      assert {:ok, decoded} = PaymentRequired.decode(encoded)
+
+      assert decoded["scheme"] == "upto"
+      assert decoded["maxPrice"] == "100"
+      refute Map.has_key?(decoded, "maxAmountRequired")
+    end
   end
 
   describe "decode/1" do
@@ -44,6 +62,28 @@ defmodule X402.PaymentRequiredTest do
     test "returns invalid_json for json that is not a map" do
       not_map = Base.encode64("[]")
       assert PaymentRequired.decode(not_map) == {:error, :invalid_json}
+    end
+
+    test "normalizes upto accepts entries to maxPrice" do
+      payload =
+        %{
+          "accepts" => [
+            %{"scheme" => "upto", "maxAmountRequired" => "42"},
+            %{"scheme" => "exact", "maxAmountRequired" => "7"}
+          ]
+        }
+        |> Jason.encode!()
+        |> Base.encode64()
+
+      assert {:ok, decoded} = PaymentRequired.decode(payload)
+      [upto, exact] = decoded["accepts"]
+
+      assert upto["scheme"] == "upto"
+      assert upto["maxPrice"] == "42"
+      refute Map.has_key?(upto, "maxAmountRequired")
+
+      assert exact["scheme"] == "exact"
+      assert exact["maxAmountRequired"] == "7"
     end
   end
 end
