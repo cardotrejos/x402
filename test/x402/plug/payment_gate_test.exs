@@ -29,14 +29,19 @@ defmodule X402.Plug.PaymentGateTest do
 
     @impl true
     def handle_call({:verify, payment_payload, requirements}, _from, state) do
-      send(state.owner, {:verify_called, payment_payload, requirements})
-      {:reply, resolve_result(state.verify, payment_payload, requirements), state}
+      handle_verify_call(payment_payload, requirements, nil, state)
     end
 
-    @impl true
+    def handle_call({:verify, payment_payload, requirements, hooks_module}, _from, state) do
+      handle_verify_call(payment_payload, requirements, hooks_module, state)
+    end
+
     def handle_call({:settle, payment_payload, requirements}, _from, state) do
-      send(state.owner, {:settle_called, payment_payload, requirements})
-      {:reply, resolve_result(state.settle, payment_payload, requirements), state}
+      handle_settle_call(payment_payload, requirements, nil, state)
+    end
+
+    def handle_call({:settle, payment_payload, requirements, hooks_module}, _from, state) do
+      handle_settle_call(payment_payload, requirements, hooks_module, state)
     end
 
     defp resolve_result(result, _payment_payload, _requirements) when is_tuple(result), do: result
@@ -45,6 +50,30 @@ defmodule X402.Plug.PaymentGateTest do
          when is_function(result_fun, 2) do
       result_fun.(payment_payload, requirements)
     end
+
+    defp handle_verify_call(payment_payload, requirements, hooks_module, state) do
+      send(state.owner, {:verify_called, payment_payload, requirements, hooks_module})
+      {:reply, resolve_result(state.verify, payment_payload, requirements), state}
+    end
+
+    defp handle_settle_call(payment_payload, requirements, hooks_module, state) do
+      send(state.owner, {:settle_called, payment_payload, requirements, hooks_module})
+      {:reply, resolve_result(state.settle, payment_payload, requirements), state}
+    end
+  end
+
+  defmodule TrackingHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
   end
 
   @route %{
@@ -126,14 +155,36 @@ defmodule X402.Plug.PaymentGateTest do
 
     assert result_conn.status == 200
 
-    assert_receive {:verify_called, payload, requirements}
+    assert_receive {:verify_called, payload, requirements, hooks_module}
     assert payload["transactionHash"] == "0xabc"
     assert requirements["network"] == "base-sepolia"
     assert requirements["asset"] == "USDC"
     assert requirements["resource"] == "/api/resource"
+    assert hooks_module == nil
 
-    assert_receive {:settle_called, payload, ^requirements}
+    assert_receive {:settle_called, payload, ^requirements, ^hooks_module}
     assert payload["payerWallet"] == "0x1111111111111111111111111111111111111111"
+  end
+
+  test "passes configured hooks module to facilitator calls" do
+    facilitator = start_mock_facilitator()
+
+    conn =
+      conn(:get, "/api/resource")
+      |> put_req_header("x-payment", valid_payment_header())
+
+    result_conn =
+      run_request(
+        conn,
+        routes: [@route],
+        facilitator: facilitator,
+        hooks: TrackingHooks
+      )
+
+    assert result_conn.status == 200
+    assert_receive {:verify_called, _payload, requirements, TrackingHooks}
+    assert requirements["resource"] == "/api/resource"
+    assert_receive {:settle_called, _payload, ^requirements, TrackingHooks}
   end
 
   test "rejects invalid x-payment header values" do
@@ -148,7 +199,7 @@ defmodule X402.Plug.PaymentGateTest do
 
     assert result_conn.status == 402
     assert body["error"] == "invalid payment header"
-    refute_received {:verify_called, _payload, _requirements}
+    refute_received {:verify_called, _payload, _requirements, _hooks_module}
   end
 
   test "rejects when facilitator verification fails" do
@@ -162,7 +213,7 @@ defmodule X402.Plug.PaymentGateTest do
     result_conn = run_request(conn, routes: [@route], facilitator: facilitator)
 
     assert result_conn.status == 402
-    refute_received {:settle_called, _payload, _requirements}
+    refute_received {:settle_called, _payload, _requirements, _hooks_module}
   end
 
   test "emits pass_through, payment_required, payment_verified, and payment_rejected telemetry events" do
@@ -240,6 +291,10 @@ defmodule X402.Plug.PaymentGateTest do
         ]
       )
     end
+
+    assert_raise NimbleOptions.ValidationError, fn ->
+      PaymentGate.init(routes: [@route], hooks: :not_a_hook_module)
+    end
   end
 
   test "rejects empty x-payment header" do
@@ -254,7 +309,7 @@ defmodule X402.Plug.PaymentGateTest do
 
     assert result_conn.status == 402
     assert body["error"] == "invalid payment header"
-    refute_received {:verify_called, _payload, _requirements}
+    refute_received {:verify_called, _payload, _requirements, _hooks_module}
   end
 
   test "rejects when settlement fails" do
@@ -320,7 +375,7 @@ defmodule X402.Plug.PaymentGateTest do
     assert result_conn.status == 402
     body = Jason.decode!(result_conn.resp_body)
     assert body["error"] == "invalid payment payload"
-    refute_received {:verify_called, _payload, _requirements}
+    refute_received {:verify_called, _payload, _requirements, _hooks_module}
   end
 
   test "rejection_error for invalid_json in payment header" do
@@ -338,7 +393,7 @@ defmodule X402.Plug.PaymentGateTest do
     assert result_conn.status == 402
     body = Jason.decode!(result_conn.resp_body)
     assert body["error"] == "invalid payment header"
-    refute_received {:verify_called, _payload, _requirements}
+    refute_received {:verify_called, _payload, _requirements, _hooks_module}
   end
 
   test "handles multiple routes with first match winning" do

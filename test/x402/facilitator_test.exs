@@ -3,8 +3,113 @@ defmodule X402.FacilitatorTest do
 
   alias X402.Facilitator
   alias X402.Facilitator.Error
+  alias X402.Hooks.Context
 
   import X402.TestHelpers
+
+  defmodule MutatingHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata) do
+      {:cont,
+       %Context{
+         context
+         | payload: Map.put(context.payload, "beforeVerify", true),
+           requirements: Map.put(context.requirements, "beforeVerify", true)
+       }}
+    end
+
+    def after_verify(%Context{} = context, _metadata) do
+      body = Map.fetch!(context.result, :body)
+      result = Map.put(context.result, :body, Map.put(body, "afterVerify", true))
+      {:cont, %Context{context | result: result}}
+    end
+
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+
+    def before_settle(%Context{} = context, _metadata) do
+      {:cont,
+       %Context{
+         context
+         | payload: Map.put(context.payload, "beforeSettle", true),
+           requirements: Map.put(context.requirements, "beforeSettle", true)
+       }}
+    end
+
+    def after_settle(%Context{} = context, _metadata) do
+      body = Map.fetch!(context.result, :body)
+      result = Map.put(context.result, :body, Map.put(body, "afterSettle", true))
+      {:cont, %Context{context | result: result}}
+    end
+
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule VerifyHaltHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = _context, _metadata), do: {:halt, :verify_halted}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule VerifyRecoverHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+
+    def on_verify_failure(%Context{} = _context, _metadata) do
+      {:recover, %{status: 200, body: %{"recovered" => true}}}
+    end
+
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule SettleRecoverHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+
+    def on_settle_failure(%Context{} = _context, _metadata) do
+      {:recover, %{status: 200, body: %{"settled" => "recovered"}}}
+    end
+  end
+
+  defmodule InvalidAfterVerifyHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = _context, _metadata), do: :invalid_return
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
 
   setup :setup_bypass
   setup :setup_finch
@@ -59,6 +164,180 @@ defmodule X402.FacilitatorTest do
 
     assert {:ok, %{status: 200, body: %{"settled" => true}}} =
              Facilitator.settle(facilitator, payment_payload, requirements)
+  end
+
+  test "before_verify and after_verify hooks can mutate verify flow", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      assert %{
+               "payload" => %{"beforeVerify" => true},
+               "requirements" => %{"beforeVerify" => true}
+             } = Jason.decode!(body)
+
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         hooks: MutatingHooks}
+      )
+
+    assert {:ok, %{status: 200, body: %{"verified" => true, "afterVerify" => true}}} =
+             Facilitator.verify(facilitator, %{}, %{})
+  end
+
+  test "before_settle and after_settle hooks can mutate settle flow", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "POST", "/settle", fn conn ->
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      assert %{
+               "payload" => %{"beforeSettle" => true},
+               "requirements" => %{"beforeSettle" => true}
+             } = Jason.decode!(body)
+
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         hooks: MutatingHooks}
+      )
+
+    assert {:ok, %{status: 200, body: %{"settled" => true, "afterSettle" => true}}} =
+             Facilitator.settle(facilitator, %{}, %{})
+  end
+
+  test "before_verify can halt the operation", %{
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         hooks: VerifyHaltHooks}
+      )
+
+    assert {:error, {:hook_halted, :before_verify, :verify_halted}} =
+             Facilitator.verify(facilitator, %{}, %{})
+  end
+
+  test "on_verify_failure can recover failed verification", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      Plug.Conn.resp(conn, 500, Jason.encode!(%{"error" => "retry me"}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         hooks: VerifyRecoverHooks}
+      )
+
+    assert {:ok, %{status: 200, body: %{"recovered" => true}}} =
+             Facilitator.verify(facilitator, %{}, %{})
+  end
+
+  test "on_settle_failure can recover failed settlement", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "POST", "/settle", fn conn ->
+      Plug.Conn.resp(conn, 500, Jason.encode!(%{"error" => "retry me"}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         hooks: SettleRecoverHooks}
+      )
+
+    assert {:ok, %{status: 200, body: %{"settled" => "recovered"}}} =
+             Facilitator.settle(facilitator, %{}, %{})
+  end
+
+  test "verify/4 and settle/4 override the configured hook module", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert %{"payload" => %{"beforeVerify" => true}} = Jason.decode!(body)
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    Bypass.expect(bypass, "POST", "/settle", fn conn ->
+      assert {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert %{"payload" => %{"beforeSettle" => true}} = Jason.decode!(body)
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         hooks: X402.Hooks.Default}
+      )
+
+    assert {:ok, %{status: 200, body: %{"verified" => true, "afterVerify" => true}}} =
+             Facilitator.verify(facilitator, %{}, %{}, MutatingHooks)
+
+    assert {:ok, %{status: 200, body: %{"settled" => true, "afterSettle" => true}}} =
+             Facilitator.settle(facilitator, %{}, %{}, MutatingHooks)
+  end
+
+  test "returns hook_invalid_return when hook callback returns invalid tuple", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         hooks: InvalidAfterVerifyHooks}
+      )
+
+    assert {:error, {:hook_invalid_return, :after_verify, :invalid_return}} =
+             Facilitator.verify(facilitator, %{}, %{})
   end
 
   test "verify/2 and settle/2 use default registered name", %{
@@ -148,6 +427,14 @@ defmodule X402.FacilitatorTest do
 
     assert {:error, %NimbleOptions.ValidationError{}} =
              Facilitator.start_link(finch: :finch, max_retries: -1)
+
+    assert {:error, %NimbleOptions.ValidationError{}} =
+             Facilitator.start_link(finch: :finch, hooks: :not_a_hook_module)
+  end
+
+  test "hook context struct includes payload and requirements" do
+    assert %Context{payload: %{a: 1}, requirements: %{b: 2}, result: nil, error: nil} =
+             Context.new(%{a: 1}, %{b: 2})
   end
 
   defp unique_name(prefix) do
