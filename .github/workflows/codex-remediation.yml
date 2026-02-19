@@ -207,8 +207,8 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          # Run Codex with the remediation prompt
-          codex exec --full-auto \
+          # Run Codex with gpt-5.3-codex and high reasoning
+          codex -m gpt-5.3-codex exec --full-auto \
             -c model_reasoning_effort="high" \
             "$(cat /tmp/remediation-prompt.txt)" \
             2>&1 | tee /tmp/codex-output.txt || true
