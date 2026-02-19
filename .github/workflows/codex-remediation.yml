@@ -1,0 +1,297 @@
+name: Codex Remediation
+
+on:
+  # Trigger when Greptile posts a review
+  pull_request_review:
+    types: [submitted]
+  # Also trigger on new review comments
+  pull_request_review_comment:
+    types: [created]
+  # Manual trigger for specific PRs
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to remediate"
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: codex-remediation-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  remediate:
+    name: Codex Remediation
+    runs-on: ubuntu-latest
+    # Only run for Greptile reviews with actionable findings
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.user.login == 'greptile-apps[bot]' &&
+       github.event.review.state != 'approved') ||
+      (github.event_name == 'pull_request_review_comment' &&
+       github.event.comment.user.login == 'greptile-apps[bot]')
+    env:
+      MAX_ITERATIONS: 5
+    steps:
+      - name: Get PR info
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR_NUMBER="${{ inputs.pr_number }}"
+          else
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+          fi
+
+          PR_DATA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+            --jq '{head_sha: .head.sha, head_ref: .head.ref, base_ref: .base.ref}')
+
+          HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head_sha')
+          HEAD_REF=$(echo "$PR_DATA" | jq -r '.head_ref')
+          BASE_REF=$(echo "$PR_DATA" | jq -r '.base_ref')
+
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+          echo "PR #$PR_NUMBER, HEAD: ${HEAD_SHA:0:7}, branch: $HEAD_REF"
+
+      - name: Check iteration count
+        id: iterations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MARKER="<!-- codex-remediation-fix -->"
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+
+          FIX_COUNT=$(gh api \
+            "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"${MARKER}\"))] | length" \
+            2>/dev/null || echo "0")
+
+          echo "count=$FIX_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Remediation iteration: $FIX_COUNT / $MAX_ITERATIONS"
+
+          if [ "$FIX_COUNT" -ge "$MAX_ITERATIONS" ]; then
+            echo "exceeded=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Max remediation iterations ($MAX_ITERATIONS) reached. Flagging for human review."
+          else
+            echo "exceeded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Flag for human review if max iterations exceeded
+        if: steps.iterations.outputs.exceeded == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MARKER="<!-- codex-remediation-escalation -->"
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+
+          BODY="${MARKER}
+          ⚠️ **Codex Remediation — Max Iterations Reached**
+
+          This PR has been through **${{ steps.iterations.outputs.count }}** automated fix attempts and still has unresolved Greptile findings.
+
+          **Action required:** Human review needed.
+
+          cc @${{ github.repository_owner }}"
+
+          # Only post once
+          EXISTING=$(gh api \
+            "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"${MARKER}\"))] | length" \
+            2>/dev/null || echo "0")
+
+          if [ "$EXISTING" -eq 0 ]; then
+            gh pr comment "$PR_NUMBER" --body "$BODY"
+          fi
+
+      - name: Collect Greptile findings for current HEAD
+        if: steps.iterations.outputs.exceeded != 'true'
+        id: findings
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          HEAD_SHA="${{ steps.pr.outputs.head_sha }}"
+
+          # Get all review comments from Greptile on this PR
+          COMMENTS=$(gh api \
+            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.user.login == "greptile-apps[bot]") | {path: .path, line: .line, body: .body, id: .id}]' \
+            2>/dev/null || echo "[]")
+
+          # Get review body from Greptile
+          REVIEW_BODY=$(gh api \
+            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+            --jq '[.[] | select(.user.login == "greptile-apps[bot]") | .body] | last // ""' \
+            2>/dev/null || echo "")
+
+          # Save findings context
+          echo "$COMMENTS" > /tmp/greptile-comments.json
+          echo "$REVIEW_BODY" > /tmp/greptile-review.txt
+
+          COMMENT_COUNT=$(echo "$COMMENTS" | jq 'length')
+          echo "comment_count=$COMMENT_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Found $COMMENT_COUNT Greptile comments"
+
+          if [ "$COMMENT_COUNT" -eq 0 ] && [ -z "$REVIEW_BODY" ]; then
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR branch
+        if: steps.findings.outputs.has_findings == 'true' && steps.iterations.outputs.exceeded != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Codex
+        if: steps.findings.outputs.has_findings == 'true' && steps.iterations.outputs.exceeded != 'true'
+        run: |
+          # Install Codex CLI
+          npm install -g @openai/codex 2>/dev/null || true
+
+          # Check if codex is available
+          if ! command -v codex &> /dev/null; then
+            echo "::error::Codex CLI not available. Install it or use a self-hosted runner with Codex."
+            exit 1
+          fi
+
+      - name: Build remediation prompt
+        if: steps.findings.outputs.has_findings == 'true' && steps.iterations.outputs.exceeded != 'true'
+        id: prompt
+        run: |
+          HEAD_SHA="${{ steps.pr.outputs.head_sha }}"
+          SHORT_SHA="${HEAD_SHA:0:7}"
+
+          # Build prompt from Greptile findings
+          PROMPT="You are fixing code review findings from Greptile (automated code review agent).
+
+          Current HEAD SHA: ${SHORT_SHA}
+
+          ## Greptile Review Summary:
+          $(cat /tmp/greptile-review.txt)
+
+          ## Specific File Comments:
+          $(cat /tmp/greptile-comments.json | jq -r '.[] | "### \(.path):\(.line)\n\(.body)\n"')
+
+          ## Instructions:
+          1. Read each finding carefully
+          2. Fix the actual code issues (not just style/formatting)
+          3. Run any available tests to verify your fixes don't break anything
+          4. Skip findings that are false positives or style-only
+          5. Commit each fix with a clear message
+
+          IMPORTANT:
+          - Do NOT modify .github/workflows/ or harness.json
+          - Do NOT bypass any policy gates
+          - Only fix findings from the list above
+          - If a finding is unclear, skip it rather than making a wrong fix"
+
+          echo "$PROMPT" > /tmp/remediation-prompt.txt
+          echo "prompt_ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run Codex remediation
+        if: steps.prompt.outputs.prompt_ready == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # Run Codex with the remediation prompt
+          codex exec --full-auto \
+            -c model_reasoning_effort="high" \
+            "$(cat /tmp/remediation-prompt.txt)" \
+            2>&1 | tee /tmp/codex-output.txt || true
+
+      - name: Push fixes
+        if: steps.prompt.outputs.prompt_ready == 'true'
+        id: push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if Codex made any changes
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes made by Codex"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Stage and commit any unstaged changes
+          git add -A
+          CHANGES=$(git diff --staged --stat)
+
+          if [ -z "$CHANGES" ]; then
+            echo "No staged changes"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "fix: address Greptile review findings (automated remediation)
+
+          Changes made by Codex in response to Greptile code review.
+          Iteration: ${{ steps.iterations.outputs.count }}
+
+          Co-authored-by: Codex <codex@openai.com>"
+
+          git push origin ${{ steps.pr.outputs.head_ref }}
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "new_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Pushed fix commit: $(git rev-parse --short HEAD)"
+
+      - name: Post remediation comment
+        if: steps.push.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MARKER="<!-- codex-remediation-fix -->"
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          NEW_SHA="${{ steps.push.outputs.new_sha }}"
+          SHORT_SHA="${NEW_SHA:0:7}"
+          ITERATION=$(( ${{ steps.iterations.outputs.count }} + 1 ))
+
+          BODY="${MARKER}
+          🤖 **Codex Remediation — Iteration ${ITERATION}**
+
+          | Field | Value |
+          |-------|-------|
+          | **Fix Commit** | \`${SHORT_SHA}\` |
+          | **Iteration** | ${ITERATION} / ${{ env.MAX_ITERATIONS }} |
+          | **Trigger** | Greptile review findings |
+
+          Pushed automated fixes. PR synchronize will trigger Greptile re-review via \`greptile-rerun.yml\`.
+
+          sha:${NEW_SHA}"
+
+          gh pr comment "$PR_NUMBER" --body "$BODY"
+
+      - name: Post no-changes comment
+        if: steps.findings.outputs.has_findings == 'true' && steps.push.outputs.pushed != 'true' && steps.iterations.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          HEAD_SHA="${{ steps.pr.outputs.head_sha }}"
+
+          BODY="<!-- codex-remediation-skip -->
+          🤖 **Codex Remediation — No Changes**
+
+          Codex analyzed the Greptile findings for \`${HEAD_SHA:0:7}\` but determined no automated fixes were applicable. This may mean:
+          - Findings are false positives or style-only
+          - Fixes require architectural decisions beyond automated scope
+
+          **Human review recommended** for remaining findings."
+
+          gh pr comment "$PR_NUMBER" --body "$BODY"
