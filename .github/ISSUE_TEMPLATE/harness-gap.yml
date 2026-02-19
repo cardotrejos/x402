@@ -1,0 +1,81 @@
+name: "🔬 Harness Gap"
+description: "Production regression or incident that needs a harness test case"
+title: "[Harness Gap] "
+labels: ["harness-gap", "quality"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Harness Gap Report
+        When a production regression or incident occurs, file this to ensure a test case is created.
+        This prevents one-off patches and grows long-term test coverage.
+
+  - type: textarea
+    id: incident
+    attributes:
+      label: "Incident Description"
+      description: "What happened in production?"
+      placeholder: "Users reported that X was broken when Y..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: root-cause
+    attributes:
+      label: "Root Cause"
+      description: "What caused the issue?"
+      placeholder: "The date filter was using UTC instead of the user's timezone..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: fix-applied
+    attributes:
+      label: "Fix Applied"
+      description: "What fix was deployed? Link the PR if available."
+      placeholder: "PR #42 — changed date boundaries to use America/Bogota timezone"
+    validations:
+      required: false
+
+  - type: textarea
+    id: test-case
+    attributes:
+      label: "Required Test Case"
+      description: "What test should be added to prevent regression?"
+      placeholder: |
+        - Unit test: verify date filtering respects timezone
+        - Integration test: compare API output against known Shopify data for specific date
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: "Severity"
+      options:
+        - "Critical — data loss or security"
+        - "High — wrong data shown to users"
+        - "Medium — UX broken but workaround exists"
+        - "Low — cosmetic or edge case"
+    validations:
+      required: true
+
+  - type: textarea
+    id: affected-paths
+    attributes:
+      label: "Affected Code Paths"
+      description: "Which files/modules were involved?"
+      placeholder: |
+        - packages/api/src/routers/sales.ts
+        - apps/web/src/app/(dashboard)/dashboard/sales-dashboard.tsx
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: sla
+    attributes:
+      label: "SLA Tracking"
+      options:
+        - label: "Test case written and merged"
+        - label: "Test passes in CI"
+        - label: "Harness gap issue can be closed"

@@ -1,0 +1,44 @@
+{
+  "version": "1",
+  "riskTierRules": {
+    "high": [
+      "lib/x402/payment_signature.ex",
+      "lib/x402/payment_required.ex",
+      "lib/x402/payment_response.ex",
+      "lib/x402/facilitator.ex",
+      "lib/x402/wallet.ex",
+      "lib/x402/plug/**"
+    ],
+    "low": ["**"]
+  },
+  "mergePolicy": {
+    "high": {
+      "requiredChecks": [
+        "risk-policy-gate",
+        "code-review-agent",
+        "CI Pipeline"
+      ]
+    },
+    "low": {
+      "requiredChecks": [
+        "risk-policy-gate",
+        "CI Pipeline"
+      ]
+    }
+  },
+  "docsDriftRules": {
+    "watchPaths": [
+      "lib/x402/**",
+      "harness.json"
+    ],
+    "requireUpdate": [
+      "README.md",
+      "docs/**"
+    ]
+  },
+  "codeReviewAgent": {
+    "provider": "greptile",
+    "timeoutMinutes": 20,
+    "requiredConfidence": 5
+  }
+}
