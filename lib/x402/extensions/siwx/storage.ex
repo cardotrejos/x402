@@ -32,7 +32,7 @@ defmodule X402.Extensions.SIWX.Storage do
   """
   @callback delete(address :: String.t(), resource :: String.t()) :: :ok
 
-  @required_callbacks [:get, :put, :delete]
+  @required_callbacks [get: 2, put: 4, delete: 2]
 
   @doc since: "0.3.0"
   @doc """
@@ -52,12 +52,5 @@ defmodule X402.Extensions.SIWX.Storage do
     do: {:error, "expected a module implementing X402.Extensions.SIWX.Storage"}
 
   @spec implementation?(module()) :: boolean()
-  defp implementation?(module) do
-    Code.ensure_loaded?(module) and
-      Enum.all?(@required_callbacks, fn
-        :get -> function_exported?(module, :get, 2)
-        :put -> function_exported?(module, :put, 4)
-        :delete -> function_exported?(module, :delete, 2)
-      end)
-  end
+  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
 end
