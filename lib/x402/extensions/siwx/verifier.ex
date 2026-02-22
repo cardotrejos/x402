@@ -19,7 +19,7 @@ defmodule X402.Extensions.SIWX.Verifier do
             ) ::
               verify_result()
 
-  @required_callbacks [:verify_signature]
+  @required_callbacks [verify_signature: 3]
 
   @doc since: "0.3.0"
   @doc """
@@ -39,8 +39,5 @@ defmodule X402.Extensions.SIWX.Verifier do
     do: {:error, "expected a module implementing X402.Extensions.SIWX.Verifier"}
 
   @spec implementation?(module()) :: boolean()
-  defp implementation?(module) do
-    Code.ensure_loaded?(module) and
-      Enum.all?(@required_callbacks, &function_exported?(module, &1, 3))
-  end
+  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
 end
