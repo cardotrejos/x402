@@ -81,12 +81,12 @@ defmodule X402.Hooks do
   @callback on_settle_failure(Context.t(), metadata()) :: on_failure_result()
 
   @required_callbacks [
-    :before_verify,
-    :after_verify,
-    :on_verify_failure,
-    :before_settle,
-    :after_settle,
-    :on_settle_failure
+    before_verify: 2,
+    after_verify: 2,
+    on_verify_failure: 2,
+    before_settle: 2,
+    after_settle: 2,
+    on_settle_failure: 2
   ]
 
   @doc since: "0.1.0"
@@ -106,8 +106,5 @@ defmodule X402.Hooks do
   def validate_module(_invalid), do: {:error, "expected a module implementing X402.Hooks"}
 
   @spec implementation?(module()) :: boolean()
-  defp implementation?(module) do
-    Code.ensure_loaded?(module) and
-      Enum.all?(@required_callbacks, &function_exported?(module, &1, 2))
-  end
+  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
 end
