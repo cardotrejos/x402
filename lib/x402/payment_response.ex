@@ -75,7 +75,7 @@ defmodule X402.PaymentResponse do
   """
   @spec decode(String.t()) :: {:ok, map()} | {:error, decode_error()}
   def decode(value) when is_binary(value) do
-    with {:ok, json} <- decode_base64(value),
+    with {:ok, json} <- X402.Utils.decode_base64(value),
          {:ok, decoded} <- Jason.decode(json),
          true <- is_map(decoded) do
       result = {:ok, decoded}
@@ -115,15 +115,5 @@ defmodule X402.PaymentResponse do
     })
 
     {:error, :invalid_base64}
-  end
-
-  @spec decode_base64(String.t()) :: {:ok, String.t()} | {:error, :invalid_base64}
-  defp decode_base64(""), do: {:error, :invalid_base64}
-
-  defp decode_base64(value) do
-    case Base.decode64(value) do
-      {:ok, decoded} -> {:ok, decoded}
-      :error -> {:error, :invalid_base64}
-    end
   end
 end

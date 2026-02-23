@@ -26,7 +26,8 @@ defmodule X402.Facilitator.HTTP do
       when is_binary(base_url) and is_binary(path) and is_map(payload) and is_list(opts) do
     with {:ok, max_retries} <- fetch_non_negative_integer(opts, :max_retries, 2),
          {:ok, retry_backoff_ms} <- fetch_non_negative_integer(opts, :retry_backoff_ms, 100),
-         {:ok, receive_timeout_ms} <- fetch_non_negative_integer(opts, :receive_timeout_ms, 5_000),
+         {:ok, receive_timeout_ms} <-
+           fetch_non_negative_integer(opts, :receive_timeout_ms, 5_000),
          {:ok, finch_module} <- ensure_finch_module(),
          {:ok, encoded_payload} <- Jason.encode(payload) do
       ctx = %{
