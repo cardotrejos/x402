@@ -386,10 +386,10 @@ defmodule X402.Facilitator do
   defp extract_max_price(payload, requirements) do
     value =
       first_present([
-        map_value(requirements, {"maxPrice", :maxPrice}),
-        map_value(requirements, {"maxAmountRequired", :maxAmountRequired}),
-        map_value(payload, {"maxPrice", :maxPrice}),
-        map_value(payload, {"maxAmountRequired", :maxAmountRequired})
+        fn -> map_value(requirements, {"maxPrice", :maxPrice}) end,
+        fn -> map_value(requirements, {"maxAmountRequired", :maxAmountRequired}) end,
+        fn -> map_value(payload, {"maxPrice", :maxPrice}) end,
+        fn -> map_value(payload, {"maxAmountRequired", :maxAmountRequired}) end
       ])
 
     case value do
@@ -407,14 +407,18 @@ defmodule X402.Facilitator do
   defp extract_payment_value(payload) do
     value =
       first_present([
-        map_value(payload, {"value", :value}),
-        nested_map_value(payload, [{"payload", :payload}, {"value", :value}]),
-        nested_map_value(payload, [
-          {"payload", :payload},
-          {"authorization", :authorization},
-          {"value", :value}
-        ]),
-        nested_map_value(payload, [{"authorization", :authorization}, {"value", :value}])
+        fn -> map_value(payload, {"value", :value}) end,
+        fn -> nested_map_value(payload, [{"payload", :payload}, {"value", :value}]) end,
+        fn ->
+          nested_map_value(payload, [
+            {"payload", :payload},
+            {"authorization", :authorization},
+            {"value", :value}
+          ])
+        end,
+        fn ->
+          nested_map_value(payload, [{"authorization", :authorization}, {"value", :value}])
+        end
       ])
 
     case value do
@@ -504,7 +508,14 @@ defmodule X402.Facilitator do
     end
   end
 
-  defp first_present(values), do: Enum.find(values, &(not is_nil(&1)))
+  defp first_present(thunks) do
+    Enum.reduce_while(thunks, nil, fn thunk, _acc ->
+      case thunk.() do
+        nil -> {:cont, nil}
+        value -> {:halt, value}
+      end
+    end)
+  end
 
   defp before_callback(:verify), do: :before_verify
   defp before_callback(:settle), do: :before_settle
