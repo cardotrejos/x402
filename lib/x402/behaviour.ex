@@ -3,6 +3,7 @@ defmodule X402.Behaviour do
   Utilities for working with Elixir behaviours and callback implementations.
   """
 
+  @doc since: "0.1.0"
   @doc """
   Checks if a module implements a set of callbacks.
 
