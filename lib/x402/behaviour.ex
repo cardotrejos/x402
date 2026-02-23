@@ -1,16 +1,14 @@
 defmodule X402.Behaviour do
   @moduledoc """
-  Utility functions for checking behaviour implementations.
-
-  Used internally to verify that modules implement the required
-  callbacks for x402 extension behaviours.
+  Utilities for working with Elixir behaviours and callback implementations.
   """
 
-  @doc since: "0.4.0"
   @doc """
   Checks if a module implements a set of callbacks.
+
+  The `callbacks` argument should be a list of `{name, arity}` tuples.
   """
-  @spec implements?(module(), [{atom(), arity()}]) :: boolean()
+  @spec implements?(module(), [{atom(), integer()}]) :: boolean()
   def implements?(module, callbacks) do
     Code.ensure_loaded?(module) and
       Enum.all?(callbacks, fn {name, arity} ->
