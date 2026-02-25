@@ -2,7 +2,6 @@ defmodule X402.FacilitatorHooksExceptionTest do
   use ExUnit.Case, async: false
 
   alias X402.Facilitator
-  alias X402.Hooks.Context
 
   import X402.TestHelpers
 
@@ -52,7 +51,9 @@ defmodule X402.FacilitatorHooksExceptionTest do
          hooks: RaisingHooks}
       )
 
-    assert {:error, {:hook_callback_failed, :before_verify, {:exception, %RuntimeError{message: "hook exception"}}}} =
+    assert {:error,
+            {:hook_callback_failed, :before_verify,
+             {:exception, %RuntimeError{message: "hook exception"}}}} =
              Facilitator.verify(facilitator, %{}, %{})
   end
 
