@@ -15,16 +15,6 @@ defmodule X402.Hooks do
   or recover the operation with `{:recover, result}`.
   """
 
-  use X402.Behaviour,
-    callbacks: [
-      before_verify: 2,
-      after_verify: 2,
-      on_verify_failure: 2,
-      before_settle: 2,
-      after_settle: 2,
-      on_settle_failure: 2
-    ]
-
   alias X402.Hooks.Context
 
   @typedoc "Lifecycle callback metadata passed to hooks."
@@ -90,6 +80,15 @@ defmodule X402.Hooks do
   """
   @callback on_settle_failure(Context.t(), metadata()) :: on_failure_result()
 
+  @required_callbacks [
+    before_verify: 2,
+    after_verify: 2,
+    on_verify_failure: 2,
+    before_settle: 2,
+    after_settle: 2,
+    on_settle_failure: 2
+  ]
+
   @doc since: "0.1.0"
   @doc """
   Validates that a value is a module implementing `X402.Hooks`.
@@ -97,6 +96,15 @@ defmodule X402.Hooks do
   This function is designed for `NimbleOptions` custom validation.
   """
   @spec validate_module(term()) :: :ok | {:error, String.t()}
-  def validate_module(module),
-    do: X402.Behaviour.validate_implementation(module, __MODULE__, @required_callbacks)
+  def validate_module(module) when is_atom(module) do
+    case implementation?(module) do
+      true -> :ok
+      false -> {:error, "expected a module implementing X402.Hooks"}
+    end
+  end
+
+  def validate_module(_invalid), do: {:error, "expected a module implementing X402.Hooks"}
+
+  @spec implementation?(module()) :: boolean()
+  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
 end

@@ -10,7 +10,6 @@ defmodule X402.Facilitator do
   alias X402.Hooks
   alias X402.Hooks.Context
   alias X402.Hooks.Default
-  alias X402.Utils
 
   @default_name __MODULE__
   @default_url "https://x402.org/facilitator"
@@ -39,16 +38,7 @@ defmodule X402.Facilitator do
     max_retries: [
       type: :non_neg_integer,
       default: 2,
-      doc: "Maximum retry count for transient errors (applies to verify only)."
-    ],
-    settle_max_retries: [
-      type: :non_neg_integer,
-      default: 0,
-      doc: """
-      Maximum retry count for settle requests. Defaults to `0` because settle
-      is not idempotent — retrying a successful settle that returned a transient
-      error causes double-settlement of the same payment proof.
-      """
+      doc: "Maximum retry count for transient errors."
     ],
     retry_backoff_ms: [
       type: :non_neg_integer,
@@ -75,7 +65,6 @@ defmodule X402.Facilitator do
           finch: term(),
           hooks: module(),
           max_retries: non_neg_integer(),
-          settle_max_retries: non_neg_integer(),
           retry_backoff_ms: non_neg_integer(),
           receive_timeout_ms: non_neg_integer()
         }
@@ -194,7 +183,6 @@ defmodule X402.Facilitator do
       finch: Keyword.fetch!(opts, :finch),
       hooks: Keyword.fetch!(opts, :hooks),
       max_retries: Keyword.fetch!(opts, :max_retries),
-      settle_max_retries: Keyword.fetch!(opts, :settle_max_retries),
       retry_backoff_ms: Keyword.fetch!(opts, :retry_backoff_ms),
       receive_timeout_ms: Keyword.fetch!(opts, :receive_timeout_ms)
     }
@@ -252,12 +240,6 @@ defmodule X402.Facilitator do
 
     case run_before_hook(hooks_module, operation, context, metadata) do
       {:cont, %Context{} = before_context} ->
-        # settle is not idempotent: use settle_max_retries (default 0) to prevent
-        # double-settlement when the server settles successfully but returns a
-        # transient 5xx before responding.
-        effective_max_retries =
-          if operation == :settle, do: state.settle_max_retries, else: state.max_retries
-
         result =
           with :ok <- validate_scheme_payment(before_context.payload, before_context.requirements) do
             HTTP.request(
@@ -268,7 +250,7 @@ defmodule X402.Facilitator do
                 payload: before_context.payload,
                 requirements: before_context.requirements
               },
-              max_retries: effective_max_retries,
+              max_retries: state.max_retries,
               retry_backoff_ms: state.retry_backoff_ms,
               receive_timeout_ms: state.receive_timeout_ms
             )
@@ -385,8 +367,7 @@ defmodule X402.Facilitator do
   end
 
   defp validate_scheme_payment(payload, requirements) do
-    case Utils.map_value(requirements, {"scheme", :scheme}) ||
-           Utils.map_value(payload, {"scheme", :scheme}) do
+    case map_value(requirements, {"scheme", :scheme}) || map_value(payload, {"scheme", :scheme}) do
       "upto" ->
         validate_upto_payment(payload, requirements)
 
@@ -404,11 +385,11 @@ defmodule X402.Facilitator do
 
   defp extract_max_price(payload, requirements) do
     value =
-      Utils.first_present([
-        fn -> Utils.map_value(requirements, {"maxPrice", :maxPrice}) end,
-        fn -> Utils.map_value(requirements, {"maxAmountRequired", :maxAmountRequired}) end,
-        fn -> Utils.map_value(payload, {"maxPrice", :maxPrice}) end,
-        fn -> Utils.map_value(payload, {"maxAmountRequired", :maxAmountRequired}) end
+      first_present([
+        map_value(requirements, {"maxPrice", :maxPrice}),
+        map_value(requirements, {"maxAmountRequired", :maxAmountRequired}),
+        map_value(payload, {"maxPrice", :maxPrice}),
+        map_value(payload, {"maxAmountRequired", :maxAmountRequired})
       ])
 
     case value do
@@ -416,7 +397,7 @@ defmodule X402.Facilitator do
         {:error, {:invalid_upto_payment, :missing_max_price}}
 
       max_price ->
-        case Utils.parse_decimal(max_price) do
+        case parse_decimal(max_price) do
           {:ok, parsed} -> {:ok, parsed}
           :error -> {:error, {:invalid_upto_payment, :invalid_max_price}}
         end
@@ -425,19 +406,15 @@ defmodule X402.Facilitator do
 
   defp extract_payment_value(payload) do
     value =
-      Utils.first_present([
-        fn -> Utils.map_value(payload, {"value", :value}) end,
-        fn -> Utils.nested_map_value(payload, [{"payload", :payload}, {"value", :value}]) end,
-        fn ->
-          Utils.nested_map_value(payload, [
-            {"payload", :payload},
-            {"authorization", :authorization},
-            {"value", :value}
-          ])
-        end,
-        fn ->
-          Utils.nested_map_value(payload, [{"authorization", :authorization}, {"value", :value}])
-        end
+      first_present([
+        map_value(payload, {"value", :value}),
+        nested_map_value(payload, [{"payload", :payload}, {"value", :value}]),
+        nested_map_value(payload, [
+          {"payload", :payload},
+          {"authorization", :authorization},
+          {"value", :value}
+        ]),
+        nested_map_value(payload, [{"authorization", :authorization}, {"value", :value}])
       ])
 
     case value do
@@ -445,7 +422,7 @@ defmodule X402.Facilitator do
         {:error, {:invalid_upto_payment, :missing_payment_value}}
 
       payment_value ->
-        case Utils.parse_decimal(payment_value) do
+        case parse_decimal(payment_value) do
           {:ok, parsed} -> {:ok, parsed}
           :error -> {:error, {:invalid_upto_payment, :invalid_payment_value}}
         end
@@ -453,11 +430,81 @@ defmodule X402.Facilitator do
   end
 
   defp ensure_not_exceeds(payment_value, max_price) do
-    case Utils.compare_decimal(payment_value, max_price) do
+    case compare_decimal(payment_value, max_price) do
       :gt -> {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
       _comparison -> :ok
     end
   end
+
+  defp compare_decimal({left_value, left_scale}, {right_value, right_scale})
+       when left_scale == right_scale do
+    compare_integer(left_value, right_value)
+  end
+
+  defp compare_decimal({left_value, left_scale}, {right_value, right_scale})
+       when left_scale > right_scale do
+    compare_integer(left_value, right_value * Integer.pow(10, left_scale - right_scale))
+  end
+
+  defp compare_decimal({left_value, left_scale}, {right_value, right_scale}) do
+    compare_integer(left_value * Integer.pow(10, right_scale - left_scale), right_value)
+  end
+
+  defp compare_integer(left, right) when left < right, do: :lt
+  defp compare_integer(left, right) when left > right, do: :gt
+  defp compare_integer(_left, _right), do: :eq
+
+  defp parse_decimal(value) when is_integer(value) and value >= 0, do: {:ok, {value, 0}}
+  defp parse_decimal(value) when is_binary(value), do: parse_decimal_string(String.trim(value))
+  defp parse_decimal(_value), do: :error
+
+  defp parse_decimal_string(""), do: :error
+
+  defp parse_decimal_string(value) do
+    cond do
+      Regex.match?(~r/^\d+$/, value) ->
+        {:ok, {String.to_integer(value), 0}}
+
+      Regex.match?(~r/^\d+\.\d+$/, value) ->
+        [whole, fraction] = String.split(value, ".", parts: 2)
+        normalized_fraction = String.trim_trailing(fraction, "0")
+
+        case normalized_fraction do
+          "" ->
+            {:ok, {String.to_integer(whole), 0}}
+
+          fraction_digits ->
+            digits = whole <> fraction_digits
+            {:ok, {String.to_integer(digits), String.length(fraction_digits)}}
+        end
+
+      true ->
+        :error
+    end
+  end
+
+  defp nested_map_value(map, [key]) when is_map(map), do: map_value(map, key)
+
+  defp nested_map_value(map, [key | rest]) when is_map(map) do
+    case map_value(map, key) do
+      %{} = nested -> nested_map_value(nested, rest)
+      _other -> nil
+    end
+  end
+
+  defp nested_map_value(_not_map, _keys), do: nil
+
+  defp map_value(map, {string_key, atom_key}) do
+    case Map.fetch(map, string_key) do
+      {:ok, value} ->
+        value
+
+      :error ->
+        Map.get(map, atom_key)
+    end
+  end
+
+  defp first_present(values), do: Enum.find(values, &(not is_nil(&1)))
 
   defp before_callback(:verify), do: :before_verify
   defp before_callback(:settle), do: :before_settle
