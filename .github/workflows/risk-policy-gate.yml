@@ -1,0 +1,195 @@
+name: Risk Policy Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  issues: read
+
+jobs:
+  policy-gate:
+    name: Risk Policy Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine changed files
+        id: changes
+        run: |
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | tr '\n' ',')
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          echo "Changed files: $FILES"
+
+      - name: Load harness contract
+        id: harness
+        run: |
+          if [ ! -f harness.json ]; then
+            echo "::error::harness.json not found in repo root"
+            exit 1
+          fi
+          echo "contract=$(cat harness.json | jq -c .)" >> "$GITHUB_OUTPUT"
+
+      - name: Compute risk tier
+        id: risk
+        env:
+          CHANGED_FILES: ${{ steps.changes.outputs.files }}
+          CONTRACT: ${{ steps.harness.outputs.contract }}
+        run: |
+          TIER="low"
+          IFS=',' read -ra FILE_ARRAY <<< "$CHANGED_FILES"
+
+          # Read high-risk patterns from contract
+          HIGH_PATTERNS=$(echo "$CONTRACT" | jq -r '.riskTierRules.high[]' 2>/dev/null)
+
+          for file in "${FILE_ARRAY[@]}"; do
+            [ -z "$file" ] && continue
+            while IFS= read -r pattern; do
+              [ -z "$pattern" ] && continue
+              # Convert glob to regex: ** → .*, * → [^/]*
+              regex=$(echo "$pattern" | sed 's/\*\*/.*?/g' | sed 's/\*/[^\/]*/g')
+              if echo "$file" | grep -qE "^${regex}$"; then
+                TIER="high"
+                echo "High-risk file detected: $file (matches $pattern)"
+                break
+              fi
+            done <<< "$HIGH_PATTERNS"
+            [ "$TIER" = "high" ] && break
+          done
+
+          echo "tier=$TIER" >> "$GITHUB_OUTPUT"
+          echo "Risk tier: $TIER"
+
+      - name: Check docs drift
+        if: steps.risk.outputs.tier == 'high'
+        env:
+          CHANGED_FILES: ${{ steps.changes.outputs.files }}
+          CONTRACT: ${{ steps.harness.outputs.contract }}
+        run: |
+          DOCS_DRIFT_PATHS=$(echo "$CONTRACT" | jq -r '.docsDriftRules.watchPaths[]?' 2>/dev/null)
+          DOCS_REQUIRED_PATHS=$(echo "$CONTRACT" | jq -r '.docsDriftRules.requireUpdate[]?' 2>/dev/null)
+
+          if [ -z "$DOCS_DRIFT_PATHS" ]; then
+            echo "No docs drift rules defined, skipping"
+            exit 0
+          fi
+
+          CONTROL_PLANE_CHANGED=false
+          IFS=',' read -ra FILE_ARRAY <<< "$CHANGED_FILES"
+          for file in "${FILE_ARRAY[@]}"; do
+            while IFS= read -r watch_path; do
+              [ -z "$watch_path" ] && continue
+              regex=$(echo "$watch_path" | sed 's/\*\*/.*?/g' | sed 's/\*/[^\/]*/g')
+              if echo "$file" | grep -qE "^${regex}$"; then
+                CONTROL_PLANE_CHANGED=true
+                echo "Control-plane file changed: $file"
+                break
+              fi
+            done <<< "$DOCS_DRIFT_PATHS"
+          done
+
+          if [ "$CONTROL_PLANE_CHANGED" = true ]; then
+            DOCS_UPDATED=false
+            for file in "${FILE_ARRAY[@]}"; do
+              while IFS= read -r doc_path; do
+                [ -z "$doc_path" ] && continue
+                regex=$(echo "$doc_path" | sed 's/\*\*/.*?/g' | sed 's/\*/[^\/]*/g')
+                if echo "$file" | grep -qE "^${regex}$"; then
+                  DOCS_UPDATED=true
+                  break
+                fi
+              done <<< "$DOCS_REQUIRED_PATHS"
+            done
+
+            if [ "$DOCS_UPDATED" = false ]; then
+              echo "::warning::Control-plane files changed but no docs were updated. Consider updating documentation."
+            fi
+          fi
+
+      - name: Verify code review agent state
+        id: review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONTRACT: ${{ steps.harness.outputs.contract }}
+          TIER: ${{ steps.risk.outputs.tier }}
+        run: |
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          # Check if code review is required for this tier
+          NEEDS_REVIEW=$(echo "$CONTRACT" | jq -r --arg tier "$TIER" '.mergePolicy[$tier].requiredChecks // [] | map(select(. == "code-review-agent")) | length > 0')
+
+          if [ "$NEEDS_REVIEW" = "false" ]; then
+            echo "Code review agent not required for $TIER tier"
+            echo "review_required=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "review_required=true" >> "$GITHUB_OUTPUT"
+
+          # Look for Greptile check run on current HEAD
+          REVIEW_STATUS=$(gh api \
+            "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" \
+            --jq '.check_runs[] | select(.app.slug == "greptile-apps" or .name == "Greptile") | .conclusion' \
+            2>/dev/null | head -1)
+
+          if [ -z "$REVIEW_STATUS" ]; then
+            echo "::notice::No Greptile review found for HEAD $HEAD_SHA yet. Review may still be pending."
+            echo "review_status=pending" >> "$GITHUB_OUTPUT"
+          elif [ "$REVIEW_STATUS" = "success" ]; then
+            echo "Greptile review passed for HEAD $HEAD_SHA"
+            echo "review_status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Greptile review status: $REVIEW_STATUS for HEAD $HEAD_SHA"
+            echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post risk tier summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TIER="${{ steps.risk.outputs.tier }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          SHORT_SHA="${HEAD_SHA:0:7}"
+          REVIEW_REQ="${{ steps.review.outputs.review_required }}"
+          REVIEW_STATUS="${{ steps.review.outputs.review_status }}"
+
+          if [ "$TIER" = "high" ]; then
+            EMOJI="🔴"
+          else
+            EMOJI="🟢"
+          fi
+
+          MARKER="<!-- risk-policy-gate -->"
+          BODY="${MARKER}
+          ## ${EMOJI} Risk Policy Gate — \`${SHORT_SHA}\`
+
+          | Field | Value |
+          |-------|-------|
+          | **Risk Tier** | \`${TIER}\` |
+          | **Head SHA** | \`${SHORT_SHA}\` |
+          | **Review Required** | \`${REVIEW_REQ}\` |
+          | **Review Status** | \`${REVIEW_STATUS:-n/a}\` |
+
+          <sub>Evaluated by \`risk-policy-gate.yml\` from \`harness.json\`</sub>"
+
+          # Find and update existing comment or create new
+          EXISTING=$(gh api \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" \
+            2>/dev/null | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            gh api \
+              "repos/${{ github.repository }}/issues/comments/${EXISTING}" \
+              -X PATCH -f body="$BODY"
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY"
+          fi

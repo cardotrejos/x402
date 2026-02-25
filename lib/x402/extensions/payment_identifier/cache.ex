@@ -88,5 +88,10 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   def delete(_adapter, _payment_id), do: {:error, :invalid_adapter}
 
   @spec implementation?(module()) :: boolean()
-  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
+  defp implementation?(module) do
+    Code.ensure_loaded?(module) and
+      Enum.all?(@required_callbacks, fn {name, arity} ->
+        function_exported?(module, name, arity)
+      end)
+  end
 end
