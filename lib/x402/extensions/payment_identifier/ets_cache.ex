@@ -93,6 +93,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
             if expires_at_ms > now_ms() do
               {:hit, value}
             else
+              :ets.delete(cache, payment_id)
               :miss
             end
 
