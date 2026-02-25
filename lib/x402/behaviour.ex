@@ -20,6 +20,15 @@ defmodule X402.Behaviour do
   Checks if a module implements a set of callbacks.
 
   The `callbacks` argument should be a list of `{name, arity}` tuples.
+
+  ## Examples
+
+      iex> X402.Behaviour.implements?(Enum, [{:map, 2}, {:filter, 2}])
+      true
+
+      iex> X402.Behaviour.implements?(Enum, [{:nonexistent, 0}])
+      false
+
   """
   @spec implements?(module(), [{atom(), integer()}]) :: boolean()
   def implements?(module, callbacks) do
