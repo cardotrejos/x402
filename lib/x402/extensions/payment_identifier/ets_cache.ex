@@ -39,7 +39,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
 
   @typedoc false
   @type state :: %{
-          table: :ets.tid(),
+          table: :ets.tid() | atom(),
           ttl_ms: non_neg_integer(),
           cleanup_interval_ms: pos_integer(),
           cleanup_timer: reference()
@@ -86,7 +86,26 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   @impl Cache
   @spec get(server(), Cache.key()) :: Cache.get_result()
   def get(cache, payment_id) when is_binary(payment_id) do
-    GenServer.call(cache, {:get, payment_id})
+    if is_atom(cache) do
+      try do
+        case :ets.lookup(cache, payment_id) do
+          [{^payment_id, value, expires_at_ms}] ->
+            if expires_at_ms > now_ms() do
+              {:hit, value}
+            else
+              :miss
+            end
+
+          [] ->
+            :miss
+        end
+      rescue
+        ArgumentError ->
+          GenServer.call(cache, {:get, payment_id})
+      end
+    else
+      GenServer.call(cache, {:get, payment_id})
+    end
   end
 
   def get(_cache, _payment_id), do: {:error, :invalid_payment_id}
@@ -123,7 +142,16 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   def init(opts) do
     ttl_ms = Keyword.fetch!(opts, :ttl_ms)
     cleanup_interval_ms = Keyword.fetch!(opts, :cleanup_interval_ms)
-    table = :ets.new(__MODULE__, [:set, :private, read_concurrency: true])
+    name = Keyword.get(opts, :name, __MODULE__)
+
+    table_opts = [:set, :protected, read_concurrency: true]
+
+    table =
+      if is_atom(name) do
+        :ets.new(name, [:named_table | table_opts])
+      else
+        :ets.new(__MODULE__, table_opts)
+      end
 
     state = %{
       table: table,
@@ -181,7 +209,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
     Process.send_after(self(), :cleanup, cleanup_interval_ms)
   end
 
-  @spec delete_expired_entries(:ets.tid(), non_neg_integer()) :: non_neg_integer()
+  @spec delete_expired_entries(:ets.tid() | atom(), non_neg_integer()) :: non_neg_integer()
   defp delete_expired_entries(table, now_ms) do
     :ets.select_delete(table, [{{:"$1", :"$2", :"$3"}, [{:"=<", :"$3", now_ms}], [true]}])
   end
