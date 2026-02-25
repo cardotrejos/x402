@@ -5,8 +5,6 @@ defmodule X402.Extensions.SIWX.Storage do
   Storage adapters persist wallet access grants keyed by `{address, resource}`.
   """
 
-  use X402.Behaviour, callbacks: [get: 2, put: 4, delete: 2]
-
   @typedoc "Stored access record for a wallet/resource pair."
   @type access_record :: %{
           required(:payment_proof) => term(),
@@ -34,6 +32,8 @@ defmodule X402.Extensions.SIWX.Storage do
   """
   @callback delete(address :: String.t(), resource :: String.t()) :: :ok
 
+  @required_callbacks [get: 2, put: 4, delete: 2]
+
   @doc since: "0.3.0"
   @doc """
   Validates that a value is a module implementing `X402.Extensions.SIWX.Storage`.
@@ -41,6 +41,16 @@ defmodule X402.Extensions.SIWX.Storage do
   This function is intended for `NimbleOptions` custom validation.
   """
   @spec validate_module(term()) :: :ok | {:error, String.t()}
-  def validate_module(module),
-    do: X402.Behaviour.validate_implementation(module, __MODULE__, @required_callbacks)
+  def validate_module(module) when is_atom(module) do
+    case implementation?(module) do
+      true -> :ok
+      false -> {:error, "expected a module implementing X402.Extensions.SIWX.Storage"}
+    end
+  end
+
+  def validate_module(_invalid),
+    do: {:error, "expected a module implementing X402.Extensions.SIWX.Storage"}
+
+  @spec implementation?(module()) :: boolean()
+  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
 end
