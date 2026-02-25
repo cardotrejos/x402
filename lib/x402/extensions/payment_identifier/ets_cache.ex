@@ -15,6 +15,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   @default_name __MODULE__
   @default_ttl_ms :timer.hours(1)
   @default_cleanup_interval_ms :timer.minutes(1)
+  @default_max_size 10_000
 
   @start_link_options_schema [
     name: [
@@ -31,6 +32,11 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
       type: :pos_integer,
       default: @default_cleanup_interval_ms,
       doc: "How often expired entries are cleaned up, in milliseconds."
+    ],
+    max_size: [
+      type: :pos_integer,
+      default: @default_max_size,
+      doc: "Maximum number of entries in the cache."
     ]
   ]
 
@@ -41,6 +47,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   @type state :: %{
           table: :ets.tid(),
           ttl_ms: non_neg_integer(),
+          max_size: pos_integer(),
           cleanup_interval_ms: pos_integer(),
           cleanup_timer: reference()
         }
@@ -122,12 +129,14 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   @spec init(keyword()) :: {:ok, state()}
   def init(opts) do
     ttl_ms = Keyword.fetch!(opts, :ttl_ms)
+    max_size = Keyword.fetch!(opts, :max_size)
     cleanup_interval_ms = Keyword.fetch!(opts, :cleanup_interval_ms)
     table = :ets.new(__MODULE__, [:set, :private, read_concurrency: true])
 
     state = %{
       table: table,
       ttl_ms: ttl_ms,
+      max_size: max_size,
       cleanup_interval_ms: cleanup_interval_ms,
       cleanup_timer: schedule_cleanup(cleanup_interval_ms)
     }
@@ -157,6 +166,14 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   end
 
   def handle_call({:put, payment_id, value}, _from, state) do
+    if :ets.info(state.table, :size) >= state.max_size and
+         not :ets.member(state.table, payment_id) do
+      case :ets.first(state.table) do
+        :"$end_of_table" -> :ok
+        key -> :ets.delete(state.table, key)
+      end
+    end
+
     expires_at_ms = now_ms() + state.ttl_ms
     true = :ets.insert(state.table, {payment_id, value, expires_at_ms})
     {:reply, :ok, state}
