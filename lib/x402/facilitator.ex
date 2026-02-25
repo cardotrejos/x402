@@ -39,7 +39,16 @@ defmodule X402.Facilitator do
     max_retries: [
       type: :non_neg_integer,
       default: 2,
-      doc: "Maximum retry count for transient errors."
+      doc: "Maximum retry count for transient errors (applies to verify only)."
+    ],
+    settle_max_retries: [
+      type: :non_neg_integer,
+      default: 0,
+      doc: """
+      Maximum retry count for settle requests. Defaults to `0` because settle
+      is not idempotent — retrying a successful settle that returned a transient
+      error causes double-settlement of the same payment proof.
+      """
     ],
     retry_backoff_ms: [
       type: :non_neg_integer,
@@ -66,6 +75,7 @@ defmodule X402.Facilitator do
           finch: term(),
           hooks: module(),
           max_retries: non_neg_integer(),
+          settle_max_retries: non_neg_integer(),
           retry_backoff_ms: non_neg_integer(),
           receive_timeout_ms: non_neg_integer()
         }
@@ -184,6 +194,7 @@ defmodule X402.Facilitator do
       finch: Keyword.fetch!(opts, :finch),
       hooks: Keyword.fetch!(opts, :hooks),
       max_retries: Keyword.fetch!(opts, :max_retries),
+      settle_max_retries: Keyword.fetch!(opts, :settle_max_retries),
       retry_backoff_ms: Keyword.fetch!(opts, :retry_backoff_ms),
       receive_timeout_ms: Keyword.fetch!(opts, :receive_timeout_ms)
     }
@@ -241,6 +252,12 @@ defmodule X402.Facilitator do
 
     case run_before_hook(hooks_module, operation, context, metadata) do
       {:cont, %Context{} = before_context} ->
+        # settle is not idempotent: use settle_max_retries (default 0) to prevent
+        # double-settlement when the server settles successfully but returns a
+        # transient 5xx before responding.
+        effective_max_retries =
+          if operation == :settle, do: state.settle_max_retries, else: state.max_retries
+
         result =
           with :ok <- validate_scheme_payment(before_context.payload, before_context.requirements) do
             HTTP.request(
@@ -251,7 +268,7 @@ defmodule X402.Facilitator do
                 payload: before_context.payload,
                 requirements: before_context.requirements
               },
-              max_retries: state.max_retries,
+              max_retries: effective_max_retries,
               retry_backoff_ms: state.retry_backoff_ms,
               receive_timeout_ms: state.receive_timeout_ms
             )

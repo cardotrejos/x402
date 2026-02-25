@@ -16,6 +16,7 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   @default_name __MODULE__
   @default_table :x402_siwx_storage
   @default_cleanup_interval_ms 60_000
+  @max_resource_bytes 2048
 
   @start_link_options_schema [
     name: [
@@ -98,7 +99,7 @@ defmodule X402.Extensions.SIWX.ETSStorage do
           {:ok, X402.Extensions.SIWX.Storage.access_record()} | {:error, :not_found}
   def get(table, address, resource)
       when is_atom(table) and is_binary(address) and is_binary(resource) do
-    key = {address, resource}
+    key = {String.downcase(address), resource}
     now = now_ms()
 
     case :ets.lookup(table, key) do
@@ -129,7 +130,11 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   @spec put(server(), String.t(), String.t(), term(), non_neg_integer()) :: :ok | {:error, term()}
   def put(server, address, resource, payment_proof, ttl_ms)
       when is_binary(address) and is_binary(resource) and is_integer(ttl_ms) and ttl_ms >= 0 do
-    GenServer.call(server, {:put, address, resource, payment_proof, ttl_ms})
+    if byte_size(resource) > @max_resource_bytes do
+      {:error, {:resource_too_long, @max_resource_bytes}}
+    else
+      GenServer.call(server, {:put, address, resource, payment_proof, ttl_ms})
+    end
   end
 
   def put(_server, _address, _resource, _payment_proof, _ttl_ms), do: {:error, :invalid_arguments}
@@ -179,7 +184,7 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   @spec handle_call(term(), GenServer.from(), state()) ::
           {:reply, :ok | {:error, term()}, state()}
   def handle_call({:put, address, resource, payment_proof, ttl_ms}, _from, state) do
-    key = {address, resource}
+    key = {String.downcase(address), resource}
     expires_at_ms = now_ms() + ttl_ms
 
     true = :ets.insert(state.table, {key, payment_proof, expires_at_ms})
@@ -188,7 +193,7 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   end
 
   def handle_call({:delete, address, resource}, _from, state) do
-    :ets.delete(state.table, {address, resource})
+    :ets.delete(state.table, {String.downcase(address), resource})
     {:reply, :ok, state}
   end
 
