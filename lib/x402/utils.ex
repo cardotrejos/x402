@@ -18,23 +18,22 @@ defmodule X402.Utils do
 
       Regex.match?(~r/^\d+\.\d+$/, value) ->
         [whole, fraction] = String.split(value, ".", parts: 2)
-        normalized_fraction = String.trim_trailing(fraction, "0")
-
-        case normalized_fraction do
-          "" ->
-            {:ok, {String.to_integer(whole), 0}}
-
-          fraction_digits ->
-            if String.length(fraction_digits) > @max_decimal_scale do
-              :error
-            else
-              digits = whole <> fraction_digits
-              {:ok, {String.to_integer(digits), String.length(fraction_digits)}}
-            end
-        end
+        do_parse_fractional(whole, String.trim_trailing(fraction, "0"))
 
       true ->
         :error
+    end
+  end
+
+  defp do_parse_fractional(whole, ""), do: {:ok, {String.to_integer(whole), 0}}
+
+  defp do_parse_fractional(whole, fraction) do
+    scale = String.length(fraction)
+
+    if scale <= @max_decimal_scale do
+      {:ok, {String.to_integer(whole <> fraction), scale}}
+    else
+      :error
     end
   end
 
