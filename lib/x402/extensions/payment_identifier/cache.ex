@@ -7,6 +7,8 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   (for example, a pid or registered process name).
   """
 
+  use X402.Behaviour, callbacks: [get: 2, put: 3, delete: 2]
+
   alias X402.Extensions.PaymentIdentifier
 
   @typedoc "Payment identifier cache key."
@@ -28,17 +30,16 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   @callback put(cache :: term(), key(), value()) :: write_result()
   @callback delete(cache :: term(), key()) :: write_result()
 
-  @required_callbacks [get: 2, put: 3, delete: 2]
-
   @doc since: "0.1.0"
   @doc """
   Validates a cache adapter tuple for `NimbleOptions` custom validation.
   """
   @spec validate_adapter(term()) :: :ok | {:error, String.t()}
   def validate_adapter({module, _cache}) when is_atom(module) do
-    case implementation?(module) do
-      true -> :ok
-      false -> {:error, "expected a cache adapter tuple {module, cache}"}
+    if implementation?(module) do
+      :ok
+    else
+      {:error, "expected a cache adapter tuple {module, cache}"}
     end
   end
 
@@ -86,7 +87,4 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   end
 
   def delete(_adapter, _payment_id), do: {:error, :invalid_adapter}
-
-  @spec implementation?(module()) :: boolean()
-  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
 end

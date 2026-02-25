@@ -6,6 +6,8 @@ defmodule X402.Extensions.SIWX.Verifier do
   signature matches the claimed wallet address.
   """
 
+  use X402.Behaviour, callbacks: [verify_signature: 3]
+
   @typedoc "Verifier return value."
   @type verify_result :: {:ok, boolean()} | {:error, term()}
 
@@ -19,8 +21,6 @@ defmodule X402.Extensions.SIWX.Verifier do
             ) ::
               verify_result()
 
-  @required_callbacks [verify_signature: 3]
-
   @doc since: "0.3.0"
   @doc """
   Validates that a value is a module implementing `X402.Extensions.SIWX.Verifier`.
@@ -28,16 +28,6 @@ defmodule X402.Extensions.SIWX.Verifier do
   This function is intended for `NimbleOptions` custom validation.
   """
   @spec validate_module(term()) :: :ok | {:error, String.t()}
-  def validate_module(module) when is_atom(module) do
-    case implementation?(module) do
-      true -> :ok
-      false -> {:error, "expected a module implementing X402.Extensions.SIWX.Verifier"}
-    end
-  end
-
-  def validate_module(_invalid),
-    do: {:error, "expected a module implementing X402.Extensions.SIWX.Verifier"}
-
-  @spec implementation?(module()) :: boolean()
-  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
+  def validate_module(module),
+    do: X402.Behaviour.validate_implementation(module, __MODULE__, @required_callbacks)
 end
