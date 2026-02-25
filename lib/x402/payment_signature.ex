@@ -58,7 +58,7 @@ defmodule X402.PaymentSignature do
   """
   @spec decode(String.t()) :: {:ok, map()} | {:error, decode_error()}
   def decode(value) when is_binary(value) do
-    with {:ok, json} <- decode_base64(value),
+    with {:ok, json} <- X402.Utils.decode_base64(value),
          {:ok, decoded} <- Jason.decode(json),
          true <- is_map(decoded) do
       result = {:ok, decoded}
@@ -209,16 +209,6 @@ defmodule X402.PaymentSignature do
   def decode_and_validate(_value, _requirements) do
     Telemetry.emit(:payment_signature, :decode_and_validate, :error, %{reason: :invalid_payload})
     {:error, :invalid_payload}
-  end
-
-  @spec decode_base64(String.t()) :: {:ok, String.t()} | {:error, :invalid_base64}
-  defp decode_base64(""), do: {:error, :invalid_base64}
-
-  defp decode_base64(value) do
-    case Base.decode64(value) do
-      {:ok, decoded} -> {:ok, decoded}
-      :error -> {:error, :invalid_base64}
-    end
   end
 
   @spec missing_fields(map()) :: [String.t()]
