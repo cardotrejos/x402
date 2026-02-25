@@ -166,7 +166,8 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   end
 
   def handle_call({:put, payment_id, value}, _from, state) do
-    if :ets.info(state.table, :size) >= state.max_size and not :ets.member(state.table, payment_id) do
+    if :ets.info(state.table, :size) >= state.max_size and
+         not :ets.member(state.table, payment_id) do
       case :ets.first(state.table) do
         :"$end_of_table" -> :ok
         key -> :ets.delete(state.table, key)
