@@ -68,6 +68,11 @@ defmodule X402.Extensions.SIWXTest do
       assert SIWX.encode(invalid_expiration) == {:error, {:invalid_field, :expiration_time}}
     end
 
+    test "rejects statement containing newlines" do
+      invalid_statement = Map.put(valid_payload(), :statement, "First line\nSecond line")
+      assert SIWX.encode(invalid_statement) == {:error, {:invalid_field, :statement}}
+    end
+
     test "returns invalid_message when format is malformed" do
       assert SIWX.decode("not a siwx message") == {:error, :invalid_message}
       assert SIWX.decode(nil) == {:error, :invalid_message}
