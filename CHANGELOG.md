@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-02-25
+
+### Fixed
+
+- Fixed unbounded ETS cache growth vulnerability (DoS) — added `max_size` config with LRU eviction (#17)
+- Fixed expired entries not being deleted during direct ETS reads (#25)
+- Fixed `mix format` compliance across all files
+
+### Added
+
+- Comprehensive tests for `X402.Behaviour.implements?/2` with doctests (#28)
+- Test coverage for facilitator hook exception and throw handling (#24)
+- Optimized ETS cache with direct concurrent reads bypassing GenServer serialization (#25)
+
 ## [0.3.0] - 2026-02-17
 
 ### Added
