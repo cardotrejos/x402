@@ -7,7 +7,6 @@ defmodule X402.PaymentRequired do
   """
 
   alias X402.Telemetry
-  alias X402.Utils
 
   @type scheme :: String.t()
   @type encode_error :: :invalid_payload | :invalid_json
@@ -156,7 +155,7 @@ defmodule X402.PaymentRequired do
 
   @spec normalize_accepts_entries(map()) :: map()
   defp normalize_accepts_entries(payload) do
-    case Utils.map_value(payload, {"accepts", :accepts}) do
+    case map_value(payload, {"accepts", :accepts}) do
       accepts when is_list(accepts) ->
         normalized =
           Enum.map(accepts, fn
@@ -173,9 +172,9 @@ defmodule X402.PaymentRequired do
 
   @spec replace_amount_key(map()) :: map()
   defp replace_amount_key(payload) do
-    case Utils.map_value(payload, {"maxPrice", :maxPrice}) do
+    case map_value(payload, {"maxPrice", :maxPrice}) do
       nil ->
-        case Utils.map_value(payload, {"maxAmountRequired", :maxAmountRequired}) do
+        case map_value(payload, {"maxAmountRequired", :maxAmountRequired}) do
           nil ->
             payload
 
@@ -191,7 +190,18 @@ defmodule X402.PaymentRequired do
   end
 
   @spec scheme(map()) :: scheme() | atom() | nil
-  defp scheme(payload), do: Utils.map_value(payload, {"scheme", :scheme})
+  defp scheme(payload), do: map_value(payload, {"scheme", :scheme})
+
+  @spec map_value(map(), {String.t(), atom()}) :: term()
+  defp map_value(map, {string_key, atom_key}) do
+    case Map.fetch(map, string_key) do
+      {:ok, value} ->
+        value
+
+      :error ->
+        Map.get(map, atom_key)
+    end
+  end
 
   @spec map_put(map(), {String.t(), atom()}, term()) :: map()
   defp map_put(map, {string_key, atom_key}, value) do
