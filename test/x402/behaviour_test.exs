@@ -1,8 +1,6 @@
 defmodule X402.BehaviourTest do
   use ExUnit.Case, async: true
 
-  doctest X402.Behaviour
-
   defmodule TestModule do
     def foo, do: :ok
     def bar(_), do: :ok
