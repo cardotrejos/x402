@@ -7,6 +7,7 @@ defmodule X402.BehaviourTest do
     def foo, do: :ok
     def bar(_), do: :ok
   end
+
   alias __MODULE__.TestModule
 
   describe "implements?/2" do
