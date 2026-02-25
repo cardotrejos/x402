@@ -12,6 +12,7 @@ defmodule X402.PaymentSignature do
   """
 
   alias X402.Telemetry
+  alias X402.Utils
 
   @required_fields ~w(transactionHash network scheme payerWallet)
 
@@ -250,7 +251,8 @@ defmodule X402.PaymentSignature do
 
   @spec effective_scheme(map(), map()) :: String.t() | atom() | nil
   defp effective_scheme(payload, requirements) do
-    map_value(requirements, {"scheme", :scheme}) || map_value(payload, {"scheme", :scheme})
+    Utils.map_value(requirements, {"scheme", :scheme}) ||
+      Utils.map_value(payload, {"scheme", :scheme})
   end
 
   @spec extract_max_price(map(), map()) ::
@@ -258,11 +260,11 @@ defmodule X402.PaymentSignature do
           | {:error, {:invalid_upto_payment, upto_validation_error()}}
   defp extract_max_price(payload, requirements) do
     value =
-      first_present([
-        map_value(requirements, {"maxPrice", :maxPrice}),
-        map_value(requirements, {"maxAmountRequired", :maxAmountRequired}),
-        map_value(payload, {"maxPrice", :maxPrice}),
-        map_value(payload, {"maxAmountRequired", :maxAmountRequired})
+      Utils.first_present([
+        Utils.map_value(requirements, {"maxPrice", :maxPrice}),
+        Utils.map_value(requirements, {"maxAmountRequired", :maxAmountRequired}),
+        Utils.map_value(payload, {"maxPrice", :maxPrice}),
+        Utils.map_value(payload, {"maxAmountRequired", :maxAmountRequired})
       ])
 
     case value do
@@ -282,15 +284,18 @@ defmodule X402.PaymentSignature do
           | {:error, {:invalid_upto_payment, upto_validation_error()}}
   defp extract_payment_value(payload) do
     value =
-      first_present([
-        map_value(payload, {"value", :value}),
-        nested_map_value(payload, [{"payload", :payload}, {"value", :value}]),
-        nested_map_value(payload, [
+      Utils.first_present([
+        Utils.map_value(payload, {"value", :value}),
+        Utils.nested_map_value(payload, [{"payload", :payload}, {"value", :value}]),
+        Utils.nested_map_value(payload, [
           {"payload", :payload},
           {"authorization", :authorization},
           {"value", :value}
         ]),
-        nested_map_value(payload, [{"authorization", :authorization}, {"value", :value}])
+        Utils.nested_map_value(payload, [
+          {"authorization", :authorization},
+          {"value", :value}
+        ])
       ])
 
     case value do
@@ -369,30 +374,4 @@ defmodule X402.PaymentSignature do
         :error
     end
   end
-
-  @spec nested_map_value(map(), [{String.t(), atom()}]) :: term()
-  defp nested_map_value(map, [key]) when is_map(map), do: map_value(map, key)
-
-  defp nested_map_value(map, [key | rest]) when is_map(map) do
-    case map_value(map, key) do
-      %{} = nested -> nested_map_value(nested, rest)
-      _other -> nil
-    end
-  end
-
-  defp nested_map_value(_not_map, _keys), do: nil
-
-  @spec map_value(map(), {String.t(), atom()}) :: term()
-  defp map_value(map, {string_key, atom_key}) do
-    case Map.fetch(map, string_key) do
-      {:ok, value} ->
-        value
-
-      :error ->
-        Map.get(map, atom_key)
-    end
-  end
-
-  @spec first_present([term()]) :: term() | nil
-  defp first_present(values), do: Enum.find(values, &(not is_nil(&1)))
 end
