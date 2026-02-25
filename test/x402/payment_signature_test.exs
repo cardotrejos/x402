@@ -191,5 +191,10 @@ defmodule X402.PaymentSignatureTest do
       assert PaymentSignature.decode_and_validate(encoded, requirements) ==
                {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
     end
+
+    test "returns invalid_payload for non-map requirements" do
+      encoded = "payload"
+      assert PaymentSignature.decode_and_validate(encoded, :invalid) == {:error, :invalid_payload}
+    end
   end
 end
