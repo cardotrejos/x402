@@ -11,6 +11,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @behaviour Plug
 
+    alias X402.Extensions.PaymentIdentifier.ETSCache
     alias X402.Facilitator
     alias X402.Facilitator.Error
     alias X402.Hooks
@@ -71,6 +72,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         default: Default,
         doc: "Lifecycle hook module implementing `X402.Hooks`."
       ],
+      payment_identifier_cache: [
+        type: {:or, [:atom, :pid, :any]},
+        default: nil,
+        doc: """
+        Optional `ETSCache` server pid/name used for idempotency. When set,
+        the plug performs an atomic claim (via `put_new`) on the payment proof
+        hash before settling, preventing concurrent requests from double-settling
+        the same payment.
+        """
+      ],
       routes: [
         type: {:list, {:map, @route_schema}},
         required: true,
@@ -82,6 +93,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @type options :: %{
             facilitator: Facilitator.server(),
             hooks: module(),
+            payment_identifier_cache: ETSCache.server() | nil,
             routes: [compiled_route()]
           }
 
@@ -113,6 +125,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       %{
         facilitator: Keyword.fetch!(validated_opts, :facilitator),
         hooks: Keyword.fetch!(validated_opts, :hooks),
+        payment_identifier_cache: Keyword.get(validated_opts, :payment_identifier_cache),
         routes:
           validated_opts
           |> Keyword.fetch!(:routes)
@@ -125,7 +138,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     Gates matching requests behind x402 payment verification.
     """
     @spec call(Plug.Conn.t(), options()) :: Plug.Conn.t()
-    def call(%Plug.Conn{} = conn, %{facilitator: facilitator, hooks: hooks, routes: routes}) do
+    def call(%Plug.Conn{} = conn, %{
+          facilitator: facilitator,
+          hooks: hooks,
+          payment_identifier_cache: payment_identifier_cache,
+          routes: routes
+        }) do
       request_path = normalize_path(conn.request_path)
       request_method = normalize_method(conn.method)
 
@@ -135,7 +153,15 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           conn
 
         route ->
-          handle_payment_gate(conn, facilitator, hooks, route, request_method, request_path)
+          handle_payment_gate(
+            conn,
+            facilitator,
+            hooks,
+            payment_identifier_cache,
+            route,
+            request_method,
+            request_path
+          )
       end
     end
 
@@ -143,11 +169,20 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             Plug.Conn.t(),
             Facilitator.server(),
             module(),
+            ETSCache.server() | nil,
             compiled_route(),
             atom(),
             String.t()
           ) :: Plug.Conn.t()
-    defp handle_payment_gate(conn, facilitator, hooks, route, request_method, request_path) do
+    defp handle_payment_gate(
+           conn,
+           facilitator,
+           hooks,
+           payment_identifier_cache,
+           route,
+           request_method,
+           request_path
+         ) do
       case payment_header(conn) do
         :missing ->
           emit(:payment_required, %{method: request_method, path: request_path, route: route.path})
@@ -159,6 +194,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             conn,
             facilitator,
             hooks,
+            payment_identifier_cache,
             route,
             request_method,
             request_path,
@@ -181,23 +217,65 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             Plug.Conn.t(),
             Facilitator.server(),
             module(),
+            ETSCache.server() | nil,
             compiled_route(),
             atom(),
             String.t(),
             String.t()
           ) :: Plug.Conn.t()
-    defp verify_and_settle(conn, facilitator, hooks, route, request_method, request_path, header) do
+    defp verify_and_settle(
+           conn,
+           facilitator,
+           hooks,
+           payment_identifier_cache,
+           route,
+           request_method,
+           request_path,
+           header
+         ) do
       requirements = facilitator_requirements(route, request_path)
+
+      # Derive a stable idempotency key from the raw payment header. Two
+      # concurrent requests carrying the same proof produce the same key.
+      payment_id = :crypto.hash(:sha256, header) |> Base.encode16(case: :lower)
 
       with {:ok, payment_payload} <- PaymentSignature.decode_and_validate(header, requirements),
            {:ok, verify_response} <-
              facilitator_verify(facilitator, payment_payload, requirements, hooks),
            :ok <- ensure_success_status(verify_response),
-           {:ok, settle_response} <-
-             facilitator_settle(facilitator, payment_payload, requirements, hooks),
-           :ok <- ensure_success_status(settle_response) do
-        emit(:payment_verified, %{method: request_method, path: request_path, route: route.path})
-        conn
+           :ok <- claim_payment(payment_identifier_cache, payment_id) do
+        # Claim succeeded. Attempt settlement separately so we can release the
+        # claim if settlement fails — otherwise a transient network error or
+        # facilitator timeout would permanently block the payment ID, leaving
+        # the user unable to retry with the same proof.
+        settle_result =
+          with {:ok, settle_response} <-
+                 facilitator_settle(facilitator, payment_payload, requirements, hooks) do
+            ensure_success_status(settle_response)
+          end
+
+        case settle_result do
+          :ok ->
+            emit(:payment_verified, %{
+              method: request_method,
+              path: request_path,
+              route: route.path
+            })
+
+            conn
+
+          {:error, reason} ->
+            release_claim(payment_identifier_cache, payment_id)
+
+            emit(:payment_rejected, %{
+              method: request_method,
+              path: request_path,
+              route: route.path,
+              reason: reason
+            })
+
+            payment_required_response(conn, route, request_path, rejection_error(reason))
+        end
       else
         {:error, reason} ->
           emit(:payment_rejected, %{
@@ -210,6 +288,22 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           payment_required_response(conn, route, request_path, rejection_error(reason))
       end
     end
+
+    # Atomically claims a payment ID to prevent concurrent double-settlement.
+    # When no cache is configured, the check is skipped (opt-in behaviour).
+    @spec claim_payment(ETSCache.server() | nil, String.t()) ::
+            :ok | {:error, :already_exists}
+    defp claim_payment(nil, _payment_id), do: :ok
+
+    defp claim_payment(cache, payment_id) do
+      ETSCache.put_new(cache, payment_id, :verified)
+    end
+
+    # Releases a previously claimed payment ID. Called when settlement fails
+    # after a successful claim, so the caller can retry with a fresh proof.
+    @spec release_claim(ETSCache.server() | nil, String.t()) :: :ok | {:error, term()}
+    defp release_claim(nil, _payment_id), do: :ok
+    defp release_claim(cache, payment_id), do: ETSCache.delete(cache, payment_id)
 
     @spec facilitator_verify(Facilitator.server(), map(), map(), module()) ::
             Facilitator.response()
@@ -381,6 +475,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error(:invalid_base64), do: "invalid payment header"
     defp rejection_error(:invalid_json), do: "invalid payment header"
     defp rejection_error(:invalid_payload), do: "invalid payment payload"
+    defp rejection_error(:already_exists), do: "payment already processed"
     defp rejection_error({:missing_fields, _fields}), do: "invalid payment payload"
     defp rejection_error({:invalid_upto_payment, _reason}), do: "invalid payment payload"
 

@@ -63,6 +63,47 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
     assert %{id: :custom_cache} = ETSCache.child_spec(name: :custom_cache)
   end
 
+  test "put_new/3 inserts a new entry and returns :ok" do
+    cache = start_cache(ttl_ms: 1_000)
+
+    assert :ok = ETSCache.put_new(cache, "payment-1", :verified)
+    assert {:hit, :verified} = ETSCache.get(cache, "payment-1")
+  end
+
+  test "put_new/3 returns :already_exists for a duplicate live entry" do
+    cache = start_cache(ttl_ms: 1_000)
+
+    assert :ok = ETSCache.put_new(cache, "payment-1", :verified)
+    assert {:error, :already_exists} = ETSCache.put_new(cache, "payment-1", :verified)
+  end
+
+  test "put_new/3 allows re-insert after the entry has expired" do
+    # Expired entries must not block legitimate retries until the cleanup
+    # timer fires. put_new should atomically clean up and re-insert.
+    cache = start_cache(ttl_ms: 10, cleanup_interval_ms: 60_000)
+
+    assert :ok = ETSCache.put_new(cache, "payment-1", :verified)
+    Process.sleep(20)
+
+    # Entry is expired but cleanup hasn't run — put_new must still succeed.
+    assert :ok = ETSCache.put_new(cache, "payment-1", :verified)
+    assert {:hit, :verified} = ETSCache.get(cache, "payment-1")
+  end
+
+  test "put_new/3 evicts the soonest-expiring entry when at max_size" do
+    cache = start_cache(ttl_ms: 1_000, max_size: 2)
+
+    assert :ok = ETSCache.put_new(cache, "payment-1", :verified)
+    assert :ok = ETSCache.put_new(cache, "payment-2", :verified)
+
+    # Adding a third entry must succeed (evicts one of the existing entries).
+    assert :ok = ETSCache.put_new(cache, "payment-3", :verified)
+
+    %{table: table} = :sys.get_state(cache)
+    assert :ets.info(table, :size) == 2
+    assert {:hit, :verified} = ETSCache.get(cache, "payment-3")
+  end
+
   defp start_cache(opts) do
     name = String.to_atom("ets_cache_#{System.unique_integer([:positive, :monotonic])}")
     options = Keyword.merge([name: name, cleanup_interval_ms: 50], opts)

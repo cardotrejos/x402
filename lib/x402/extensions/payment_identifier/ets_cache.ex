@@ -132,6 +132,25 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
 
   def put(_cache, _payment_id, _value), do: {:error, :invalid_payment_id}
 
+  @doc since: "0.4.0"
+  @doc """
+  Atomically inserts a payment identifier only if it does not already exist.
+
+  Returns `:ok` if the entry was inserted, or `{:error, :already_exists}` if
+  a non-expired entry for `payment_id` is already present. This is used to
+  prevent concurrent requests from double-settling the same payment proof.
+  """
+  @spec put_new(server(), Cache.key(), Cache.value()) ::
+          :ok | {:error, :already_exists | :invalid_cache_value}
+  def put_new(cache, payment_id, value) when is_binary(payment_id) do
+    case valid_value?(value) do
+      true -> GenServer.call(cache, {:put_new, payment_id, value})
+      false -> {:error, :invalid_cache_value}
+    end
+  end
+
+  def put_new(_cache, _payment_id, _value), do: {:error, :invalid_payment_id}
+
   @doc since: "0.1.0"
   @doc """
   Deletes a payment identifier entry from the cache.
@@ -196,15 +215,42 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   def handle_call({:put, payment_id, value}, _from, state) do
     if :ets.info(state.table, :size) >= state.max_size and
          not :ets.member(state.table, payment_id) do
-      case :ets.first(state.table) do
-        :"$end_of_table" -> :ok
-        key -> :ets.delete(state.table, key)
-      end
+      # Evict the entry nearest to expiry (not ets.first, which is hash-order
+      # and effectively random — an attacker could flood with unique IDs to
+      # evict legitimate in-flight records and reopen replay windows).
+      evict_soonest_expiry(state.table)
     end
 
     expires_at_ms = now_ms() + state.ttl_ms
     true = :ets.insert(state.table, {payment_id, value, expires_at_ms})
     {:reply, :ok, state}
+  end
+
+  def handle_call({:put_new, payment_id, value}, _from, state) do
+    now = now_ms()
+    expires_at_ms = now + state.ttl_ms
+
+    # Delete expired entries with the same key before attempting insert_new.
+    # ets.insert_new returns false for any existing entry regardless of expiry,
+    # which would incorrectly block legitimate retries until the cleanup timer
+    # fires (up to @default_cleanup_interval_ms = 1 minute by default).
+    case :ets.lookup(state.table, payment_id) do
+      [{^payment_id, _val, exp}] when exp <= now -> :ets.delete(state.table, payment_id)
+      _ -> :ok
+    end
+
+    # Enforce max_size — unlike `put`, the original put_new had no capacity
+    # check, allowing the cache to grow without bound under concurrent load.
+    if :ets.info(state.table, :size) >= state.max_size and
+         not :ets.member(state.table, payment_id) do
+      evict_soonest_expiry(state.table)
+    end
+
+    # ets.insert_new is atomic — only one concurrent process wins the race.
+    case :ets.insert_new(state.table, {payment_id, value, expires_at_ms}) do
+      true -> {:reply, :ok, state}
+      false -> {:reply, {:error, :already_exists}, state}
+    end
   end
 
   def handle_call({:delete, payment_id}, _from, state) do
@@ -224,6 +270,31 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   @spec schedule_cleanup(pos_integer()) :: reference()
   defp schedule_cleanup(cleanup_interval_ms) do
     Process.send_after(self(), :cleanup, cleanup_interval_ms)
+  end
+
+  @spec evict_soonest_expiry(:ets.tid() | atom()) :: true
+  defp evict_soonest_expiry(table) do
+    # Find the key whose TTL expires soonest and evict it. O(n) but eviction
+    # is rare (only at max_size) and prevents cache-flooding attacks.
+    case :ets.first(table) do
+      :"$end_of_table" ->
+        true
+
+      first_key ->
+        [{_, _, first_exp}] = :ets.lookup(table, first_key)
+        {_min_exp, oldest_key} = :ets.foldl(&pick_soonest_expiry/2, {first_exp, first_key}, table)
+        :ets.delete(table, oldest_key)
+    end
+  end
+
+  # Accumulator for foldl — keeps track of the entry with the smallest expiry.
+  # Extracted to avoid nesting depth violations in Credo strict mode.
+  @spec pick_soonest_expiry(
+          {term(), term(), non_neg_integer()},
+          {non_neg_integer(), term()}
+        ) :: {non_neg_integer(), term()}
+  defp pick_soonest_expiry({key, _val, expires}, {min_exp, min_key}) do
+    if expires < min_exp, do: {expires, key}, else: {min_exp, min_key}
   end
 
   @spec delete_expired_entries(:ets.tid() | atom(), non_neg_integer()) :: non_neg_integer()
