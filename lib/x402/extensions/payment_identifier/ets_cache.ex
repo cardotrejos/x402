@@ -227,7 +227,24 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   end
 
   def handle_call({:put_new, payment_id, value}, _from, state) do
-    expires_at_ms = now_ms() + state.ttl_ms
+    now = now_ms()
+    expires_at_ms = now + state.ttl_ms
+
+    # Delete expired entries with the same key before attempting insert_new.
+    # ets.insert_new returns false for any existing entry regardless of expiry,
+    # which would incorrectly block legitimate retries until the cleanup timer
+    # fires (up to @default_cleanup_interval_ms = 1 minute by default).
+    case :ets.lookup(state.table, payment_id) do
+      [{^payment_id, _val, exp}] when exp <= now -> :ets.delete(state.table, payment_id)
+      _ -> :ok
+    end
+
+    # Enforce max_size — unlike `put`, the original put_new had no capacity
+    # check, allowing the cache to grow without bound under concurrent load.
+    if :ets.info(state.table, :size) >= state.max_size and
+         not :ets.member(state.table, payment_id) do
+      evict_soonest_expiry(state.table)
+    end
 
     # ets.insert_new is atomic — only one concurrent process wins the race.
     case :ets.insert_new(state.table, {payment_id, value, expires_at_ms}) do

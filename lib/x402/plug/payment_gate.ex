@@ -243,12 +243,40 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
            {:ok, verify_response} <-
              facilitator_verify(facilitator, payment_payload, requirements, hooks),
            :ok <- ensure_success_status(verify_response),
-           :ok <- claim_payment(payment_identifier_cache, payment_id),
-           {:ok, settle_response} <-
-             facilitator_settle(facilitator, payment_payload, requirements, hooks),
-           :ok <- ensure_success_status(settle_response) do
-        emit(:payment_verified, %{method: request_method, path: request_path, route: route.path})
-        conn
+           :ok <- claim_payment(payment_identifier_cache, payment_id) do
+        # Claim succeeded. Attempt settlement separately so we can release the
+        # claim if settlement fails — otherwise a transient network error or
+        # facilitator timeout would permanently block the payment ID, leaving
+        # the user unable to retry with the same proof.
+        settle_result =
+          with {:ok, settle_response} <-
+                 facilitator_settle(facilitator, payment_payload, requirements, hooks),
+               :ok <- ensure_success_status(settle_response) do
+            :ok
+          end
+
+        case settle_result do
+          :ok ->
+            emit(:payment_verified, %{
+              method: request_method,
+              path: request_path,
+              route: route.path
+            })
+
+            conn
+
+          {:error, reason} ->
+            release_claim(payment_identifier_cache, payment_id)
+
+            emit(:payment_rejected, %{
+              method: request_method,
+              path: request_path,
+              route: route.path,
+              reason: reason
+            })
+
+            payment_required_response(conn, route, request_path, rejection_error(reason))
+        end
       else
         {:error, reason} ->
           emit(:payment_rejected, %{
@@ -271,6 +299,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp claim_payment(cache, payment_id) do
       ETSCache.put_new(cache, payment_id, :verified)
     end
+
+    # Releases a previously claimed payment ID. Called when settlement fails
+    # after a successful claim, so the caller can retry with a fresh proof.
+    @spec release_claim(ETSCache.server() | nil, String.t()) :: :ok | {:error, term()}
+    defp release_claim(nil, _payment_id), do: :ok
+    defp release_claim(cache, payment_id), do: ETSCache.delete(cache, payment_id)
 
     @spec facilitator_verify(Facilitator.server(), map(), map(), module()) ::
             Facilitator.response()
