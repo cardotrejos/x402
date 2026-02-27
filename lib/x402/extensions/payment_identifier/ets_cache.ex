@@ -282,18 +282,19 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
 
       first_key ->
         [{_, _, first_exp}] = :ets.lookup(table, first_key)
-
-        {_min_exp, oldest_key} =
-          :ets.foldl(
-            fn {key, _val, expires}, {min_exp, min_key} ->
-              if expires < min_exp, do: {expires, key}, else: {min_exp, min_key}
-            end,
-            {first_exp, first_key},
-            table
-          )
-
+        {_min_exp, oldest_key} = :ets.foldl(&pick_soonest_expiry/2, {first_exp, first_key}, table)
         :ets.delete(table, oldest_key)
     end
+  end
+
+  # Accumulator for foldl — keeps track of the entry with the smallest expiry.
+  # Extracted to avoid nesting depth violations in Credo strict mode.
+  @spec pick_soonest_expiry(
+          {term(), term(), non_neg_integer()},
+          {non_neg_integer(), term()}
+        ) :: {non_neg_integer(), term()}
+  defp pick_soonest_expiry({key, _val, expires}, {min_exp, min_key}) do
+    if expires < min_exp, do: {expires, key}, else: {min_exp, min_key}
   end
 
   @spec delete_expired_entries(:ets.tid() | atom(), non_neg_integer()) :: non_neg_integer()

@@ -250,9 +250,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         # the user unable to retry with the same proof.
         settle_result =
           with {:ok, settle_response} <-
-                 facilitator_settle(facilitator, payment_payload, requirements, hooks),
-               :ok <- ensure_success_status(settle_response) do
-            :ok
+                 facilitator_settle(facilitator, payment_payload, requirements, hooks) do
+            ensure_success_status(settle_response)
           end
 
         case settle_result do
