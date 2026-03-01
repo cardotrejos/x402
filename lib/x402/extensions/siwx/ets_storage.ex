@@ -171,7 +171,7 @@ defmodule X402.Extensions.SIWX.ETSStorage do
 
   @impl true
   @spec handle_call(term(), GenServer.from(), state()) ::
-          {:reply, :ok | {:error, term()}, state()}
+          {:reply, :ok | {:ok, X402.Extensions.SIWX.Storage.access_record()} | {:error, term()}, state()}
   def handle_call({:get, address, resource}, _from, state) do
     key = {address, resource}
     now = now_ms()
