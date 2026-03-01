@@ -5,8 +5,8 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   Records are stored in an ETS table keyed by `{address, resource}` and cleaned
   up periodically by the GenServer process.
 
-  Reads bypass the GenServer and go directly to ETS for better concurrency.
-  Writes are serialized through the GenServer to ensure consistency.
+  Reads are serialized through the GenServer to ensure consistency with
+  concurrent deletes (e.g., session revocation).
   """
 
   use GenServer
@@ -85,32 +85,26 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   @impl true
   @spec get(String.t(), String.t()) ::
           {:ok, X402.Extensions.SIWX.Storage.access_record()} | {:error, :not_found}
-  def get(address, resource), do: get(@default_table, address, resource)
+  def get(address, resource), do: get(@default_name, address, resource)
 
   @doc since: "0.3.0"
   @doc """
-  Fetches an access record from a specific storage table.
+  Fetches an access record from a specific storage server.
 
-  Reads bypass the GenServer and go directly to ETS for better concurrency
-  under high read load.
+  Routes through the GenServer to ensure reads are serialised with
+  concurrent deletes (e.g., session revocation). A direct ETS read on a
+  `:protected` table sees the table state at read-time, which may be before
+  a queued-but-not-yet-processed `delete` is applied — meaning a revoked
+  session can appear valid until the next cleanup sweep.
   """
-  @spec get(atom(), String.t(), String.t()) ::
+  @spec get(server(), String.t(), String.t()) ::
           {:ok, X402.Extensions.SIWX.Storage.access_record()} | {:error, :not_found}
-  def get(table, address, resource)
-      when is_atom(table) and is_binary(address) and is_binary(resource) do
-    key = {address, resource}
-    now = now_ms()
-
-    case :ets.lookup(table, key) do
-      [{^key, payment_proof, expires_at_ms}] when expires_at_ms > now ->
-        {:ok, %{payment_proof: payment_proof, expires_at_ms: expires_at_ms}}
-
-      _other ->
-        {:error, :not_found}
-    end
+  def get(server, address, resource)
+      when is_binary(address) and is_binary(resource) do
+    GenServer.call(server, {:get, address, resource})
   end
 
-  def get(_table, _address, _resource), do: {:error, :not_found}
+  def get(_server, _address, _resource), do: {:error, :not_found}
 
   @doc since: "0.3.0"
   @doc """
@@ -177,7 +171,24 @@ defmodule X402.Extensions.SIWX.ETSStorage do
 
   @impl true
   @spec handle_call(term(), GenServer.from(), state()) ::
-          {:reply, :ok | {:error, term()}, state()}
+          {:reply, :ok | {:ok, X402.Extensions.SIWX.Storage.access_record()} | {:error, term()},
+           state()}
+  def handle_call({:get, address, resource}, _from, state) do
+    key = {address, resource}
+    now = now_ms()
+
+    reply =
+      case :ets.lookup(state.table, key) do
+        [{^key, payment_proof, expires_at_ms}] when expires_at_ms > now ->
+          {:ok, %{payment_proof: payment_proof, expires_at_ms: expires_at_ms}}
+
+        _other ->
+          {:error, :not_found}
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call({:put, address, resource, payment_proof, ttl_ms}, _from, state) do
     key = {address, resource}
     expires_at_ms = now_ms() + ttl_ms

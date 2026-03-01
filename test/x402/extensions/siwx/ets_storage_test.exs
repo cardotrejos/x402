@@ -27,15 +27,15 @@ defmodule X402.Extensions.SIWX.ETSStorageTest do
 
       assert :ok = ETSStorage.put(storage, "0xabc", "/paid/resource", %{"tx" => "0x1"}, 5_000)
 
-      assert {:ok, record} = ETSStorage.get(table, "0xabc", "/paid/resource")
+      assert {:ok, record} = ETSStorage.get(storage, "0xabc", "/paid/resource")
       assert record.payment_proof == %{"tx" => "0x1"}
       assert is_integer(record.expires_at_ms)
     end
 
     test "returns not_found for missing records" do
-      {_storage, table} = start_storage()
+      {storage, _table} = start_storage()
 
-      assert ETSStorage.get(table, "0xmissing", "/paid/resource") == {:error, :not_found}
+      assert ETSStorage.get(storage, "0xmissing", "/paid/resource") == {:error, :not_found}
     end
 
     test "deletes records" do
@@ -43,7 +43,7 @@ defmodule X402.Extensions.SIWX.ETSStorageTest do
 
       assert :ok = ETSStorage.put(storage, "0xabc", "/paid/resource", %{"tx" => "0x1"}, 5_000)
       assert :ok = ETSStorage.delete(storage, "0xabc", "/paid/resource")
-      assert ETSStorage.get(table, "0xabc", "/paid/resource") == {:error, :not_found}
+      assert ETSStorage.get(storage, "0xabc", "/paid/resource") == {:error, :not_found}
     end
 
     test "returns invalid_arguments for malformed put inputs" do
@@ -64,7 +64,7 @@ defmodule X402.Extensions.SIWX.ETSStorageTest do
       assert :ok = ETSStorage.put(storage, "0xabc", "/paid/resource", %{"tx" => "0x1"}, 5)
       Process.sleep(25)
 
-      assert ETSStorage.get(table, "0xabc", "/paid/resource") == {:error, :not_found}
+      assert ETSStorage.get(storage, "0xabc", "/paid/resource") == {:error, :not_found}
     end
 
     test "periodic cleanup removes expired entries" do

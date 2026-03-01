@@ -205,8 +205,14 @@ defmodule X402.Facilitator.HTTP do
   defp timeout_reason?(%{reason: {:timeout, _details}}), do: true
   defp timeout_reason?(_reason), do: false
 
+  # Full-jitter exponential backoff (capped exponential with uniform jitter).
+  # Without jitter, all concurrent callers retry at the same instant —
+  # thundering-herd — amplifying load on the facilitator under pressure.
+  # With full jitter each caller sleeps for a random value in [1, cap], which
+  # spreads retries evenly across the window.
   defp backoff_ms(retry_backoff_ms, attempt) do
-    retry_backoff_ms * trunc(:math.pow(2, attempt - 1))
+    cap = retry_backoff_ms * trunc(:math.pow(2, attempt - 1))
+    :rand.uniform(max(cap, 1))
   end
 
   defp fetch_non_negative_integer(opts, key, default) do
