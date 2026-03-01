@@ -1,7 +1,7 @@
 defmodule X402.MixProject do
   use Mix.Project
 
-  @version "0.3.1"
+  @version "0.3.2"
   @source_url "https://github.com/cardotrejos/x402"
   @description "Elixir SDK for the x402 HTTP payment protocol"
 

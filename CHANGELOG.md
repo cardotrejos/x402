@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-03-01
+
+### Fixed
+
+- Safe cache eviction with bounded cleanup to prevent full-table scans under load (#30)
+- Atomic payment claim in PaymentGate plug to prevent double-settlement on concurrent requests (#30)
+- SIWX ETSStorage read consistency — route `get` through GenServer to prevent revoked session reads (#31)
+- Full-jitter exponential backoff in Facilitator.HTTP to prevent thundering herd on retries (#31)
+- Base.decode64 padding safety in PaymentSignature and PaymentRequired (#31)
+
+
 ## [0.3.1] - 2026-02-25
 
 ### Fixed
