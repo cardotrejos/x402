@@ -5,8 +5,8 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   Records are stored in an ETS table keyed by `{address, resource}` and cleaned
   up periodically by the GenServer process.
 
-  Reads bypass the GenServer and go directly to ETS for better concurrency.
-  Writes are serialized through the GenServer to ensure consistency.
+  Reads are serialized through the GenServer to ensure consistency with
+  concurrent deletes (e.g., session revocation).
   """
 
   use GenServer
