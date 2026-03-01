@@ -208,7 +208,7 @@ defmodule X402.Facilitator.HTTP do
   # Full-jitter exponential backoff (capped exponential with uniform jitter).
   # Without jitter, all concurrent callers retry at the same instant —
   # thundering-herd — amplifying load on the facilitator under pressure.
-  # With full jitter each caller sleeps for a random value in [0, cap], which
+  # With full jitter each caller sleeps for a random value in [1, cap], which
   # spreads retries evenly across the window.
   defp backoff_ms(retry_backoff_ms, attempt) do
     cap = retry_backoff_ms * trunc(:math.pow(2, attempt - 1))
