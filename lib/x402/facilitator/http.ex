@@ -19,7 +19,32 @@ defmodule X402.Facilitator.HTTP do
   - `:max_retries` (default: `2`)
   - `:retry_backoff_ms` (default: `100`)
   - `:receive_timeout_ms` (default: `5_000`)
+
+  ## TLS Verification
+
+  **REQUIRED**: TLS peer verification must be configured when starting your Finch pool.
+  Failure to do so leaves your application vulnerable to MITM attacks.
+
+  Example configuration:
+
+      Finch.start_link(
+        name: MyFinch,
+        pools: %{
+          default: [
+            conn_opts: [
+              transport_opts: [
+                verify: :verify_peer,
+                # Note: requires OTP 25+, see https://www.erlang.org/doc/apps/public_key/public_key.html#cacerts_get/0
+                cacerts: :public_key.cacerts_get()
+              ]
+            ]
+          ]
+        }
+      )
+
+  See `secure_pool_opts/0` for a ready-to-use configuration.
   """
+
   @doc since: "0.1.0"
   @spec request(finch_name(), String.t(), String.t(), map(), keyword()) :: response()
   def request(finch_name, base_url, path, payload, opts \\ [])
@@ -54,6 +79,32 @@ defmodule X402.Facilitator.HTTP do
     end
   end
 
+  @doc """
+  Returns recommended Finch pool options with TLS peer verification enabled.
+
+  Use these when starting your Finch pool to ensure facilitator connections
+  are verified against the system CA store:
+
+      Finch.start_link(
+        name: MyFinch,
+        pools: %{default: X402.Facilitator.HTTP.secure_pool_opts()}
+      )
+
+  Requires OTP 25+ for `:public_key.cacerts_get/0`.
+  """
+  @doc since: "0.3.2"
+  @spec secure_pool_opts() :: keyword()
+  def secure_pool_opts do
+    [
+      conn_opts: [
+        transport_opts: [
+          verify: :verify_peer,
+          cacerts: :public_key.cacerts_get()
+        ]
+      ]
+    ]
+  end
+
   # Bundles retry-related context to keep function arity ≤ 8.
   defp do_request(%{} = ctx, attempt, max_attempts) do
     result = perform_request(ctx, attempt)
@@ -71,10 +122,11 @@ defmodule X402.Facilitator.HTTP do
          attempt
        ) do
     request = finch_module.build(:post, url, @json_headers, encoded_payload)
+    finch_opts = [receive_timeout: receive_timeout_ms]
 
     response =
       try do
-        finch_module.request(request, finch_name, receive_timeout: receive_timeout_ms)
+        finch_module.request(request, finch_name, finch_opts)
       catch
         :exit, reason -> {:error, reason}
       end
