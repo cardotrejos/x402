@@ -79,7 +79,6 @@ defmodule X402.Facilitator.HTTP do
     end
   end
 
-  # Bundles retry-related context to keep function arity ≤ 8.
   @doc """
   Returns recommended Finch pool options with TLS peer verification enabled.
 
@@ -106,6 +105,7 @@ defmodule X402.Facilitator.HTTP do
     ]
   end
 
+  # Bundles retry-related context to keep function arity ≤ 8.
   defp do_request(%{} = ctx, attempt, max_attempts) do
     result = perform_request(ctx, attempt)
     maybe_retry(result, ctx, attempt, max_attempts)
