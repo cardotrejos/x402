@@ -36,9 +36,16 @@ defmodule X402.PaymentSignatureTest do
       assert PaymentSignature.decode(invalid_json) == {:error, :invalid_json}
     end
 
-    test "returns payload_too_large for oversized headers" do
-      # @max_header_bytes is 8_192
-      oversized = String.duplicate("A", 8_193) |> Base.encode64()
+    test "accepts headers at exactly the size limit" do
+      # @max_header_bytes is 8_192 — check is on raw input byte_size
+      at_limit = String.duplicate("A", 8_192)
+      # Should NOT return :payload_too_large (will fail for other reasons)
+      refute PaymentSignature.decode(at_limit) == {:error, :payload_too_large}
+    end
+
+    test "returns payload_too_large for headers exceeding size limit" do
+      # @max_header_bytes is 8_192 — one byte over triggers rejection
+      oversized = String.duplicate("A", 8_193)
       assert PaymentSignature.decode(oversized) == {:error, :payload_too_large}
     end
 
