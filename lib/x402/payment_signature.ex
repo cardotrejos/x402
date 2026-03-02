@@ -76,6 +76,15 @@ defmodule X402.PaymentSignature do
     end
   end
 
+  def decode(_value) do
+    Telemetry.emit(:payment_signature, :decode, :error, %{
+      reason: :invalid_base64,
+      header: header_name()
+    })
+
+    {:error, :invalid_base64}
+  end
+
   defp do_decode(value) do
     with {:ok, json} <- decode_base64(value),
          {:ok, decoded} <- Jason.decode(json),
@@ -108,15 +117,6 @@ defmodule X402.PaymentSignature do
 
         {:error, :invalid_json}
     end
-  end
-
-  def decode(_value) do
-    Telemetry.emit(:payment_signature, :decode, :error, %{
-      reason: :invalid_base64,
-      header: header_name()
-    })
-
-    {:error, :invalid_base64}
   end
 
   @doc since: "0.1.0", group: :verification
