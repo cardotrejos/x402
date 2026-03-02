@@ -474,6 +474,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error(:invalid_payment_header), do: "invalid payment header"
     defp rejection_error(:invalid_base64), do: "invalid payment header"
     defp rejection_error(:invalid_json), do: "invalid payment header"
+    defp rejection_error(:payload_too_large), do: "invalid payment header"
     defp rejection_error(:invalid_payload), do: "invalid payment payload"
     defp rejection_error(:already_exists), do: "payment already processed"
     defp rejection_error({:missing_fields, _fields}), do: "invalid payment payload"
