@@ -19,11 +19,16 @@ defmodule X402.Facilitator.HTTP do
   - `:max_retries` (default: `2`)
   - `:retry_backoff_ms` (default: `100`)
   - `:receive_timeout_ms` (default: `5_000`)
+  - `:verify_tls` (default: `true`) — when `true`, enforces TLS peer
+    verification using system CA certs. Set to `false` only in
+    development/test environments; never in production.
   """
   @doc since: "0.1.0"
   @spec request(finch_name(), String.t(), String.t(), map(), keyword()) :: response()
   def request(finch_name, base_url, path, payload, opts \\ [])
       when is_binary(base_url) and is_binary(path) and is_map(payload) and is_list(opts) do
+    verify_tls = Keyword.get(opts, :verify_tls, true)
+
     with {:ok, max_retries} <- fetch_non_negative_integer(opts, :max_retries, 2),
          {:ok, retry_backoff_ms} <- fetch_non_negative_integer(opts, :retry_backoff_ms, 100),
          {:ok, receive_timeout_ms} <- fetch_non_negative_integer(opts, :receive_timeout_ms, 5_000),
@@ -35,7 +40,8 @@ defmodule X402.Facilitator.HTTP do
         url: join_url(base_url, path),
         payload: encoded_payload,
         receive_timeout_ms: receive_timeout_ms,
-        retry_backoff_ms: retry_backoff_ms
+        retry_backoff_ms: retry_backoff_ms,
+        verify_tls: verify_tls
       }
 
       do_request(ctx, 1, max_retries + 1)
@@ -66,15 +72,27 @@ defmodule X402.Facilitator.HTTP do
            finch_name: finch_name,
            url: url,
            payload: encoded_payload,
-           receive_timeout_ms: receive_timeout_ms
+           receive_timeout_ms: receive_timeout_ms,
+           verify_tls: verify_tls
          },
          attempt
        ) do
     request = finch_module.build(:post, url, @json_headers, encoded_payload)
 
+    finch_opts =
+      [receive_timeout: receive_timeout_ms] ++
+        if verify_tls do
+          # Enforce TLS peer verification using the system CA bundle.
+          # Without this, a MITM could intercept facilitator responses
+          # and inject fraudulent payment approval.
+          [transport_opts: [verify: :verify_peer, cacerts: :public_key.cacerts_get()]]
+        else
+          []
+        end
+
     response =
       try do
-        finch_module.request(request, finch_name, receive_timeout: receive_timeout_ms)
+        finch_module.request(request, finch_name, finch_opts)
       catch
         :exit, reason -> {:error, reason}
       end

@@ -15,7 +15,13 @@ defmodule X402.PaymentSignature do
 
   @required_fields ~w(transactionHash network scheme payerWallet)
 
-  @type decode_error :: :invalid_base64 | :invalid_json
+  # Maximum byte size of the PAYMENT-SIGNATURE header value before decoding.
+  # A valid payment signature is a small JSON object — 8 KB is generous.
+  # Rejecting oversized input before Base64 decode prevents memory exhaustion
+  # under load when many concurrent large payloads hit Jason.decode/1.
+  @max_header_bytes 8_192
+
+  @type decode_error :: :invalid_base64 | :invalid_json | :payload_too_large
   @type upto_validation_error ::
           :missing_max_price
           | :missing_payment_value
@@ -58,6 +64,19 @@ defmodule X402.PaymentSignature do
   """
   @spec decode(String.t()) :: {:ok, map()} | {:error, decode_error()}
   def decode(value) when is_binary(value) do
+    if byte_size(value) > @max_header_bytes do
+      Telemetry.emit(:payment_signature, :decode, :error, %{
+        reason: :payload_too_large,
+        header: header_name()
+      })
+
+      {:error, :payload_too_large}
+    else
+      do_decode(value)
+    end
+  end
+
+  defp do_decode(value) do
     with {:ok, json} <- decode_base64(value),
          {:ok, decoded} <- Jason.decode(json),
          true <- is_map(decoded) do
