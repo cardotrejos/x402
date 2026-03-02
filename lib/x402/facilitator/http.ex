@@ -22,8 +22,10 @@ defmodule X402.Facilitator.HTTP do
 
   ## TLS Verification
 
-  TLS peer verification must be configured when starting your Finch pool,
-  not per-request. Example:
+  **REQUIRED**: TLS peer verification must be configured when starting your Finch pool.
+  Failure to do so leaves your application vulnerable to MITM attacks.
+
+  Example configuration:
 
       Finch.start_link(
         name: MyFinch,
@@ -32,15 +34,13 @@ defmodule X402.Facilitator.HTTP do
             conn_opts: [
               transport_opts: [
                 verify: :verify_peer,
+                # Note: requires OTP 25+, see https://www.erlang.org/doc/apps/public_key/public_key.html#cacerts_get/0
                 cacerts: :public_key.cacerts_get()
               ]
             ]
           ]
         }
       )
-
-  Without proper TLS configuration, your application is vulnerable to MITM
-  attacks on facilitator responses.
 
   See `secure_pool_opts/0` for a ready-to-use configuration.
   """
