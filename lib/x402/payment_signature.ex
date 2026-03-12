@@ -15,11 +15,8 @@ defmodule X402.PaymentSignature do
 
   @required_fields ~w(transactionHash network scheme payerWallet)
 
-  # Maximum byte size of the PAYMENT-SIGNATURE header value before decoding.
-  # A valid payment signature is a small JSON object — 8 KB is generous.
-  # Rejecting oversized input before Base64 decode prevents memory exhaustion
-  # under load when many concurrent large payloads hit Jason.decode/1.
-  @max_header_bytes 8_192
+  # Single source of truth for the 8 KB decode guard — see X402.Header.
+  @max_header_bytes X402.Header.max_header_bytes()
 
   @type decode_error :: :invalid_base64 | :invalid_json | :payload_too_large
   @type upto_validation_error ::

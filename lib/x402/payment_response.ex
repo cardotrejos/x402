@@ -8,9 +8,8 @@ defmodule X402.PaymentResponse do
 
   alias X402.Telemetry
 
-  # 8 KB — generous for valid PAYMENT-RESPONSE payloads; rejects memory-exhaustion
-  # attacks before any Base64 decode/JSON parse work is done.
-  @max_header_bytes 8_192
+  # Single source of truth for the 8 KB decode guard — see X402.Header.
+  @max_header_bytes X402.Header.max_header_bytes()
 
   @type encode_error :: :invalid_payload | :invalid_json
   @type decode_error :: :invalid_base64 | :invalid_json | :payload_too_large

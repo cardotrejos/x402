@@ -91,5 +91,13 @@ defmodule X402.PaymentRequiredTest do
       oversized = String.duplicate("A", 8_193)
       assert PaymentRequired.decode(oversized) == {:error, :payload_too_large}
     end
+
+    test "accepts header values at exactly the 8 KB limit" do
+      # Exactly 8,192 bytes — the > guard must allow this through (not >=)
+      at_limit = String.duplicate("A", 8_192)
+      # Not valid Base64/JSON, but must not be rejected as payload_too_large
+      result = PaymentRequired.decode(at_limit)
+      assert result != {:error, :payload_too_large}
+    end
   end
 end
