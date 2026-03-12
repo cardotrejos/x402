@@ -42,7 +42,7 @@ defmodule X402 do
       "exact"
   """
   @spec decode_payment_required(String.t()) ::
-          {:ok, map()} | {:error, :invalid_base64 | :invalid_json}
+          {:ok, map()} | {:error, :invalid_base64 | :invalid_json | :payload_too_large}
   defdelegate decode_payment_required(header), to: PaymentRequired, as: :decode
 
   @doc since: "0.1.0", group: :headers
@@ -146,7 +146,7 @@ defmodule X402 do
       true
   """
   @spec decode_payment_response(String.t()) ::
-          {:ok, map()} | {:error, :invalid_base64 | :invalid_json}
+          {:ok, map()} | {:error, :invalid_base64 | :invalid_json | :payload_too_large}
   defdelegate decode_payment_response(header), to: PaymentResponse, as: :decode
 
   @doc since: "0.1.0"
