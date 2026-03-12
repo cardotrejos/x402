@@ -68,6 +68,10 @@ defmodule X402.PaymentResponse do
   @doc """
   Decodes a Base64 `PAYMENT-RESPONSE` value to a map.
 
+  Returns `{:error, :payload_too_large}` when the encoded value exceeds 8 KB.
+  Returns `{:error, :invalid_base64}` when the value cannot be Base64-decoded.
+  Returns `{:error, :invalid_json}` when JSON cannot be decoded to a map.
+
   ## Examples
 
       iex> {:ok, value} = X402.PaymentResponse.encode(%{"settled" => true})
