@@ -8,9 +8,13 @@ defmodule X402.PaymentRequired do
 
   alias X402.Telemetry
 
+  # 8 KB — generous for valid PAYMENT-REQUIRED payloads; rejects memory-exhaustion
+  # attacks before any Base64 decode/JSON parse work is done.
+  @max_header_bytes 8_192
+
   @type scheme :: String.t()
   @type encode_error :: :invalid_payload | :invalid_json
-  @type decode_error :: :invalid_base64 | :invalid_json
+  @type decode_error :: :invalid_base64 | :invalid_json | :payload_too_large
 
   @doc since: "0.1.0", group: :headers
   @doc """
@@ -85,36 +89,45 @@ defmodule X402.PaymentRequired do
   """
   @spec decode(String.t()) :: {:ok, map()} | {:error, decode_error()}
   def decode(value) when is_binary(value) do
-    with {:ok, json} <- decode_base64(value),
-         {:ok, decoded} <- Jason.decode(json),
-         true <- is_map(decoded) do
-      result = {:ok, normalize_payload(decoded)}
-      Telemetry.emit(:payment_required, :decode, :ok, %{header: header_name()})
-      result
+    if byte_size(value) > @max_header_bytes do
+      Telemetry.emit(:payment_required, :decode, :error, %{
+        reason: :payload_too_large,
+        header: header_name()
+      })
+
+      {:error, :payload_too_large}
     else
-      {:error, :invalid_base64} = error ->
-        Telemetry.emit(:payment_required, :decode, :error, %{
-          reason: :invalid_base64,
-          header: header_name()
-        })
+      with {:ok, json} <- decode_base64(value),
+           {:ok, decoded} <- Jason.decode(json),
+           true <- is_map(decoded) do
+        result = {:ok, normalize_payload(decoded)}
+        Telemetry.emit(:payment_required, :decode, :ok, %{header: header_name()})
+        result
+      else
+        {:error, :invalid_base64} = error ->
+          Telemetry.emit(:payment_required, :decode, :error, %{
+            reason: :invalid_base64,
+            header: header_name()
+          })
 
-        error
+          error
 
-      {:error, %Jason.DecodeError{}} ->
-        Telemetry.emit(:payment_required, :decode, :error, %{
-          reason: :invalid_json,
-          header: header_name()
-        })
+        {:error, %Jason.DecodeError{}} ->
+          Telemetry.emit(:payment_required, :decode, :error, %{
+            reason: :invalid_json,
+            header: header_name()
+          })
 
-        {:error, :invalid_json}
+          {:error, :invalid_json}
 
-      false ->
-        Telemetry.emit(:payment_required, :decode, :error, %{
-          reason: :invalid_json,
-          header: header_name()
-        })
+        false ->
+          Telemetry.emit(:payment_required, :decode, :error, %{
+            reason: :invalid_json,
+            header: header_name()
+          })
 
-        {:error, :invalid_json}
+          {:error, :invalid_json}
+      end
     end
   end
 

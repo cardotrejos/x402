@@ -40,5 +40,10 @@ defmodule X402.PaymentResponseTest do
       assert PaymentResponse.decode(Base.encode64("{")) == {:error, :invalid_json}
       assert PaymentResponse.decode(Base.encode64("\"ok\"")) == {:error, :invalid_json}
     end
+
+    test "returns payload_too_large for oversized header values" do
+      oversized = String.duplicate("A", 8_193)
+      assert PaymentResponse.decode(oversized) == {:error, :payload_too_large}
+    end
   end
 end

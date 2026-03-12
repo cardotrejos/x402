@@ -85,5 +85,11 @@ defmodule X402.PaymentRequiredTest do
       assert exact["scheme"] == "exact"
       assert exact["maxAmountRequired"] == "7"
     end
+
+    test "returns payload_too_large for oversized header values" do
+      # 8 KB + 1 byte of valid-ish Base64 — must be rejected before decode
+      oversized = String.duplicate("A", 8_193)
+      assert PaymentRequired.decode(oversized) == {:error, :payload_too_large}
+    end
   end
 end
