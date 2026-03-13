@@ -137,7 +137,7 @@ defmodule X402.PaymentResponse do
   defp decode_base64(""), do: {:error, :invalid_base64}
 
   defp decode_base64(value) do
-    case Base.decode64(value) do
+    case Base.decode64(value, padding: false) do
       {:ok, decoded} -> {:ok, decoded}
       :error -> {:error, :invalid_base64}
     end
