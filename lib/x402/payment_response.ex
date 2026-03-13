@@ -8,8 +8,11 @@ defmodule X402.PaymentResponse do
 
   alias X402.Telemetry
 
+  # Single source of truth for the 8 KB decode guard — see X402.Header.
+  @max_header_bytes X402.Header.max_header_bytes()
+
   @type encode_error :: :invalid_payload | :invalid_json
-  @type decode_error :: :invalid_base64 | :invalid_json
+  @type decode_error :: :invalid_base64 | :invalid_json | :payload_too_large
 
   @doc since: "0.1.0", group: :headers
   @doc """
@@ -64,6 +67,10 @@ defmodule X402.PaymentResponse do
   @doc """
   Decodes a Base64 `PAYMENT-RESPONSE` value to a map.
 
+  Returns `{:error, :payload_too_large}` when the encoded value exceeds 8 KB.
+  Returns `{:error, :invalid_base64}` when the value cannot be Base64-decoded.
+  Returns `{:error, :invalid_json}` when JSON cannot be decoded to a map.
+
   ## Examples
 
       iex> {:ok, value} = X402.PaymentResponse.encode(%{"settled" => true})
@@ -75,36 +82,45 @@ defmodule X402.PaymentResponse do
   """
   @spec decode(String.t()) :: {:ok, map()} | {:error, decode_error()}
   def decode(value) when is_binary(value) do
-    with {:ok, json} <- decode_base64(value),
-         {:ok, decoded} <- Jason.decode(json),
-         true <- is_map(decoded) do
-      result = {:ok, decoded}
-      Telemetry.emit(:payment_response, :decode, :ok, %{header: header_name()})
-      result
+    if byte_size(value) > @max_header_bytes do
+      Telemetry.emit(:payment_response, :decode, :error, %{
+        reason: :payload_too_large,
+        header: header_name()
+      })
+
+      {:error, :payload_too_large}
     else
-      {:error, :invalid_base64} = error ->
-        Telemetry.emit(:payment_response, :decode, :error, %{
-          reason: :invalid_base64,
-          header: header_name()
-        })
+      with {:ok, json} <- decode_base64(value),
+           {:ok, decoded} <- Jason.decode(json),
+           true <- is_map(decoded) do
+        result = {:ok, decoded}
+        Telemetry.emit(:payment_response, :decode, :ok, %{header: header_name()})
+        result
+      else
+        {:error, :invalid_base64} = error ->
+          Telemetry.emit(:payment_response, :decode, :error, %{
+            reason: :invalid_base64,
+            header: header_name()
+          })
 
-        error
+          error
 
-      {:error, %Jason.DecodeError{}} ->
-        Telemetry.emit(:payment_response, :decode, :error, %{
-          reason: :invalid_json,
-          header: header_name()
-        })
+        {:error, %Jason.DecodeError{}} ->
+          Telemetry.emit(:payment_response, :decode, :error, %{
+            reason: :invalid_json,
+            header: header_name()
+          })
 
-        {:error, :invalid_json}
+          {:error, :invalid_json}
 
-      false ->
-        Telemetry.emit(:payment_response, :decode, :error, %{
-          reason: :invalid_json,
-          header: header_name()
-        })
+        false ->
+          Telemetry.emit(:payment_response, :decode, :error, %{
+            reason: :invalid_json,
+            header: header_name()
+          })
 
-        {:error, :invalid_json}
+          {:error, :invalid_json}
+      end
     end
   end
 
@@ -121,7 +137,7 @@ defmodule X402.PaymentResponse do
   defp decode_base64(""), do: {:error, :invalid_base64}
 
   defp decode_base64(value) do
-    case Base.decode64(value) do
+    case Base.decode64(value, padding: false) do
       {:ok, decoded} -> {:ok, decoded}
       :error -> {:error, :invalid_base64}
     end
