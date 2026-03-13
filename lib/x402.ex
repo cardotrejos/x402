@@ -63,7 +63,7 @@ defmodule X402 do
       "eip155:8453"
   """
   @spec decode_payment_signature(String.t()) ::
-          {:ok, map()} | {:error, :invalid_base64 | :invalid_json}
+          {:ok, map()} | {:error, :invalid_base64 | :invalid_json | :payload_too_large}
   defdelegate decode_payment_signature(header), to: PaymentSignature, as: :decode
 
   @doc since: "0.1.0", group: :verification
@@ -113,6 +113,7 @@ defmodule X402 do
           | {:error,
              :invalid_base64
              | :invalid_json
+             | :payload_too_large
              | :invalid_payload
              | {:missing_fields, [String.t()]}
              | {:invalid_upto_payment, X402.PaymentSignature.upto_validation_error()}}

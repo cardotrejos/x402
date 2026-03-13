@@ -133,6 +133,8 @@ defmodule X402.PaymentResponse do
     {:error, :invalid_base64}
   end
 
+  # Accepts both padded and unpadded Base64 (padding: false) to match the
+  # behaviour of PaymentRequired and PaymentSignature decoders.
   @spec decode_base64(String.t()) :: {:ok, String.t()} | {:error, :invalid_base64}
   defp decode_base64(""), do: {:error, :invalid_base64}
 
