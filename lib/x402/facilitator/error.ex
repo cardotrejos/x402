@@ -9,6 +9,7 @@ defmodule X402.Facilitator.Error do
   @type error_type ::
           :finch_unavailable
           | :http_error
+          | :insecure_scheme
           | :invalid_json
           | :invalid_option
           | :request_setup_failed

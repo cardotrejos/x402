@@ -6,117 +6,105 @@ defmodule X402.Facilitator.HTTPTest do
 
   import X402.TestHelpers
 
-  setup :maybe_setup_bypass
-  setup :maybe_setup_finch
+  test "request/5 returns status and decoded body on success" do
+    with_stubbed_finch(fn ->
+      Process.put(
+        :http_test_finch_response,
+        {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
+      )
 
-  test "request/5 returns status and decoded body on success", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.expect(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 200, Jason.encode!(%{"ok" => true}))
+      assert {:ok, %{status: 200, body: %{"ok" => true}}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{"payload" => %{}}, [])
     end)
-
-    assert {:ok, %{status: 200, body: %{"ok" => true}}} =
-             HTTP.request(finch, facilitator_url, "/verify", %{"payload" => %{}}, [])
   end
 
-  test "request/4 applies default opts", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.expect(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 200, Jason.encode!(%{"ok" => true}))
-    end)
+  test "request/4 applies default opts" do
+    with_stubbed_finch(fn ->
+      Process.put(
+        :http_test_finch_response,
+        {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
+      )
 
-    assert {:ok, %{status: 200, body: %{"ok" => true}}} =
-             HTTP.request(finch, facilitator_url, "/verify", %{"payload" => %{}})
+      assert {:ok, %{status: 200, body: %{"ok" => true}}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{"payload" => %{}})
+    end)
   end
 
-  test "request/5 returns non-retryable error for 400", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.expect(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 400, Jason.encode!(%{"error" => "bad request"}))
-    end)
+  test "request/5 returns non-retryable error for 400" do
+    with_stubbed_finch(fn ->
+      Process.put(
+        :http_test_finch_response,
+        {:ok, %{status: 400, body: Jason.encode!(%{"error" => "bad request"})}}
+      )
 
-    assert {:error,
-            %Error{
-              type: :http_error,
-              status: 400,
-              body: %{"error" => "bad request"},
-              retryable: false
-            }} =
-             HTTP.request(finch, facilitator_url, "/verify", %{}, max_retries: 2)
+      assert {:error,
+              %Error{
+                type: :http_error,
+                status: 400,
+                body: %{"error" => "bad request"},
+                retryable: false
+              }} = HTTP.request(:stub, "https://facilitator.test", "/verify", %{}, max_retries: 2)
+    end)
   end
 
-  test "request/5 returns non-retryable error for 401", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.expect(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 401, Jason.encode!(%{"error" => "unauthorized"}))
-    end)
+  test "request/5 returns non-retryable error for 401" do
+    with_stubbed_finch(fn ->
+      Process.put(
+        :http_test_finch_response,
+        {:ok, %{status: 401, body: Jason.encode!(%{"error" => "unauthorized"})}}
+      )
 
-    assert {:error,
-            %Error{
-              type: :http_error,
-              status: 401,
-              body: %{"error" => "unauthorized"},
-              retryable: false
-            }} = HTTP.request(finch, facilitator_url, "/verify", %{}, max_retries: 2)
+      assert {:error,
+              %Error{
+                type: :http_error,
+                status: 401,
+                body: %{"error" => "unauthorized"},
+                retryable: false
+              }} = HTTP.request(:stub, "https://facilitator.test", "/verify", %{}, max_retries: 2)
+    end)
   end
 
-  test "request/5 retries transient errors and eventually succeeds", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+  test "request/5 retries transient errors and eventually succeeds" do
+    with_stubbed_finch(fn ->
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
 
-    Bypass.stub(bypass, "POST", "/verify", fn conn ->
-      current_attempt = Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
+      Process.put(
+        :http_test_finch_response,
+        {:fun,
+         fn _req, _name, _opts ->
+           current_attempt = Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
 
-      case current_attempt do
-        1 ->
-          Plug.Conn.resp(conn, 429, Jason.encode!(%{"error" => "rate limited"}))
+           case current_attempt do
+             1 -> {:ok, %{status: 429, body: Jason.encode!(%{"error" => "rate limited"})}}
+             2 -> {:ok, %{status: 503, body: Jason.encode!(%{"error" => "busy"})}}
+             _ -> {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
+           end
+         end}
+      )
 
-        2 ->
-          Plug.Conn.resp(conn, 503, Jason.encode!(%{"error" => "busy"}))
+      assert {:ok, %{status: 200, body: %{"ok" => true}}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{},
+                 max_retries: 2,
+                 retry_backoff_ms: 1
+               )
 
-        _attempt ->
-          Plug.Conn.resp(conn, 200, Jason.encode!(%{"ok" => true}))
-      end
+      assert Agent.get(attempts, & &1) == 3
     end)
-
-    assert {:ok, %{status: 200, body: %{"ok" => true}}} =
-             HTTP.request(finch, facilitator_url, "/verify", %{},
-               max_retries: 2,
-               retry_backoff_ms: 1
-             )
-
-    assert Agent.get(attempts, & &1) == 3
   end
 
-  test "request/5 returns retryable error for 500 after retries exhausted", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.stub(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 500, Jason.encode!(%{"error" => "server"}))
-    end)
+  test "request/5 returns retryable error for 500 after retries exhausted" do
+    with_stubbed_finch(fn ->
+      Process.put(
+        :http_test_finch_response,
+        {:ok, %{status: 500, body: Jason.encode!(%{"error" => "server"})}}
+      )
 
-    assert {:error, %Error{type: :http_error, status: 500, retryable: true, attempt: 3}} =
-             HTTP.request(finch, facilitator_url, "/verify", %{},
-               max_retries: 2,
-               retry_backoff_ms: 1
-             )
+      assert {:error, %Error{type: :http_error, status: 500, retryable: true, attempt: 3}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{},
+                 max_retries: 2,
+                 retry_backoff_ms: 1
+               )
+    end)
   end
 
   test "request/5 wraps non-Error setup failures from payload encoding" do
@@ -126,17 +114,13 @@ defmodule X402.Facilitator.HTTPTest do
              })
   end
 
-  test "request/5 handles invalid JSON in successful response", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.expect(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 200, "not-json")
-    end)
+  test "request/5 handles invalid JSON in successful response" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:ok, %{status: 200, body: "not-json"}})
 
-    assert {:error, %Error{type: :invalid_json, status: 200, retryable: false}} =
-             HTTP.request(finch, facilitator_url, "/verify", %{}, [])
+      assert {:error, %Error{type: :invalid_json, status: 200, retryable: false}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{}, [])
+    end)
   end
 
   test "request/5 validates options" do
@@ -154,92 +138,72 @@ defmodule X402.Facilitator.HTTPTest do
              HTTP.request(:finch, "https://example.com", "/verify", %{}, receive_timeout_ms: -5)
   end
 
-  test "request/5 handles empty body in successful response", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.expect(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 200, "")
-    end)
+  test "request/5 handles empty body in successful response" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:ok, %{status: 200, body: ""}})
 
-    assert {:ok, %{status: 200, body: %{}}} =
-             HTTP.request(finch, facilitator_url, "/verify", %{}, [])
+      assert {:ok, %{status: 200, body: %{}}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{}, [])
+    end)
   end
 
-  test "request/5 handles nil body in error response (transient status)", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.stub(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 503, "")
-    end)
+  test "request/5 handles nil body in error response (transient status)" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:ok, %{status: 503, body: ""}})
 
-    assert {:error, %Error{type: :http_error, status: 503, body: %{}, retryable: true}} =
-             HTTP.request(finch, facilitator_url, "/verify", %{}, max_retries: 0)
+      assert {:error, %Error{type: :http_error, status: 503, body: %{}, retryable: true}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{}, max_retries: 0)
+    end)
   end
 
-  test "request/5 handles non-JSON error body", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.expect(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 400, "plain text error")
-    end)
+  test "request/5 handles non-JSON error body" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:ok, %{status: 400, body: "plain text error"}})
 
-    assert {:error,
-            %Error{type: :http_error, status: 400, body: %{"raw_body" => "plain text error"}}} =
-             HTTP.request(finch, facilitator_url, "/verify", %{}, [])
+      assert {:error,
+              %Error{type: :http_error, status: 400, body: %{"raw_body" => "plain text error"}}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{}, [])
+    end)
   end
 
-  test "request/5 handles JSON array response as invalid json", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.expect(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 200, "[1, 2, 3]")
-    end)
+  test "request/5 handles JSON array response as invalid json" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:ok, %{status: 200, body: "[1, 2, 3]"}})
 
-    assert {:error, %Error{type: :invalid_json, status: 200, retryable: false}} =
-             HTTP.request(finch, facilitator_url, "/verify", %{}, [])
+      assert {:error, %Error{type: :invalid_json, status: 200, retryable: false}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{}, [])
+    end)
   end
 
-  test "request/5 handles all transient status codes", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
+  test "request/5 handles all transient status codes" do
     for status <- [408, 429, 502, 504] do
-      Bypass.stub(bypass, "POST", "/verify", fn conn ->
-        Plug.Conn.resp(conn, status, Jason.encode!(%{"error" => "transient"}))
-      end)
+      with_stubbed_finch(fn ->
+        Process.put(
+          :http_test_finch_response,
+          {:ok, %{status: status, body: Jason.encode!(%{"error" => "transient"})}}
+        )
 
-      assert {:error, %Error{type: :http_error, status: ^status, retryable: true}} =
-               HTTP.request(finch, facilitator_url, "/verify", %{},
-                 max_retries: 0,
-                 retry_backoff_ms: 1
-               )
+        assert {:error, %Error{type: :http_error, status: ^status, retryable: true}} =
+                 HTTP.request(:stub, "https://facilitator.test", "/verify", %{},
+                   max_retries: 0,
+                   retry_backoff_ms: 1
+                 )
+      end)
     end
   end
 
-  test "request/5 normalizes URL trailing slashes", %{
-    bypass: bypass,
-    finch: finch,
-    facilitator_url: facilitator_url
-  } do
-    Bypass.expect(bypass, "POST", "/verify", fn conn ->
-      Plug.Conn.resp(conn, 200, Jason.encode!(%{"ok" => true}))
-    end)
+  test "request/5 normalizes URL trailing slashes" do
+    with_stubbed_finch(fn ->
+      Process.put(
+        :http_test_finch_response,
+        {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
+      )
 
-    assert {:ok, %{status: 200}} =
-             HTTP.request(finch, facilitator_url <> "/", "/verify", %{}, [])
+      assert {:ok, %{status: 200}} =
+               HTTP.request(:stub, "https://facilitator.test/", "/verify", %{}, [])
+    end)
   end
 
-  @tag skip_bypass: true
-  @tag skip_finch: true
   test "request/5 handles finch edge responses without external network" do
     with_stubbed_finch(fn ->
       Process.put(:http_test_finch_response, {:ok, %{status: 200, body: nil}})
@@ -288,8 +252,61 @@ defmodule X402.Facilitator.HTTPTest do
     end)
   end
 
-  @tag skip_bypass: true
-  @tag skip_finch: true
+  test "request/5 rejects http:// base_url with insecure_scheme error" do
+    assert {:error, %Error{type: :insecure_scheme}} =
+             HTTP.request(:finch, "http://example.com", "/verify", %{})
+  end
+
+  test "request/5 rejects base_url with no scheme" do
+    assert {:error, %Error{type: :insecure_scheme}} =
+             HTTP.request(:finch, "example.com", "/verify", %{})
+  end
+
+  test "request/5 rejects ftp:// base_url with insecure_scheme error" do
+    assert {:error, %Error{type: :insecure_scheme}} =
+             HTTP.request(:finch, "ftp://example.com", "/verify", %{})
+  end
+
+  test "request/5 accepts https:// base_url (scheme validation passes, Finch may still fail)" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:error, :connection_refused})
+
+      result = HTTP.request(:stub, "https://example.com", "/verify", %{})
+      assert {:error, %Error{type: type}} = result
+      refute type == :insecure_scheme
+    end)
+  end
+
+  test "request/5 allows http://localhost (loopback exemption — no MitM risk)" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:error, :connection_refused})
+
+      result = HTTP.request(:stub, "http://localhost:4000", "/verify", %{})
+      assert {:error, %Error{type: type}} = result
+      refute type == :insecure_scheme
+    end)
+  end
+
+  test "request/5 allows http://127.0.0.1 (loopback exemption — no MitM risk)" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:error, :connection_refused})
+
+      result = HTTP.request(:stub, "http://127.0.0.1:4000", "/verify", %{})
+      assert {:error, %Error{type: type}} = result
+      refute type == :insecure_scheme
+    end)
+  end
+
+  test "request/5 allows http://[::1] (IPv6 loopback exemption — no MitM risk)" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:error, :connection_refused})
+
+      result = HTTP.request(:stub, "http://[::1]:4000", "/verify", %{})
+      assert {:error, %Error{type: type}} = result
+      refute type == :insecure_scheme
+    end)
+  end
+
   test "request/5 returns finch_unavailable when Finch callbacks are missing" do
     with_redefined_finch(
       """
@@ -307,12 +324,6 @@ defmodule X402.Facilitator.HTTPTest do
       end
     )
   end
-
-  defp maybe_setup_bypass(%{skip_bypass: true}), do: :ok
-  defp maybe_setup_bypass(context), do: setup_bypass(context)
-
-  defp maybe_setup_finch(%{skip_finch: true}), do: :ok
-  defp maybe_setup_finch(context), do: setup_finch(context)
 
   defp with_stubbed_finch(fun) when is_function(fun, 0) do
     with_redefined_finch(

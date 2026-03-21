@@ -49,7 +49,8 @@ defmodule X402.Facilitator.HTTP do
   @spec request(finch_name(), String.t(), String.t(), map(), keyword()) :: response()
   def request(finch_name, base_url, path, payload, opts \\ [])
       when is_binary(base_url) and is_binary(path) and is_map(payload) and is_list(opts) do
-    with {:ok, max_retries} <- fetch_non_negative_integer(opts, :max_retries, 2),
+    with :ok <- validate_https_scheme(base_url),
+         {:ok, max_retries} <- fetch_non_negative_integer(opts, :max_retries, 2),
          {:ok, retry_backoff_ms} <- fetch_non_negative_integer(opts, :retry_backoff_ms, 100),
          {:ok, receive_timeout_ms} <- fetch_non_negative_integer(opts, :receive_timeout_ms, 5_000),
          {:ok, finch_module} <- ensure_finch_module(),
@@ -295,6 +296,51 @@ defmodule X402.Facilitator.HTTP do
 
       false ->
         {:error, %Error{type: :finch_unavailable, reason: :missing_dependency, retryable: false}}
+    end
+  end
+
+  # Enforces HTTPS scheme on facilitator base_url to prevent accidental
+  # plaintext transmission of payment proofs. An http:// URL would bypass
+  # the TLS pool configuration in secure_pool_opts/0 entirely.
+  #
+  # localhost is explicitly exempted: loopback addresses cannot be
+  # intercepted by a network attacker, so http://localhost is safe for
+  # local development and test environments using plain-HTTP servers.
+  defp validate_https_scheme(base_url) do
+    case URI.parse(base_url) do
+      %URI{scheme: "https"} ->
+        :ok
+
+      %URI{scheme: "http", host: host} when host in ["localhost", "127.0.0.1", "::1"] ->
+        :ok
+
+      %URI{scheme: "http"} ->
+        {:error,
+         %Error{
+           type: :insecure_scheme,
+           reason:
+             "base_url must use https:// — http:// would transmit payment proofs in plaintext",
+           retryable: false,
+           attempt: nil
+         }}
+
+      %URI{scheme: nil} ->
+        {:error,
+         %Error{
+           type: :insecure_scheme,
+           reason: "base_url must include an https:// scheme",
+           retryable: false,
+           attempt: nil
+         }}
+
+      %URI{scheme: other} ->
+        {:error,
+         %Error{
+           type: :insecure_scheme,
+           reason: "base_url scheme must be https://, got: #{other}://",
+           retryable: false,
+           attempt: nil
+         }}
     end
   end
 
