@@ -290,7 +290,28 @@ defmodule X402.Facilitator.HTTPTest do
 
   @tag skip_bypass: true
   @tag skip_finch: true
-  test "request/5 returns finch_unavailable when Finch callbacks are missing" do
+  test "request/5 rejects http:// base_url with insecure_scheme error" do
+    assert {:error, %Error{type: :insecure_scheme}} =
+             HTTP.request(:finch, "http://example.com", "/verify", %{})
+  end
+
+  test "request/5 rejects base_url with no scheme" do
+    assert {:error, %Error{type: :insecure_scheme}} =
+             HTTP.request(:finch, "example.com", "/verify", %{})
+  end
+
+  test "request/5 rejects ftp:// base_url with insecure_scheme error" do
+    assert {:error, %Error{type: :insecure_scheme}} =
+             HTTP.request(:finch, "ftp://example.com", "/verify", %{})
+  end
+
+  test "request/5 accepts https:// base_url (scheme validation passes, Finch may still fail)" do
+    result = HTTP.request(:no_finch, "https://example.com", "/verify", %{})
+    assert {:error, %Error{type: type}} = result
+    refute type == :insecure_scheme
+  end
+
+    test "request/5 returns finch_unavailable when Finch callbacks are missing" do
     with_redefined_finch(
       """
       defmodule Finch do
