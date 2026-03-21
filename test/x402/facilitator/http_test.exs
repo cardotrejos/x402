@@ -289,6 +289,30 @@ defmodule X402.Facilitator.HTTPTest do
 
   @tag skip_bypass: true
   @tag skip_finch: true
+  test "request/5 allows http://localhost (loopback exemption — no MitM risk)" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:error, :connection_refused})
+
+      result = HTTP.request(:stub, "http://localhost:4000", "/verify", %{})
+      assert {:error, %Error{type: type}} = result
+      refute type == :insecure_scheme
+    end)
+  end
+
+  @tag skip_bypass: true
+  @tag skip_finch: true
+  test "request/5 allows http://127.0.0.1 (loopback exemption — no MitM risk)" do
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:error, :connection_refused})
+
+      result = HTTP.request(:stub, "http://127.0.0.1:4000", "/verify", %{})
+      assert {:error, %Error{type: type}} = result
+      refute type == :insecure_scheme
+    end)
+  end
+
+  @tag skip_bypass: true
+  @tag skip_finch: true
   test "request/5 returns finch_unavailable when Finch callbacks are missing" do
     with_redefined_finch(
       """
@@ -306,12 +330,6 @@ defmodule X402.Facilitator.HTTPTest do
       end
     )
   end
-
-  defp maybe_setup_bypass(%{skip_bypass: true}), do: :ok
-  defp maybe_setup_bypass(context), do: setup_bypass(context)
-
-  defp maybe_setup_finch(%{skip_finch: true}), do: :ok
-  defp maybe_setup_finch(context), do: setup_finch(context)
 
   defp with_stubbed_finch(fun) when is_function(fun, 0) do
     with_redefined_finch(
