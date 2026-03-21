@@ -311,7 +311,7 @@ defmodule X402.Facilitator.HTTP do
       %URI{scheme: "https"} ->
         :ok
 
-      %URI{scheme: "http", host: host} when host in ["localhost", "127.0.0.1", "[::1]"] ->
+      %URI{scheme: "http", host: host} when host in ["localhost", "127.0.0.1", "::1"] ->
         :ok
 
       %URI{scheme: "http"} ->
