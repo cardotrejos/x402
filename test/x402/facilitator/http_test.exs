@@ -8,7 +8,10 @@ defmodule X402.Facilitator.HTTPTest do
 
   test "request/5 returns status and decoded body on success" do
     with_stubbed_finch(fn ->
-      Process.put(:http_test_finch_response, {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}})
+      Process.put(
+        :http_test_finch_response,
+        {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
+      )
 
       assert {:ok, %{status: 200, body: %{"ok" => true}}} =
                HTTP.request(:stub, "https://facilitator.test", "/verify", %{"payload" => %{}}, [])
@@ -17,7 +20,10 @@ defmodule X402.Facilitator.HTTPTest do
 
   test "request/4 applies default opts" do
     with_stubbed_finch(fn ->
-      Process.put(:http_test_finch_response, {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}})
+      Process.put(
+        :http_test_finch_response,
+        {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
+      )
 
       assert {:ok, %{status: 200, body: %{"ok" => true}}} =
                HTTP.request(:stub, "https://facilitator.test", "/verify", %{"payload" => %{}})
@@ -62,15 +68,19 @@ defmodule X402.Facilitator.HTTPTest do
     with_stubbed_finch(fn ->
       {:ok, attempts} = Agent.start_link(fn -> 0 end)
 
-      Process.put(:http_test_finch_response, {:fun, fn _req, _name, _opts ->
-        current_attempt = Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
+      Process.put(
+        :http_test_finch_response,
+        {:fun,
+         fn _req, _name, _opts ->
+           current_attempt = Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
 
-        case current_attempt do
-          1 -> {:ok, %{status: 429, body: Jason.encode!(%{"error" => "rate limited"})}}
-          2 -> {:ok, %{status: 503, body: Jason.encode!(%{"error" => "busy"})}}
-          _ -> {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
-        end
-      end})
+           case current_attempt do
+             1 -> {:ok, %{status: 429, body: Jason.encode!(%{"error" => "rate limited"})}}
+             2 -> {:ok, %{status: 503, body: Jason.encode!(%{"error" => "busy"})}}
+             _ -> {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
+           end
+         end}
+      )
 
       assert {:ok, %{status: 200, body: %{"ok" => true}}} =
                HTTP.request(:stub, "https://facilitator.test", "/verify", %{},
@@ -184,7 +194,10 @@ defmodule X402.Facilitator.HTTPTest do
 
   test "request/5 normalizes URL trailing slashes" do
     with_stubbed_finch(fn ->
-      Process.put(:http_test_finch_response, {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}})
+      Process.put(
+        :http_test_finch_response,
+        {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
+      )
 
       assert {:ok, %{status: 200}} =
                HTTP.request(:stub, "https://facilitator.test/", "/verify", %{}, [])
