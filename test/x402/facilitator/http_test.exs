@@ -278,9 +278,13 @@ defmodule X402.Facilitator.HTTPTest do
   @tag skip_bypass: true
   @tag skip_finch: true
   test "request/5 accepts https:// base_url (scheme validation passes, Finch may still fail)" do
-    result = HTTP.request(:no_finch, "https://example.com", "/verify", %{})
-    assert {:error, %Error{type: type}} = result
-    refute type == :insecure_scheme
+    with_stubbed_finch(fn ->
+      Process.put(:http_test_finch_response, {:error, :connection_refused})
+
+      result = HTTP.request(:stub, "https://example.com", "/verify", %{})
+      assert {:error, %Error{type: type}} = result
+      refute type == :insecure_scheme
+    end)
   end
 
   @tag skip_bypass: true

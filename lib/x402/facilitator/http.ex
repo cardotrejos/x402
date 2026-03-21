@@ -303,11 +303,15 @@ defmodule X402.Facilitator.HTTP do
   # plaintext transmission of payment proofs. An http:// URL would bypass
   # the TLS pool configuration in secure_pool_opts/0 entirely.
   #
-  # This check is intentionally unconditional — use a local HTTPS proxy or
-  # a self-signed cert for dev/test environments that need real network calls.
+  # localhost is explicitly exempted: loopback addresses cannot be
+  # intercepted by a network attacker, so http://localhost is safe for
+  # local development and test environments using plain-HTTP servers.
   defp validate_https_scheme(base_url) do
     case URI.parse(base_url) do
       %URI{scheme: "https"} ->
+        :ok
+
+      %URI{scheme: "http", host: host} when host in ["localhost", "127.0.0.1", "::1"] ->
         :ok
 
       %URI{scheme: "http"} ->
