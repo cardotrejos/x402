@@ -314,7 +314,8 @@ defmodule X402.Facilitator.HTTP do
         {:error,
          %Error{
            type: :insecure_scheme,
-           reason: "base_url must use https:// — http:// would transmit payment proofs in plaintext",
+           reason:
+             "base_url must use https:// — http:// would transmit payment proofs in plaintext",
            retryable: false,
            attempt: nil
          }}
