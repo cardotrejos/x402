@@ -303,12 +303,6 @@ defmodule X402.Facilitator.HTTPTest do
     )
   end
 
-  defp maybe_setup_bypass(%{skip_bypass: true}), do: :ok
-  defp maybe_setup_bypass(context), do: setup_bypass(context)
-
-  defp maybe_setup_finch(%{skip_finch: true}), do: :ok
-  defp maybe_setup_finch(context), do: setup_finch(context)
-
   defp with_stubbed_finch(fun) when is_function(fun, 0) do
     with_redefined_finch(
       """
