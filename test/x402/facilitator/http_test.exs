@@ -311,7 +311,9 @@ defmodule X402.Facilitator.HTTPTest do
     refute type == :insecure_scheme
   end
 
-    test "request/5 returns finch_unavailable when Finch callbacks are missing" do
+  @tag skip_bypass: true
+  @tag skip_finch: true
+  test "request/5 returns finch_unavailable when Finch callbacks are missing" do
     with_redefined_finch(
       """
       defmodule Finch do

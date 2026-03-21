@@ -303,9 +303,8 @@ defmodule X402.Facilitator.HTTP do
   # plaintext transmission of payment proofs. An http:// URL would bypass
   # the TLS pool configuration in secure_pool_opts/0 entirely.
   #
-  # Callers can opt out for local dev/test by passing verify_tls: false in
-  # pool opts, but the scheme check here is separate — http:// means no TLS
-  # at all regardless of pool settings.
+  # This check is intentionally unconditional — use a local HTTPS proxy or
+  # a self-signed cert for dev/test environments that need real network calls.
   defp validate_https_scheme(base_url) do
     case URI.parse(base_url) do
       %URI{scheme: "https"} ->
@@ -317,7 +316,7 @@ defmodule X402.Facilitator.HTTP do
            type: :insecure_scheme,
            reason: "base_url must use https:// — http:// would transmit payment proofs in plaintext",
            retryable: false,
-           attempt: 0
+           attempt: nil
          }}
 
       %URI{scheme: nil} ->
@@ -326,7 +325,7 @@ defmodule X402.Facilitator.HTTP do
            type: :insecure_scheme,
            reason: "base_url must include an https:// scheme",
            retryable: false,
-           attempt: 0
+           attempt: nil
          }}
 
       %URI{scheme: other} ->
@@ -335,7 +334,7 @@ defmodule X402.Facilitator.HTTP do
            type: :insecure_scheme,
            reason: "base_url scheme must be https://, got: #{other}://",
            retryable: false,
-           attempt: 0
+           attempt: nil
          }}
     end
   end
