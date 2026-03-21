@@ -306,11 +306,14 @@ defmodule X402.Facilitator.HTTP do
   # This check is intentionally unconditional — use a local HTTPS proxy or
   # a self-signed cert for dev/test environments that need real network calls.
   defp validate_https_scheme(base_url) do
-    case URI.parse(base_url) do
-      %URI{scheme: "https"} ->
+    uri = URI.parse(base_url)
+    normalized_scheme = if uri.scheme, do: String.downcase(uri.scheme), else: nil
+
+    case normalized_scheme do
+      "https" ->
         :ok
 
-      %URI{scheme: "http"} ->
+      "http" ->
         {:error,
          %Error{
            type: :insecure_scheme,
@@ -319,7 +322,7 @@ defmodule X402.Facilitator.HTTP do
            attempt: nil
          }}
 
-      %URI{scheme: nil} ->
+      nil ->
         {:error,
          %Error{
            type: :insecure_scheme,
@@ -328,11 +331,11 @@ defmodule X402.Facilitator.HTTP do
            attempt: nil
          }}
 
-      %URI{scheme: other} ->
+      _other ->
         {:error,
          %Error{
            type: :insecure_scheme,
-           reason: "base_url scheme must be https://, got: #{other}://",
+           reason: "base_url scheme must be https://, got: #{uri.scheme}://",
            retryable: false,
            attempt: nil
          }}
