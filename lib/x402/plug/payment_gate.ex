@@ -122,10 +122,31 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     def init(opts) when is_list(opts) do
       validated_opts = NimbleOptions.validate!(opts, @options_schema)
 
+      cache = Keyword.get(validated_opts, :payment_identifier_cache)
+
+      if is_nil(cache) do
+        # Emit a warning at init time so operators notice the missing protection.
+        # Without an idempotency cache, the same payment proof can be replayed
+        # across concurrent requests — each passes the facilitator verify step
+        # before any can record the result, resulting in double-settlement.
+        #
+        # This is intentionally opt-in (not all deployments need ETS), but it
+        # is a meaningful security gap in any production deployment that calls
+        # real on-chain settlement.
+        require Logger
+
+        Logger.warning(
+          "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
+            "Duplicate payment proofs will NOT be detected — your deployment is " <>
+            "vulnerable to double-settlement of concurrent identical requests. " <>
+            "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
+        )
+      end
+
       %{
         facilitator: Keyword.fetch!(validated_opts, :facilitator),
         hooks: Keyword.fetch!(validated_opts, :hooks),
-        payment_identifier_cache: Keyword.get(validated_opts, :payment_identifier_cache),
+        payment_identifier_cache: cache,
         routes:
           validated_opts
           |> Keyword.fetch!(:routes)
