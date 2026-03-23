@@ -423,37 +423,30 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp ensure_success_status(%{status: status}),
       do: {:error, {:unexpected_facilitator_status, status}}
 
-    @spec facilitator_requirements(compiled_route(), String.t()) :: map()
     # Emits a Logger.warning exactly once per node when payment_identifier_cache
-    # is not configured.  Uses :ets.insert_new/2, which is atomic, to avoid the
-    # TOCTOU race of a check-then-put pattern under concurrent startup traffic.
+    # is not configured.  Uses :persistent_term to ensure the flag persists across
+    # process lifetimes, so the warning truly fires only once per node.
     defp warn_no_idempotency_cache_once do
-      table =
-        case :ets.whereis(__MODULE__) do
-          :undefined ->
-            try do
-              :ets.new(__MODULE__, [:named_table, :set, :public])
-            rescue
-              # Another process created the table concurrently; use theirs.
-              ArgumentError -> :ets.whereis(__MODULE__)
-            end
+      key = {__MODULE__, :no_idempotency_cache_warned}
 
-          tid ->
-            tid
-        end
+      case :persistent_term.get(key, nil) do
+        nil ->
+          :persistent_term.put(key, true)
+          require Logger
 
-      if :ets.insert_new(table, {:no_idempotency_cache_warned, true}) do
-        require Logger
+          Logger.warning(
+            "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
+              "Duplicate payment proofs will NOT be detected — your deployment is " <>
+              "vulnerable to double-settlement of concurrent identical requests. " <>
+              "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
+          )
 
-        Logger.warning(
-          "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
-            "Duplicate payment proofs will NOT be detected — your deployment is " <>
-            "vulnerable to double-settlement of concurrent identical requests. " <>
-            "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
-        )
+        _already_warned ->
+          :ok
       end
     end
 
+    @spec facilitator_requirements(compiled_route(), String.t()) :: map()
     defp facilitator_requirements(route, request_path) do
       %{
         "scheme" => route.scheme,
