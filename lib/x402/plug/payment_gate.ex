@@ -142,7 +142,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             "Duplicate payment proofs will NOT be detected — your deployment is " <>
             "vulnerable to double-settlement of concurrent identical requests. " <>
             "Pass `payment_identifier_cache: pid_or_name` to enable idempotency.",
-          []
+          __ENV__
         )
       end
 
@@ -172,21 +172,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       # configured.  This complements the compile-time IO.warn in init/1:
       # pre-built releases never execute init/1 at boot, so this ensures
       # production application logs always surface the double-settlement risk.
-      if is_nil(payment_identifier_cache) do
-        key = {__MODULE__, :no_idempotency_cache_warned}
-
-        unless :persistent_term.get(key, false) do
-          :persistent_term.put(key, true)
-          require Logger
-
-          Logger.warning(
-            "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
-              "Duplicate payment proofs will NOT be detected — your deployment is " <>
-              "vulnerable to double-settlement of concurrent identical requests. " <>
-              "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
-          )
-        end
-      end
+      if is_nil(payment_identifier_cache), do: warn_no_idempotency_cache_once()
 
       request_path = normalize_path(conn.request_path)
       request_method = normalize_method(conn.method)
@@ -438,6 +424,36 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       do: {:error, {:unexpected_facilitator_status, status}}
 
     @spec facilitator_requirements(compiled_route(), String.t()) :: map()
+    # Emits a Logger.warning exactly once per node when payment_identifier_cache
+    # is not configured.  Uses :ets.insert_new/2, which is atomic, to avoid the
+    # TOCTOU race of a check-then-put pattern under concurrent startup traffic.
+    defp warn_no_idempotency_cache_once do
+      table =
+        case :ets.whereis(__MODULE__) do
+          :undefined ->
+            try do
+              :ets.new(__MODULE__, [:named_table, :set, :public])
+            rescue
+              # Another process created the table concurrently; use theirs.
+              ArgumentError -> :ets.whereis(__MODULE__)
+            end
+
+          tid ->
+            tid
+        end
+
+      if :ets.insert_new(table, {:no_idempotency_cache_warned, true}) do
+        require Logger
+
+        Logger.warning(
+          "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
+            "Duplicate payment proofs will NOT be detected — your deployment is " <>
+            "vulnerable to double-settlement of concurrent identical requests. " <>
+            "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
+        )
+      end
+    end
+
     defp facilitator_requirements(route, request_path) do
       %{
         "scheme" => route.scheme,
