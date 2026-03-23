@@ -426,22 +426,34 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       do: {:error, {:unexpected_facilitator_status, status}}
 
     # Emits a Logger.warning exactly once per node when payment_identifier_cache
-    # is not configured. Uses :persistent_term to survive request-process deaths —
-    # an ETS named table is owned by its creating process and would be destroyed
-    # when a short-lived request process exits, causing the warning to re-fire on
-    # every subsequent request.
+    # is not configured. Uses :atomics for race-free synchronization and
+    # :persistent_term to survive request-process deaths — an ETS named table
+    # would be destroyed when a short-lived request process exits.
     defp warn_no_idempotency_cache_once do
-      key = {__MODULE__, :no_idempotency_cache_warned}
+      key = {__MODULE__, :no_idempotency_cache_atomics}
 
-      unless :persistent_term.get(key, false) do
-        :persistent_term.put(key, true)
+      atomics_ref =
+        case :persistent_term.get(key, :not_found) do
+          :not_found ->
+            ref = :atomics.new(1, [])
+            :persistent_term.put(key, ref)
+            ref
 
-        Logger.warning(
-          "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
-            "Duplicate payment proofs will NOT be detected — your deployment is " <>
-            "vulnerable to double-settlement of concurrent identical requests. " <>
-            "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
-        )
+          ref ->
+            ref
+        end
+
+      case :atomics.compare_exchange(atomics_ref, 1, 0, 1) do
+        :ok ->
+          Logger.warning(
+            "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
+              "Duplicate payment proofs will NOT be detected — your deployment is " <>
+              "vulnerable to double-settlement of concurrent identical requests. " <>
+              "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
+          )
+
+        1 ->
+          :ok
       end
     end
 
