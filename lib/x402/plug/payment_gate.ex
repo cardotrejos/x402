@@ -125,21 +125,24 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       cache = Keyword.get(validated_opts, :payment_identifier_cache)
 
       if is_nil(cache) do
-        # Emit a warning at init time so operators notice the missing protection.
+        # Emit a compile-time / pipeline-init warning so operators notice the
+        # missing protection during development and CI builds.
         # Without an idempotency cache, the same payment proof can be replayed
         # across concurrent requests — each passes the facilitator verify step
         # before any can record the result, resulting in double-settlement.
         #
-        # This is intentionally opt-in (not all deployments need ETS), but it
-        # is a meaningful security gap in any production deployment that calls
-        # real on-chain settlement.
-        require Logger
-
-        Logger.warning(
+        # NOTE: in module-based Plug pipelines (Phoenix router `plug/2`),
+        # `init/1` is evaluated at compile time. For pre-built production
+        # releases the warning below fires only during the build, not at
+        # application boot.  A separate :persistent_term-gated runtime warning
+        # is emitted on the first `call/2` invocation so that production
+        # operators always see it in their application logs.
+        IO.warn(
           "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
             "Duplicate payment proofs will NOT be detected — your deployment is " <>
             "vulnerable to double-settlement of concurrent identical requests. " <>
-            "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
+            "Pass `payment_identifier_cache: pid_or_name` to enable idempotency.",
+          []
         )
       end
 
@@ -165,6 +168,26 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           payment_identifier_cache: payment_identifier_cache,
           routes: routes
         }) do
+      # Emit a one-time runtime warning when the idempotency cache is not
+      # configured.  This complements the compile-time IO.warn in init/1:
+      # pre-built releases never execute init/1 at boot, so this ensures
+      # production application logs always surface the double-settlement risk.
+      if is_nil(payment_identifier_cache) do
+        key = {__MODULE__, :no_idempotency_cache_warned}
+
+        unless :persistent_term.get(key, false) do
+          :persistent_term.put(key, true)
+          require Logger
+
+          Logger.warning(
+            "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
+              "Duplicate payment proofs will NOT be detected — your deployment is " <>
+              "vulnerable to double-settlement of concurrent identical requests. " <>
+              "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
+          )
+        end
+      end
+
       request_path = normalize_path(conn.request_path)
       request_method = normalize_method(conn.method)
 
