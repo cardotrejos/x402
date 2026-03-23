@@ -425,17 +425,17 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp ensure_success_status(%{status: status}),
       do: {:error, {:unexpected_facilitator_status, status}}
 
-    # Emits a Logger.warning exactly once per node when payment_identifier_cache
-    # is not configured. Uses :persistent_term to survive request-process deaths —
-    # an ETS named table is owned by its creating process and would be destroyed
-    # when a short-lived request process exits, causing the warning to re-fire on
-    # every subsequent request.
+    # Atomic "fire once" flag — created at module-load time and shared across
+    # all scheduler threads. :atomics.compare_exchange/4 is a CAS operation:
+    # only the first caller to flip 0→1 emits the warning; all concurrent
+    # callers that lose the race see a non-:ok return and skip it.
+    @no_idempotency_cache_warned :atomics.new(1, [])
+
+    # Emits a Logger.warning at most once per node when payment_identifier_cache
+    # is not configured. Uses an :atomics CAS to guarantee the warning fires
+    # exactly once even under concurrent initial requests.
     defp warn_no_idempotency_cache_once do
-      key = {__MODULE__, :no_idempotency_cache_warned}
-
-      unless :persistent_term.get(key, false) do
-        :persistent_term.put(key, true)
-
+      if :atomics.compare_exchange(@no_idempotency_cache_warned, 1, 0, 1) == :ok do
         Logger.warning(
           "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
             "Duplicate payment proofs will NOT be detected — your deployment is " <>
