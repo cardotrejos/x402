@@ -32,8 +32,8 @@ defmodule X402.WalletTest do
       refute Wallet.valid_solana?(String.duplicate("3", 32))
       refute Wallet.valid_solana?(String.duplicate("3", 42))
       refute Wallet.valid_solana?(String.duplicate("4", 45))
-      refute Wallet.valid_solana?("0" <> String.duplicate("1", 31))
-      refute Wallet.valid_solana?("O" <> String.duplicate("1", 31))
+      refute Wallet.valid_solana?("0" <> String.duplicate("1", 42))
+      refute Wallet.valid_solana?("O" <> String.duplicate("1", 42))
       refute Wallet.valid_solana?(nil)
     end
   end
