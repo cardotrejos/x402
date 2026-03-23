@@ -18,6 +18,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     alias X402.Hooks.Default
     alias X402.PaymentSignature
 
+    require Logger
+
     import Plug.Conn, only: [get_req_header: 2, halt: 1, put_resp_content_type: 2, send_resp: 3]
 
     @http_methods [:any, :delete, :get, :head, :options, :patch, :post, :put, :trace]
@@ -423,27 +425,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp ensure_success_status(%{status: status}),
       do: {:error, {:unexpected_facilitator_status, status}}
 
-    @spec facilitator_requirements(compiled_route(), String.t()) :: map()
     # Emits a Logger.warning exactly once per node when payment_identifier_cache
-    # is not configured.  Uses :ets.insert_new/2, which is atomic, to avoid the
-    # TOCTOU race of a check-then-put pattern under concurrent startup traffic.
+    # is not configured. Uses :persistent_term to survive request-process deaths —
+    # an ETS named table is owned by its creating process and would be destroyed
+    # when a short-lived request process exits, causing the warning to re-fire on
+    # every subsequent request.
     defp warn_no_idempotency_cache_once do
-      table =
-        case :ets.whereis(__MODULE__) do
-          :undefined ->
-            try do
-              :ets.new(__MODULE__, [:named_table, :set, :public])
-            rescue
-              # Another process created the table concurrently; use theirs.
-              ArgumentError -> :ets.whereis(__MODULE__)
-            end
+      key = {__MODULE__, :no_idempotency_cache_warned}
 
-          tid ->
-            tid
-        end
-
-      if :ets.insert_new(table, {:no_idempotency_cache_warned, true}) do
-        require Logger
+      unless :persistent_term.get(key, false) do
+        :persistent_term.put(key, true)
 
         Logger.warning(
           "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
@@ -454,6 +445,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    @spec facilitator_requirements(compiled_route(), String.t()) :: map()
     defp facilitator_requirements(route, request_path) do
       %{
         "scheme" => route.scheme,
