@@ -21,17 +21,19 @@ defmodule X402.WalletTest do
   end
 
   describe "valid_solana?/1" do
-    test "accepts base58 strings from 32 to 44 chars" do
-      assert Wallet.valid_solana?(String.duplicate("1", 32))
+    test "accepts base58 strings of 43 or 44 chars" do
+      assert Wallet.valid_solana?(String.duplicate("1", 43))
       assert Wallet.valid_solana?(String.duplicate("2", 44))
       assert Wallet.valid_solana?("9xQeWvG816bUx9EPfQmQTYnC16hHhV6bQf8kX6y4YB9")
     end
 
     test "rejects out-of-range lengths and invalid characters" do
       refute Wallet.valid_solana?(String.duplicate("3", 31))
+      refute Wallet.valid_solana?(String.duplicate("3", 32))
+      refute Wallet.valid_solana?(String.duplicate("3", 42))
       refute Wallet.valid_solana?(String.duplicate("4", 45))
-      refute Wallet.valid_solana?("0" <> String.duplicate("1", 31))
-      refute Wallet.valid_solana?("O" <> String.duplicate("1", 31))
+      refute Wallet.valid_solana?("0" <> String.duplicate("1", 42))
+      refute Wallet.valid_solana?("O" <> String.duplicate("1", 42))
       refute Wallet.valid_solana?(nil)
     end
   end

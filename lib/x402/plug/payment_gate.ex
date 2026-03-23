@@ -18,6 +18,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     alias X402.Hooks.Default
     alias X402.PaymentSignature
 
+    require Logger
+
     import Plug.Conn, only: [get_req_header: 2, halt: 1, put_resp_content_type: 2, send_resp: 3]
 
     @http_methods [:any, :delete, :get, :head, :options, :patch, :post, :put, :trace]
@@ -122,10 +124,34 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     def init(opts) when is_list(opts) do
       validated_opts = NimbleOptions.validate!(opts, @options_schema)
 
+      cache = Keyword.get(validated_opts, :payment_identifier_cache)
+
+      if is_nil(cache) do
+        # Emit a compile-time / pipeline-init warning so operators notice the
+        # missing protection during development and CI builds.
+        # Without an idempotency cache, the same payment proof can be replayed
+        # across concurrent requests — each passes the facilitator verify step
+        # before any can record the result, resulting in double-settlement.
+        #
+        # NOTE: in module-based Plug pipelines (Phoenix router `plug/2`),
+        # `init/1` is evaluated at compile time. For pre-built production
+        # releases the warning below fires only during the build, not at
+        # application boot.  A separate :persistent_term-gated runtime warning
+        # is emitted on the first `call/2` invocation so that production
+        # operators always see it in their application logs.
+        IO.warn(
+          "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
+            "Duplicate payment proofs will NOT be detected — your deployment is " <>
+            "vulnerable to double-settlement of concurrent identical requests. " <>
+            "Pass `payment_identifier_cache: pid_or_name` to enable idempotency.",
+          __ENV__
+        )
+      end
+
       %{
         facilitator: Keyword.fetch!(validated_opts, :facilitator),
         hooks: Keyword.fetch!(validated_opts, :hooks),
-        payment_identifier_cache: Keyword.get(validated_opts, :payment_identifier_cache),
+        payment_identifier_cache: cache,
         routes:
           validated_opts
           |> Keyword.fetch!(:routes)
@@ -144,6 +170,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           payment_identifier_cache: payment_identifier_cache,
           routes: routes
         }) do
+      # Emit a one-time runtime warning when the idempotency cache is not
+      # configured.  This complements the compile-time IO.warn in init/1:
+      # pre-built releases never execute init/1 at boot, so this ensures
+      # production application logs always surface the double-settlement risk.
+      if is_nil(payment_identifier_cache), do: warn_no_idempotency_cache_once()
+
       request_path = normalize_path(conn.request_path)
       request_method = normalize_method(conn.method)
 
@@ -392,6 +424,26 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp ensure_success_status(%{status: status}),
       do: {:error, {:unexpected_facilitator_status, status}}
+
+    # Emits a Logger.warning at most once per node when payment_identifier_cache
+    # is not configured. Uses :persistent_term as a lightweight flag so the
+    # warning fires only on the first request, not on every call.
+    # Minor: two concurrent first-requests may both log before the flag is set;
+    # this is acceptable — the consequence is a duplicate log line, not a bug.
+    defp warn_no_idempotency_cache_once do
+      key = {__MODULE__, :no_idempotency_cache_warned}
+
+      unless :persistent_term.get(key, false) do
+        :persistent_term.put(key, true)
+
+        Logger.warning(
+          "[X402.Plug.PaymentGate] payment_identifier_cache is not configured. " <>
+            "Duplicate payment proofs will NOT be detected — your deployment is " <>
+            "vulnerable to double-settlement of concurrent identical requests. " <>
+            "Pass `payment_identifier_cache: pid_or_name` to enable idempotency."
+        )
+      end
+    end
 
     @spec facilitator_requirements(compiled_route(), String.t()) :: map()
     defp facilitator_requirements(route, request_path) do
