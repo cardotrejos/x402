@@ -7,6 +7,7 @@ defmodule X402.PaymentRequired do
   """
 
   alias X402.Telemetry
+  alias X402.Utils
 
   # Single source of truth for the 8 KB decode guard — see X402.Header.
   @max_header_bytes X402.Header.max_header_bytes()
@@ -97,7 +98,7 @@ defmodule X402.PaymentRequired do
 
       {:error, :payload_too_large}
     else
-      with {:ok, json} <- decode_base64(value),
+      with {:ok, json} <- Utils.decode_base64(value),
            {:ok, decoded} <- Jason.decode(json),
            true <- is_map(decoded) do
         result = {:ok, normalize_payload(decoded)}
@@ -140,16 +141,6 @@ defmodule X402.PaymentRequired do
     {:error, :invalid_base64}
   end
 
-  @spec decode_base64(String.t()) :: {:ok, String.t()} | {:error, :invalid_base64}
-  defp decode_base64(""), do: {:error, :invalid_base64}
-
-  defp decode_base64(value) do
-    case Base.decode64(value, padding: false) do
-      {:ok, decoded} -> {:ok, decoded}
-      :error -> {:error, :invalid_base64}
-    end
-  end
-
   @spec normalize_payload(map()) :: map()
   defp normalize_payload(payload) do
     payload
@@ -168,7 +159,7 @@ defmodule X402.PaymentRequired do
 
   @spec normalize_accepts_entries(map()) :: map()
   defp normalize_accepts_entries(payload) do
-    case map_value(payload, {"accepts", :accepts}) do
+    case Utils.map_value(payload, {"accepts", :accepts}) do
       accepts when is_list(accepts) ->
         normalized =
           Enum.map(accepts, fn
@@ -176,7 +167,7 @@ defmodule X402.PaymentRequired do
             other -> other
           end)
 
-        map_put(payload, {"accepts", :accepts}, normalized)
+        Utils.map_put(payload, {"accepts", :accepts}, normalized)
 
       _other ->
         payload
@@ -185,16 +176,16 @@ defmodule X402.PaymentRequired do
 
   @spec replace_amount_key(map()) :: map()
   defp replace_amount_key(payload) do
-    case map_value(payload, {"maxPrice", :maxPrice}) do
+    case Utils.map_value(payload, {"maxPrice", :maxPrice}) do
       nil ->
-        case map_value(payload, {"maxAmountRequired", :maxAmountRequired}) do
+        case Utils.map_value(payload, {"maxAmountRequired", :maxAmountRequired}) do
           nil ->
             payload
 
           legacy_max_amount ->
             payload
-            |> map_put({"maxPrice", :maxPrice}, legacy_max_amount)
-            |> map_delete({"maxAmountRequired", :maxAmountRequired})
+            |> Utils.map_put({"maxPrice", :maxPrice}, legacy_max_amount)
+            |> Utils.map_delete({"maxAmountRequired", :maxAmountRequired})
         end
 
       _max_price ->
@@ -203,37 +194,5 @@ defmodule X402.PaymentRequired do
   end
 
   @spec scheme(map()) :: scheme() | atom() | nil
-  defp scheme(payload), do: map_value(payload, {"scheme", :scheme})
-
-  @spec map_value(map(), {String.t(), atom()}) :: term()
-  defp map_value(map, {string_key, atom_key}) do
-    case Map.fetch(map, string_key) do
-      {:ok, value} ->
-        value
-
-      :error ->
-        Map.get(map, atom_key)
-    end
-  end
-
-  @spec map_put(map(), {String.t(), atom()}, term()) :: map()
-  defp map_put(map, {string_key, atom_key}, value) do
-    cond do
-      Map.has_key?(map, string_key) ->
-        Map.put(map, string_key, value)
-
-      Map.has_key?(map, atom_key) ->
-        Map.put(map, atom_key, value)
-
-      true ->
-        Map.put(map, string_key, value)
-    end
-  end
-
-  @spec map_delete(map(), {String.t(), atom()}) :: map()
-  defp map_delete(map, {string_key, atom_key}) do
-    map
-    |> Map.delete(string_key)
-    |> Map.delete(atom_key)
-  end
+  defp scheme(payload), do: Utils.map_value(payload, {"scheme", :scheme})
 end
