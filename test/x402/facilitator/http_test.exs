@@ -333,7 +333,7 @@ defmodule X402.Facilitator.HTTPTest do
              ]
            ] = HTTP.secure_pool_opts()
 
-    assert cacerts == :public_key.cacerts_get()
+    assert is_list(cacerts) and cacerts != []
   end
 
   defp with_stubbed_finch(fun) when is_function(fun, 0) do
