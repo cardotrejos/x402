@@ -6,6 +6,8 @@ defmodule X402.Extensions.PaymentIdentifier do
   required `"paymentId"` field.
   """
 
+  alias X402.Utils
+
   @typedoc "Payment identifier value used for idempotency."
   @type payment_id :: String.t()
 
@@ -50,7 +52,7 @@ defmodule X402.Extensions.PaymentIdentifier do
   """
   @spec decode(String.t()) :: {:ok, payment_id()} | {:error, decode_error()}
   def decode(value) when is_binary(value) do
-    with {:ok, json} <- decode_base64(value),
+    with {:ok, json} <- Utils.decode_base64(value),
          {:ok, decoded} <- Jason.decode(json),
          {:ok, payment_id} <- fetch_payment_id(decoded) do
       {:ok, payment_id}
@@ -87,14 +89,4 @@ defmodule X402.Extensions.PaymentIdentifier do
   end
 
   def fetch_payment_id(_payload), do: {:error, :invalid_payment_id}
-
-  @spec decode_base64(String.t()) :: {:ok, String.t()} | {:error, :invalid_base64}
-  defp decode_base64(""), do: {:error, :invalid_base64}
-
-  defp decode_base64(value) do
-    case Base.decode64(value) do
-      {:ok, decoded} -> {:ok, decoded}
-      :error -> {:error, :invalid_base64}
-    end
-  end
 end

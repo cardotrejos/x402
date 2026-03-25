@@ -6,6 +6,7 @@ defmodule X402.Extensions.SIWX do
   chain identifiers for EVM networks (`eip155:*`).
   """
 
+  alias X402.Utils
   alias X402.Wallet
 
   @required_message_fields [
@@ -190,7 +191,7 @@ defmodule X402.Extensions.SIWX do
   """
   @spec decode_header(String.t()) :: {:ok, map()} | {:error, header_decode_error()}
   def decode_header(value) when is_binary(value) do
-    with {:ok, json} <- decode_base64(value),
+    with {:ok, json} <- Utils.decode_base64(value),
          {:ok, decoded} <- Jason.decode(json),
          true <- is_map(decoded),
          {:ok, message} <- fetch_non_empty_binary(decoded, :message),
@@ -479,16 +480,6 @@ defmodule X402.Extensions.SIWX do
     case DateTime.compare(expiration_datetime, issued_at_datetime) do
       :gt -> :ok
       _other -> {:error, {:invalid_field, :expiration_time}}
-    end
-  end
-
-  @spec decode_base64(String.t()) :: {:ok, String.t()} | {:error, :invalid_base64}
-  defp decode_base64(""), do: {:error, :invalid_base64}
-
-  defp decode_base64(value) do
-    case Base.decode64(value) do
-      {:ok, decoded} -> {:ok, decoded}
-      :error -> {:error, :invalid_base64}
     end
   end
 end

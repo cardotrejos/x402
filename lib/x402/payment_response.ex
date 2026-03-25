@@ -7,6 +7,7 @@ defmodule X402.PaymentResponse do
   """
 
   alias X402.Telemetry
+  alias X402.Utils
 
   # Single source of truth for the 8 KB decode guard — see X402.Header.
   @max_header_bytes X402.Header.max_header_bytes()
@@ -90,7 +91,7 @@ defmodule X402.PaymentResponse do
 
       {:error, :payload_too_large}
     else
-      with {:ok, json} <- decode_base64(value),
+      with {:ok, json} <- Utils.decode_base64(value),
            {:ok, decoded} <- Jason.decode(json),
            true <- is_map(decoded) do
         result = {:ok, decoded}
@@ -131,15 +132,5 @@ defmodule X402.PaymentResponse do
     })
 
     {:error, :invalid_base64}
-  end
-
-  @spec decode_base64(String.t()) :: {:ok, String.t()} | {:error, :invalid_base64}
-  defp decode_base64(""), do: {:error, :invalid_base64}
-
-  defp decode_base64(value) do
-    case Base.decode64(value, padding: false) do
-      {:ok, decoded} -> {:ok, decoded}
-      :error -> {:error, :invalid_base64}
-    end
   end
 end
