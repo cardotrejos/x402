@@ -28,7 +28,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
   end
 
   test "cleanup process removes expired entries periodically" do
-    cache = start_cache(ttl_ms: 10, cleanup_interval_ms: 10)
+    cache = start_cache(ttl_ms: 50, cleanup_interval_ms: 50)
 
     assert :ok = ETSCache.put(cache, "payment-1", :verified)
 

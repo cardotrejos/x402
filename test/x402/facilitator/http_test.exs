@@ -4,8 +4,6 @@ defmodule X402.Facilitator.HTTPTest do
   alias X402.Facilitator.Error
   alias X402.Facilitator.HTTP
 
-  import X402.TestHelpers
-
   test "request/5 returns status and decoded body on success" do
     with_stubbed_finch(fn ->
       Process.put(
@@ -323,6 +321,19 @@ defmodule X402.Facilitator.HTTPTest do
                 }} = HTTP.request(:stub, "https://example.com", "/verify", %{})
       end
     )
+  end
+
+  test "secure_pool_opts/0 returns default TLS configuration" do
+    assert [
+             conn_opts: [
+               transport_opts: [
+                 verify: :verify_peer,
+                 cacerts: cacerts
+               ]
+             ]
+           ] = HTTP.secure_pool_opts()
+
+    assert is_list(cacerts) and cacerts != []
   end
 
   defp with_stubbed_finch(fun) when is_function(fun, 0) do
