@@ -23,7 +23,7 @@ defmodule X402.Extensions.SIWX.ETSStorageTest do
 
   describe "get/put/delete" do
     test "stores and retrieves access records" do
-      {storage, table} = start_storage()
+      {storage, _table} = start_storage()
 
       assert :ok = ETSStorage.put(storage, "0xabc", "/paid/resource", %{"tx" => "0x1"}, 5_000)
 
@@ -39,7 +39,7 @@ defmodule X402.Extensions.SIWX.ETSStorageTest do
     end
 
     test "deletes records" do
-      {storage, table} = start_storage()
+      {storage, _table} = start_storage()
 
       assert :ok = ETSStorage.put(storage, "0xabc", "/paid/resource", %{"tx" => "0x1"}, 5_000)
       assert :ok = ETSStorage.delete(storage, "0xabc", "/paid/resource")
@@ -59,7 +59,7 @@ defmodule X402.Extensions.SIWX.ETSStorageTest do
 
   describe "ttl behavior" do
     test "expired entries return not_found on read" do
-      {storage, table} = start_storage(cleanup_interval_ms: 10_000)
+      {storage, _table} = start_storage(cleanup_interval_ms: 10_000)
 
       assert :ok = ETSStorage.put(storage, "0xabc", "/paid/resource", %{"tx" => "0x1"}, 5)
       Process.sleep(25)

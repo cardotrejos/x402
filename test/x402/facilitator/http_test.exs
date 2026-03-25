@@ -4,8 +4,6 @@ defmodule X402.Facilitator.HTTPTest do
   alias X402.Facilitator.Error
   alias X402.Facilitator.HTTP
 
-  import X402.TestHelpers
-
   test "request/5 returns status and decoded body on success" do
     with_stubbed_finch(fn ->
       Process.put(
