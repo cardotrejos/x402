@@ -78,6 +78,7 @@ defmodule X402.Utils do
 
   @spec parse_decimal_string(String.t()) :: {:ok, {non_neg_integer(), non_neg_integer()}} | :error
   defp parse_decimal_string(""), do: :error
+  defp parse_decimal_string("." <> _rest), do: :error
 
   defp parse_decimal_string(value) do
     case parse_whole(value, 0) do
