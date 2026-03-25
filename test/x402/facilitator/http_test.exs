@@ -325,6 +325,19 @@ defmodule X402.Facilitator.HTTPTest do
     )
   end
 
+  test "secure_pool_opts/0 returns default TLS configuration" do
+    assert [
+             conn_opts: [
+               transport_opts: [
+                 verify: :verify_peer,
+                 cacerts: cacerts
+               ]
+             ]
+           ] = HTTP.secure_pool_opts()
+
+    assert cacerts == :public_key.cacerts_get()
+  end
+
   defp with_stubbed_finch(fun) when is_function(fun, 0) do
     with_redefined_finch(
       """
