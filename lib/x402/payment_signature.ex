@@ -257,7 +257,8 @@ defmodule X402.PaymentSignature do
 
   @spec effective_scheme(map(), map()) :: String.t() | atom() | nil
   defp effective_scheme(payload, requirements) do
-    Utils.map_value(requirements, {"scheme", :scheme}) || Utils.map_value(payload, {"scheme", :scheme})
+    Utils.map_value(requirements, {"scheme", :scheme}) ||
+      Utils.map_value(payload, {"scheme", :scheme})
   end
 
   @spec extract_max_price(map(), map()) ::
