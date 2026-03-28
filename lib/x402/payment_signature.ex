@@ -67,7 +67,7 @@ defmodule X402.PaymentSignature do
 
   ## Examples
 
-      iex> payload = %{"transactionHash" => "0xabc", "network" => "eip155:8453", "scheme" => "exact", "payerWallet" => "0x1111111111111111111111111111111111111111"}
+      iex> payload = %{"transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "network" => "eip155:8453", "scheme" => "exact", "payerWallet" => "0x1111111111111111111111111111111111111111"}
       iex> value = payload |> Jason.encode!() |> Base.encode64()
       iex> X402.PaymentSignature.decode(value)
       {:ok, payload}
@@ -139,7 +139,7 @@ defmodule X402.PaymentSignature do
   ## Examples
 
       iex> payload = %{
-      ...>   "transactionHash" => "0xabc",
+      ...>   "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       ...>   "network" => "eip155:8453",
       ...>   "scheme" => "exact",
       ...>   "payerWallet" => "0x1111111111111111111111111111111111111111"
@@ -167,47 +167,51 @@ defmodule X402.PaymentSignature do
   """
   @spec validate(map(), map()) :: {:ok, map()} | {:error, validate_error()}
   def validate(payload, requirements) when is_map(payload) and is_map(requirements) do
-    missing = missing_fields(payload)
+    with :ok <- check_missing_fields(payload),
+         :ok <- check_field_formats(payload) do
+      case validate_scheme(payload, requirements) do
+        :ok ->
+          Telemetry.emit(:payment_signature, :validate, :ok, %{required_fields: @required_fields})
+          {:ok, payload}
 
-    case missing do
+        {:error, {:invalid_upto_payment, reason}} = error ->
+          Telemetry.emit(:payment_signature, :validate, :error, %{
+            reason: :invalid_upto_payment,
+            detail: reason
+          })
+
+          error
+      end
+    end
+  end
+
+  defp check_missing_fields(payload) do
+    case missing_fields(payload) do
       [] ->
-        case validate_field_formats(payload) do
-          [] ->
-            case validate_scheme(payload, requirements) do
-              :ok ->
-                result = {:ok, payload}
+        :ok
 
-                Telemetry.emit(:payment_signature, :validate, :ok, %{
-                  required_fields: @required_fields
-                })
-
-                result
-
-              {:error, {:invalid_upto_payment, reason}} = error ->
-                Telemetry.emit(:payment_signature, :validate, :error, %{
-                  reason: :invalid_upto_payment,
-                  detail: reason
-                })
-
-                error
-            end
-
-          format_errors ->
-            Telemetry.emit(:payment_signature, :validate, :error, %{
-              reason: :invalid_format,
-              fields: Enum.map(format_errors, &elem(&1, 0))
-            })
-
-            {:error, {:invalid_format, format_errors}}
-        end
-
-      _ ->
+      missing ->
         Telemetry.emit(:payment_signature, :validate, :error, %{
           reason: :missing_fields,
           fields: missing
         })
 
         {:error, {:missing_fields, missing}}
+    end
+  end
+
+  defp check_field_formats(payload) do
+    case validate_field_formats(payload) do
+      [] ->
+        :ok
+
+      format_errors ->
+        Telemetry.emit(:payment_signature, :validate, :error, %{
+          reason: :invalid_format,
+          fields: Enum.map(format_errors, &elem(&1, 0))
+        })
+
+        {:error, {:invalid_format, format_errors}}
     end
   end
 
@@ -222,7 +226,7 @@ defmodule X402.PaymentSignature do
 
   ## Examples
 
-      iex> payload = %{"transactionHash" => "0xabc", "network" => "eip155:8453", "scheme" => "exact", "payerWallet" => "0x1111111111111111111111111111111111111111"}
+      iex> payload = %{"transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "network" => "eip155:8453", "scheme" => "exact", "payerWallet" => "0x1111111111111111111111111111111111111111"}
       iex> value = payload |> Jason.encode!() |> Base.encode64()
       iex> X402.PaymentSignature.decode_and_validate(value)
       {:ok, payload}
