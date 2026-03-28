@@ -12,8 +12,7 @@ defmodule X402Test do
 
     test "delegates payment-signature decode and validate" do
       payload = %{
-        "transactionHash" =>
-          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "exact",
         "payerWallet" => "0x1111111111111111111111111111111111111111"
