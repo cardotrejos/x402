@@ -185,6 +185,11 @@ defmodule X402.PaymentSignature do
     end
   end
 
+  def validate(_payload, _requirements) do
+    Telemetry.emit(:payment_signature, :validate, :error, %{reason: :invalid_payload})
+    {:error, :invalid_payload}
+  end
+
   defp check_missing_fields(payload) do
     case missing_fields(payload) do
       [] ->
@@ -213,11 +218,6 @@ defmodule X402.PaymentSignature do
 
         {:error, {:invalid_format, format_errors}}
     end
-  end
-
-  def validate(_payload, _requirements) do
-    Telemetry.emit(:payment_signature, :validate, :error, %{reason: :invalid_payload})
-    {:error, :invalid_payload}
   end
 
   @doc since: "0.1.0", group: :verification
