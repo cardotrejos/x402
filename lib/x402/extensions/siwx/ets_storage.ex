@@ -38,7 +38,8 @@ defmodule X402.Extensions.SIWX.ETSStorage do
     max_size: [
       type: :pos_integer,
       default: @default_max_size,
-      doc: "Maximum number of {address, resource} entries to keep in the ETS table. When reached, new `put/4` calls return `{:error, :storage_full}` until the next cleanup sweep evicts expired records. Prevents unbounded memory growth under spam attacks."
+      doc:
+        "Maximum number of {address, resource} entries to keep in the ETS table. When reached, new `put/4` calls return `{:error, :storage_full}` until the next cleanup sweep evicts expired records. Prevents unbounded memory growth under spam attacks."
     ]
   ]
 
