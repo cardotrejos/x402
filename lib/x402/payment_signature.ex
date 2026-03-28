@@ -28,7 +28,7 @@ defmodule X402.PaymentSignature do
   @solana_tx_sig_regex ~r/^[1-9A-HJ-NP-Za-km-z]{87,88}$/
 
   # Solana wallet address: base58, 32-44 characters.
-  @solana_address_regex ~r/^[1-9A-HJ-NP-Za-km-z]{32,44}$/
+  @solana_address_regex ~r/^[1-9A-HJ-NP-Za-km-z]{43,44}$/
 
   # Single source of truth for the 8 KB decode guard — see X402.Header.
   @max_header_bytes X402.Header.max_header_bytes()
