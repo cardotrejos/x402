@@ -17,6 +17,8 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   @default_table :x402_siwx_storage
   @default_cleanup_interval_ms 60_000
 
+  @default_max_size 100_000
+
   @start_link_options_schema [
     name: [
       type: :any,
@@ -32,6 +34,11 @@ defmodule X402.Extensions.SIWX.ETSStorage do
       type: :pos_integer,
       default: @default_cleanup_interval_ms,
       doc: "Interval in milliseconds between cleanup sweeps."
+    ],
+    max_size: [
+      type: :pos_integer,
+      default: @default_max_size,
+      doc: "Maximum number of {address, resource} entries to keep in the ETS table. When reached, new `put/4` calls return `{:error, :storage_full}` until the next cleanup sweep evicts expired records. Prevents unbounded memory growth under spam attacks."
     ]
   ]
 
@@ -40,7 +47,8 @@ defmodule X402.Extensions.SIWX.ETSStorage do
 
   @type state :: %{
           table: atom(),
-          cleanup_interval_ms: pos_integer()
+          cleanup_interval_ms: pos_integer(),
+          max_size: pos_integer()
         }
 
   @doc """
@@ -152,6 +160,7 @@ defmodule X402.Extensions.SIWX.ETSStorage do
   def init(opts) do
     table = Keyword.fetch!(opts, :table)
     cleanup_interval_ms = Keyword.fetch!(opts, :cleanup_interval_ms)
+    max_size = Keyword.fetch!(opts, :max_size)
 
     :ets.new(table, [
       :named_table,
@@ -165,7 +174,8 @@ defmodule X402.Extensions.SIWX.ETSStorage do
     {:ok,
      %{
        table: table,
-       cleanup_interval_ms: cleanup_interval_ms
+       cleanup_interval_ms: cleanup_interval_ms,
+       max_size: max_size
      }}
   end
 
@@ -191,11 +201,22 @@ defmodule X402.Extensions.SIWX.ETSStorage do
 
   def handle_call({:put, address, resource, payment_proof, ttl_ms}, _from, state) do
     key = {address, resource}
-    expires_at_ms = now_ms() + ttl_ms
+    current_size = :ets.info(state.table, :size)
 
-    true = :ets.insert(state.table, {key, payment_proof, expires_at_ms})
+    # Enforce size cap to prevent unbounded ETS memory growth under spam attacks.
+    # An attacker who generates unique (address, resource) pairs would grow the
+    # table without limit until the node OOMs.  We check if the key already
+    # exists (an update never grows the table) and only reject genuinely new
+    # insertions that would push us over the limit.
+    already_exists = :ets.member(state.table, key)
 
-    {:reply, :ok, state}
+    if not already_exists and current_size >= state.max_size do
+      {:reply, {:error, :storage_full}, state}
+    else
+      expires_at_ms = now_ms() + ttl_ms
+      true = :ets.insert(state.table, {key, payment_proof, expires_at_ms})
+      {:reply, :ok, state}
+    end
   end
 
   def handle_call({:delete, address, resource}, _from, state) do

@@ -16,6 +16,20 @@ defmodule X402.PaymentSignature do
 
   @required_fields ~w(transactionHash network scheme payerWallet)
 
+  # EIP-55 Ethereum address: 0x followed by exactly 40 hex characters (case-insensitive).
+  # We accept mixed-case (checksummed) and lower-case (normalised) addresses.
+  @eth_address_regex ~r/^0x[0-9a-fA-F]{40}$/
+
+  # Transaction hash: 0x followed by exactly 64 hex characters (256-bit hash).
+  # Solana tx IDs are base58, 87-88 chars — we detect them by absence of "0x" prefix.
+  @eth_tx_hash_regex ~r/^0x[0-9a-fA-F]{64}$/
+
+  # Solana base-58 transaction signature (87–88 characters of base58 alphabet).
+  @solana_tx_sig_regex ~r/^[1-9A-HJ-NP-Za-km-z]{87,88}$/
+
+  # Solana wallet address: base58, 32-44 characters.
+  @solana_address_regex ~r/^[1-9A-HJ-NP-Za-km-z]{32,44}$/
+
   # Single source of truth for the 8 KB decode guard — see X402.Header.
   @max_header_bytes X402.Header.max_header_bytes()
 
@@ -31,6 +45,7 @@ defmodule X402.PaymentSignature do
           :invalid_payload
           | {:missing_fields, [String.t()]}
           | {:invalid_upto_payment, upto_validation_error()}
+          | {:invalid_format, [{field :: String.t(), reason :: atom()}]}
 
   @type decode_and_validate_error :: decode_error() | validate_error()
 
@@ -156,23 +171,34 @@ defmodule X402.PaymentSignature do
 
     case missing do
       [] ->
-        case validate_scheme(payload, requirements) do
-          :ok ->
-            result = {:ok, payload}
+        case validate_field_formats(payload) do
+          [] ->
+            case validate_scheme(payload, requirements) do
+              :ok ->
+                result = {:ok, payload}
 
-            Telemetry.emit(:payment_signature, :validate, :ok, %{
-              required_fields: @required_fields
-            })
+                Telemetry.emit(:payment_signature, :validate, :ok, %{
+                  required_fields: @required_fields
+                })
 
-            result
+                result
 
-          {:error, {:invalid_upto_payment, reason}} = error ->
+              {:error, {:invalid_upto_payment, reason}} = error ->
+                Telemetry.emit(:payment_signature, :validate, :error, %{
+                  reason: :invalid_upto_payment,
+                  detail: reason
+                })
+
+                error
+            end
+
+          format_errors ->
             Telemetry.emit(:payment_signature, :validate, :error, %{
-              reason: :invalid_upto_payment,
-              detail: reason
+              reason: :invalid_format,
+              fields: Enum.map(format_errors, &elem(&1, 0))
             })
 
-            error
+            {:error, {:invalid_format, format_errors}}
         end
 
       _ ->
@@ -239,6 +265,50 @@ defmodule X402.PaymentSignature do
     end)
     |> Enum.sort()
   end
+
+  # Validates the format of fields that have known structural constraints:
+  #   - transactionHash: EVM 0x+64hex OR Solana base58 87-88 chars
+  #   - payerWallet: EVM 0x+40hex OR Solana base58 32-44 chars
+  #
+  # We intentionally do NOT validate `network` and `scheme` here — those fields
+  # are validated downstream by the facilitator / scheme validators which have
+  # the authoritative list of supported values.
+  #
+  # Returns a list of {field, reason} tuples for each invalid field; empty list = ok.
+  @spec validate_field_formats(map()) :: [{String.t(), atom()}]
+  defp validate_field_formats(payload) do
+    [
+      validate_transaction_hash(Map.get(payload, "transactionHash")),
+      validate_payer_wallet(Map.get(payload, "payerWallet"))
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  @spec validate_transaction_hash(String.t() | nil) :: {String.t(), atom()} | nil
+  defp validate_transaction_hash(nil), do: nil
+
+  defp validate_transaction_hash(hash) when is_binary(hash) do
+    cond do
+      Regex.match?(@eth_tx_hash_regex, hash) -> nil
+      Regex.match?(@solana_tx_sig_regex, hash) -> nil
+      true -> {"transactionHash", :invalid_format}
+    end
+  end
+
+  defp validate_transaction_hash(_), do: {"transactionHash", :invalid_format}
+
+  @spec validate_payer_wallet(String.t() | nil) :: {String.t(), atom()} | nil
+  defp validate_payer_wallet(nil), do: nil
+
+  defp validate_payer_wallet(wallet) when is_binary(wallet) do
+    cond do
+      Regex.match?(@eth_address_regex, wallet) -> nil
+      Regex.match?(@solana_address_regex, wallet) -> nil
+      true -> {"payerWallet", :invalid_format}
+    end
+  end
+
+  defp validate_payer_wallet(_), do: {"payerWallet", :invalid_format}
 
   @spec validate_scheme(map(), map()) ::
           :ok | {:error, {:invalid_upto_payment, upto_validation_error()}}
