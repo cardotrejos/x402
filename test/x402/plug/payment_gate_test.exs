@@ -170,7 +170,8 @@ defmodule X402.Plug.PaymentGateTest do
     assert result_conn.status == 200
 
     assert_receive {:verify_called, payload, requirements, hooks_module}
-    assert payload["transactionHash"] == "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    assert payload["transactionHash"] ==
+             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     assert requirements["network"] == "base-sepolia"
     assert requirements["asset"] == "USDC"
     assert requirements["resource"] == "/api/resource"

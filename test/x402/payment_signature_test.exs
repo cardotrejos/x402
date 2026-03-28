@@ -14,7 +14,8 @@ defmodule X402.PaymentSignatureTest do
   describe "decode/1" do
     test "decodes a valid base64 json payload" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" =>
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "exact",
         "payerWallet" => "0x1111111111111111111111111111111111111111"
@@ -58,7 +59,8 @@ defmodule X402.PaymentSignatureTest do
   describe "validate/1" do
     test "returns ok for complete payload" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" =>
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "exact",
         "payerWallet" => "0x1111111111111111111111111111111111111111"
@@ -92,7 +94,8 @@ defmodule X402.PaymentSignatureTest do
 
     test "validates upto payments when value is within maxPrice from payload" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" =>
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "upto",
         "payerWallet" => "0x1111111111111111111111111111111111111111",
@@ -107,7 +110,8 @@ defmodule X402.PaymentSignatureTest do
   describe "validate/2" do
     test "validates upto payments when value is within requirements maxPrice" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" =>
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "upto",
         "payerWallet" => "0x1111111111111111111111111111111111111111",
@@ -121,7 +125,8 @@ defmodule X402.PaymentSignatureTest do
 
     test "rejects upto payments when value exceeds maxPrice" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" =>
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "upto",
         "payerWallet" => "0x1111111111111111111111111111111111111111",
@@ -136,7 +141,8 @@ defmodule X402.PaymentSignatureTest do
 
     test "rejects upto payments when value is missing" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" =>
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "upto",
         "payerWallet" => "0x1111111111111111111111111111111111111111"
@@ -150,7 +156,8 @@ defmodule X402.PaymentSignatureTest do
 
     test "returns invalid_payload for non-map requirements" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" =>
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "upto",
         "payerWallet" => "0x1111111111111111111111111111111111111111",
@@ -164,7 +171,8 @@ defmodule X402.PaymentSignatureTest do
   describe "decode_and_validate/1" do
     test "returns ok for valid encoded payload" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" =>
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "exact",
         "payerWallet" => "0x1111111111111111111111111111111111111111"
@@ -191,7 +199,8 @@ defmodule X402.PaymentSignatureTest do
   describe "decode_and_validate/2" do
     test "validates upto scheme against requirements" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transactionHash" =>
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "network" => "eip155:8453",
         "scheme" => "upto",
         "payerWallet" => "0x1111111111111111111111111111111111111111",
