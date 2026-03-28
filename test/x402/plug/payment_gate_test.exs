@@ -170,7 +170,7 @@ defmodule X402.Plug.PaymentGateTest do
     assert result_conn.status == 200
 
     assert_receive {:verify_called, payload, requirements, hooks_module}
-    assert payload["transactionHash"] == "0xabc"
+    assert payload["transactionHash"] == "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     assert requirements["network"] == "base-sepolia"
     assert requirements["asset"] == "USDC"
     assert requirements["resource"] == "/api/resource"
@@ -523,7 +523,7 @@ defmodule X402.Plug.PaymentGateTest do
 
   defp valid_payment_header do
     %{
-      "transactionHash" => "0xabc",
+      "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "network" => "base-sepolia",
       "scheme" => "exact",
       "payerWallet" => "0x1111111111111111111111111111111111111111"
@@ -534,7 +534,7 @@ defmodule X402.Plug.PaymentGateTest do
 
   defp valid_upto_payment_header(value) do
     %{
-      "transactionHash" => "0xabc",
+      "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "network" => "base-sepolia",
       "scheme" => "upto",
       "payerWallet" => "0x1111111111111111111111111111111111111111",

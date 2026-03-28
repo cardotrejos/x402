@@ -52,7 +52,7 @@ defmodule X402 do
   ## Examples
 
       iex> payload = %{
-      ...>   "transactionHash" => "0xabc",
+      ...>   "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       ...>   "network" => "eip155:8453",
       ...>   "scheme" => "exact",
       ...>   "payerWallet" => "0x1111111111111111111111111111111111111111"
@@ -73,7 +73,7 @@ defmodule X402 do
   ## Examples
 
       iex> X402.validate_payment_signature(%{
-      ...>   "transactionHash" => "0xabc",
+      ...>   "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       ...>   "network" => "eip155:8453",
       ...>   "scheme" => "exact",
       ...>   "payerWallet" => "0x1111111111111111111111111111111111111111"
@@ -82,7 +82,7 @@ defmodule X402 do
         "network" => "eip155:8453",
         "payerWallet" => "0x1111111111111111111111111111111111111111",
         "scheme" => "exact",
-        "transactionHash" => "0xabc"
+        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }}
   """
   @spec validate_payment_signature(map()) ::
@@ -100,7 +100,7 @@ defmodule X402 do
   ## Examples
 
       iex> payload = %{
-      ...>   "transactionHash" => "0xabc",
+      ...>   "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       ...>   "network" => "eip155:8453",
       ...>   "scheme" => "exact",
       ...>   "payerWallet" => "0x1111111111111111111111111111111111111111"
