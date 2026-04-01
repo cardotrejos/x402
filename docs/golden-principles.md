@@ -51,3 +51,13 @@ Unit tests use Bypass or Mox. Real HTTP calls are forbidden in test suite. CI ne
 If a PR drops coverage below 90%, it is not merged. Period. Coverage is a floor, not a vanity metric.
 
 **Violation:** Merging a PR with coverage at 88% "because it's close enough".
+
+## 11. TLS Must Be Verified (added v0.3.2)
+All HTTP connections to the facilitator must use TLS peer verification. No `:verify_none` in production configuration. `HTTP.secure_pool_opts/0` is the canonical source of pool config.
+
+**Violation:** Passing `[transport_opts: [verify: :verify_none]]` to `Finch.start_link`.
+
+## 12. Enforce HTTPS on Facilitator URL
+The facilitator `base_url` must start with `https://`. This is validated at `Facilitator.start_link/1` time, not at call time.
+
+**Violation:** Accepting an `http://` facilitator URL at startup without raising.

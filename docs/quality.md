@@ -1,16 +1,16 @@
 # Quality Status — x402 Elixir SDK
 
-> Last updated: 2026-02-25
+> Last updated: 2026-04-01
 
 ## Current Grades
 
 | Area | Grade | Notes |
 |------|-------|-------|
-| Tests | A- | >89% line coverage (ExCoveralls), doctests on all pure functions |
+| Tests | A | >90% line coverage (ExCoveralls), doctests on all pure functions; new HTTP + PaymentSignature tests added |
 | Architecture | A | Flat modules, behaviours, minimal deps — Dashbit-level |
 | Docs | A | hexdocs published, @moduledoc + @doc + @spec on all publics |
 | Type Safety | A | Dialyzer-clean, full typespecs |
-| Security | B+ | No secrets stored, wallet validation tested, SIWX needs more fuzz |
+| Security | A- | TLS peer verification enforced, HTTPS-only base_url, 8KB size caps on all headers, atomic ETS claim |
 | Optional Deps | A | Compiles cleanly with `--no-optional-deps` |
 
 ## Coverage Target
