@@ -3,7 +3,7 @@
 > These are non-negotiable. Every PR is judged against them.
 
 ## 1. Zero Lock-In
-The library never forces a specific facilitator, chain, HTTP client, or framework. Users bring their own `Finch` process. Any facilitator URL is accepted. Any CAIP-2 network is valid.
+The library never forces a specific facilitator, chain, HTTP client, or framework. Users bring their own `Finch` process. Any HTTPS facilitator URL is accepted. Any CAIP-2 network is valid.
 
 **Violation:** Hardcoding Coinbase's facilitator URL. Requiring a specific HTTP client at compile time.
 
@@ -57,7 +57,7 @@ All HTTP connections to the facilitator must use TLS peer verification. No `:ver
 
 **Violation:** Passing `[transport_opts: [verify: :verify_none]]` to `Finch.start_link`.
 
-## 12. Enforce HTTPS on Facilitator URL
+## 12. Enforce HTTPS on Facilitator URL (added v0.3.2)
 The facilitator `base_url` must start with `https://`. This is validated at `Facilitator.start_link/1` time, not at call time.
 
 **Violation:** Accepting an `http://` facilitator URL at startup without raising.

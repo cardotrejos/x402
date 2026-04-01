@@ -17,6 +17,8 @@ A pure Elixir library implementing the x402 HTTP payment protocol. Ships as a He
 
 ```
 X402                         # Top-level convenience API (delegates to submodules)
+├── Utils                    # Shared utilities (decimal parsing, common helpers)
+├── Header                   # Shared header utilities
 ├── PaymentRequired          # Encode/decode PAYMENT-REQUIRED header (Base64 JSON)
 ├── PaymentSignature         # Decode and validate PAYMENT-SIGNATURE header
 ├── PaymentResponse          # Encode PAYMENT-RESPONSE header
