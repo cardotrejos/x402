@@ -1,6 +1,6 @@
 # Architecture — x402 Elixir SDK
 
-> Last updated: 2026-02-25
+> Last updated: 2026-04-01
 
 ## Overview
 
@@ -17,6 +17,8 @@ A pure Elixir library implementing the x402 HTTP payment protocol. Ships as a He
 
 ```
 X402                         # Top-level convenience API (delegates to submodules)
+├── Utils                    # Shared utilities (decimal parsing, common helpers)
+├── Header                   # Shared header utilities
 ├── PaymentRequired          # Encode/decode PAYMENT-REQUIRED header (Base64 JSON)
 ├── PaymentSignature         # Decode and validate PAYMENT-SIGNATURE header
 ├── PaymentResponse          # Encode PAYMENT-RESPONSE header
@@ -91,3 +93,14 @@ Only raise on programmer errors (wrong type passed to function, etc.).
 [:x402, :settle, :stop]
 [:x402, :settle, :exception]
 ```
+
+## Recent Changes (v0.3.2 → v0.3.3)
+
+- **`X402.Utils`** — new centralized utilities module; decimal parsing optimized, shared helpers extracted from multiple modules
+- **`X402.Facilitator.HTTP`** — TLS peer verification now enforced; secure pool options exposed via `HTTP.secure_pool_opts/0`; HTTPS-only on `base_url` (rejects `http://` at config time)
+- **`X402.PaymentSignature`** — format validation tightened; 8KB size cap enforced to prevent oversized headers
+- **`X402.PaymentRequired` / `X402.PaymentResponse`** — 8KB payload size cap added
+- **`X402.Extensions.SIWX.ETSStorage`** — ETS size cap added; read consistency fixes; atomic claim to prevent double-settle; safe cache eviction
+- **Elixir minimum** — bumped to `~> 1.19`
+- **`X402.Header`** — new shared header utilities module
+- **`X402.Wallet`** — Solana address validation tightened
