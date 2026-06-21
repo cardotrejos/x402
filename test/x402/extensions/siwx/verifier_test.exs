@@ -17,7 +17,7 @@ defmodule X402.Extensions.SIWX.VerifierTest do
 
   describe "validate_module/1" do
     test "returns ok for valid verifier module" do
-      assert Verifier.validate_module(ValidVerifier) == :ok
+      assert {:ok, ValidVerifier} = Verifier.validate_module(ValidVerifier)
     end
 
     test "returns error for invalid verifier module" do

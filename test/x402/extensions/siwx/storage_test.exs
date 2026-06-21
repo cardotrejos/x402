@@ -23,7 +23,7 @@ defmodule X402.Extensions.SIWX.StorageTest do
 
   describe "validate_module/1" do
     test "returns ok for valid storage module" do
-      assert Storage.validate_module(ValidStorage) == :ok
+      assert {:ok, ValidStorage} = Storage.validate_module(ValidStorage)
     end
 
     test "returns error for invalid storage modules" do

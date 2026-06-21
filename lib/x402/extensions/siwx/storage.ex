@@ -40,10 +40,10 @@ defmodule X402.Extensions.SIWX.Storage do
 
   This function is intended for `NimbleOptions` custom validation.
   """
-  @spec validate_module(term()) :: :ok | {:error, String.t()}
+  @spec validate_module(term()) :: {:ok, module()} | {:error, String.t()}
   def validate_module(module) when is_atom(module) do
     case implementation?(module) do
-      true -> :ok
+      true -> {:ok, module}
       false -> {:error, "expected a module implementing X402.Extensions.SIWX.Storage"}
     end
   end
