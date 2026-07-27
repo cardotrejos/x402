@@ -42,19 +42,21 @@ Incoming HTTP request
         ▼
 X402.Plug.PaymentGate
         │
-        ├─ No PAYMENT-SIGNATURE header? → 402 response (PAYMENT-REQUIRED header)
+        ├─ No PAYMENT-SIGNATURE? → 402 + PAYMENT-REQUIRED (v2 PaymentRequired)
         │
-        └─ Signature present?
+        └─ PAYMENT-SIGNATURE present?
                 │
-                ├─ Call X402.Facilitator.verify/2
-                │       └─ POST /verify to facilitator URL
+                ├─ Decode PaymentPayload (x402Version must be 2)
+                │     malformed / wrong version → 400 + PAYMENT-REQUIRED
                 │
-                ├─ Verify OK? → Call X402.Facilitator.settle/2
-                │                       └─ POST /settle to facilitator URL
+                ├─ Match payload.accepted to route accepts
+                │     (scheme, network, amount, asset, payTo)
+                │     no match → 402 + PAYMENT-REQUIRED
                 │
-                ├─ Hooks: before_verify → after_verify → on_failure
+                ├─ Facilitator.verify → Facilitator.settle
+                │     failure → 402 (+ PAYMENT-RESPONSE when settle body present)
                 │
-                └─ Pass through to app handler (conn)
+                └─ Success → PAYMENT-RESPONSE, assigns, pass through
 ```
 
 ## Optional Dependencies
@@ -67,13 +69,16 @@ X402.Plug.PaymentGate
 
 All optional deps are guarded by compile-time checks. Must `mix compile --no-optional-deps` successfully.
 
-## Data Formats
+## Data Formats (x402 v2)
 
 All x402 headers carry **Base64-encoded JSON payloads**:
 
-- `PAYMENT-REQUIRED`: `{scheme, network, maxAmountRequired, payTo, asset, extra}`
-- `PAYMENT-SIGNATURE`: `{x402Version, scheme, network, payload, authorization}`
-- `PAYMENT-RESPONSE`: `{success, transaction, networkId, errorReason?}`
+- `PAYMENT-REQUIRED`: `{x402Version: 2, error?, resource, accepts[], extensions?}`
+  - Each accept: `{scheme, network, amount, asset, payTo, maxTimeoutSeconds, extra?}`
+  - `resource`: `{url, description?, mimeType?, serviceName?, tags?, iconUrl?}`
+- `PAYMENT-SIGNATURE` (PaymentPayload): `{x402Version: 2, resource?, accepted, payload, extensions?}`
+  - `accepted` is a full PaymentRequirements object (must match a server accept)
+- `PAYMENT-RESPONSE` (SettleResponse): `{success, transaction, network, payer?, amount?, errorReason?, extensions?}`
 
 Network IDs use CAIP-2 format: `"eip155:8453"` (Base mainnet), `"eip155:84532"` (Base Sepolia).
 

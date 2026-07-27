@@ -248,8 +248,10 @@ defmodule X402.Facilitator do
               state.url,
               endpoint,
               %{
-                payload: before_context.payload,
-                requirements: before_context.requirements
+                # x402 v2 facilitator wire format (§7.1 / §7.2)
+                "x402Version" => 2,
+                "paymentPayload" => before_context.payload,
+                "paymentRequirements" => before_context.requirements
               },
               max_retries: state.max_retries,
               retry_backoff_ms: state.retry_backoff_ms,

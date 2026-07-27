@@ -146,8 +146,11 @@ defmodule X402.FacilitatorTest do
     Bypass.expect(bypass, "POST", "/verify", fn conn ->
       assert {:ok, body, conn} = Plug.Conn.read_body(conn)
 
-      assert %{"payload" => ^payment_payload, "requirements" => ^requirements} =
-               Jason.decode!(body)
+      assert %{
+               "x402Version" => 2,
+               "paymentPayload" => ^payment_payload,
+               "paymentRequirements" => ^requirements
+             } = Jason.decode!(body)
 
       Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
     end)
@@ -172,8 +175,11 @@ defmodule X402.FacilitatorTest do
     Bypass.expect(bypass, "POST", "/settle", fn conn ->
       assert {:ok, body, conn} = Plug.Conn.read_body(conn)
 
-      assert %{"payload" => ^payment_payload, "requirements" => ^requirements} =
-               Jason.decode!(body)
+      assert %{
+               "x402Version" => 2,
+               "paymentPayload" => ^payment_payload,
+               "paymentRequirements" => ^requirements
+             } = Jason.decode!(body)
 
       Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
     end)
@@ -196,8 +202,9 @@ defmodule X402.FacilitatorTest do
       assert {:ok, body, conn} = Plug.Conn.read_body(conn)
 
       assert %{
-               "payload" => %{"beforeVerify" => true},
-               "requirements" => %{"beforeVerify" => true}
+               "x402Version" => 2,
+               "paymentPayload" => %{"beforeVerify" => true},
+               "paymentRequirements" => %{"beforeVerify" => true}
              } = Jason.decode!(body)
 
       Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
@@ -225,8 +232,9 @@ defmodule X402.FacilitatorTest do
       assert {:ok, body, conn} = Plug.Conn.read_body(conn)
 
       assert %{
-               "payload" => %{"beforeSettle" => true},
-               "requirements" => %{"beforeSettle" => true}
+               "x402Version" => 2,
+               "paymentPayload" => %{"beforeSettle" => true},
+               "paymentRequirements" => %{"beforeSettle" => true}
              } = Jason.decode!(body)
 
       Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
@@ -313,13 +321,13 @@ defmodule X402.FacilitatorTest do
   } do
     Bypass.expect(bypass, "POST", "/verify", fn conn ->
       assert {:ok, body, conn} = Plug.Conn.read_body(conn)
-      assert %{"payload" => %{"beforeVerify" => true}} = Jason.decode!(body)
+      assert %{"paymentPayload" => %{"beforeVerify" => true}} = Jason.decode!(body)
       Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
     end)
 
     Bypass.expect(bypass, "POST", "/settle", fn conn ->
       assert {:ok, body, conn} = Plug.Conn.read_body(conn)
-      assert %{"payload" => %{"beforeSettle" => true}} = Jason.decode!(body)
+      assert %{"paymentPayload" => %{"beforeSettle" => true}} = Jason.decode!(body)
       Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
     end)
 
@@ -462,13 +470,13 @@ defmodule X402.FacilitatorTest do
   } do
     Bypass.expect(bypass, "POST", "/verify", fn conn ->
       assert {:ok, body, conn} = Plug.Conn.read_body(conn)
-      assert %{"payload" => %{"value" => "9"}} = Jason.decode!(body)
+      assert %{"paymentPayload" => %{"value" => "9"}} = Jason.decode!(body)
       Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
     end)
 
     Bypass.expect(bypass, "POST", "/settle", fn conn ->
       assert {:ok, body, conn} = Plug.Conn.read_body(conn)
-      assert %{"payload" => %{"value" => "9"}} = Jason.decode!(body)
+      assert %{"paymentPayload" => %{"value" => "9"}} = Jason.decode!(body)
       Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
     end)
 
