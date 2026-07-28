@@ -118,7 +118,7 @@ defmodule X402.Plug.PaymentGateTest do
     price: @amount,
     network: @network,
     asset: @asset,
-          pay_to: @receiver
+    pay_to: @receiver
   }
 
   @upto_route Map.put(@route, :scheme, "upto")
@@ -450,7 +450,7 @@ defmodule X402.Plug.PaymentGateTest do
           price: @amount,
           network: @network,
           asset: @asset,
-    pay_to: @receiver
+          pay_to: @receiver
         },
         @solana_accept
       ]

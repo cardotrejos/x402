@@ -27,7 +27,6 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     alias X402.Extensions.PaymentIdentifier.ETSCache
     alias X402.Facilitator
-    alias X402.Facilitator.Error
     alias X402.Hooks
     alias X402.Hooks.Default
     alias X402.PaymentRequired
@@ -48,7 +47,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       ]
 
     @http_methods [:any, :delete, :get, :head, :options, :patch, :post, :put, :trace]
-    @route_schemes ["exact", "upto"] # TODO Implement batch-settlement scheme
+    # TODO Implement batch-settlement scheme
+    @route_schemes ["exact", "upto"]
     @x402_version 2
     @default_max_timeout_seconds 60
     @default_description "Payment required"
@@ -444,17 +444,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
              facilitator_verify(facilitator, payment_payload, requirements, hooks),
            :ok <- ensure_verify_success(verify_response),
            :ok <- claim_payment(payment_identifier_cache, payment_id) do
-        settle_result =
-          case facilitator_settle(facilitator, payment_payload, requirements, hooks) do
-            {:ok, settle_response} ->
-              case ensure_settle_success(settle_response) do
-                :ok -> {:ok, settle_response}
-                {:error, reason} -> {:error, reason, settle_response.body}
-              end
-
-            {:error, reason} ->
-              {:error, reason, nil}
-          end
+        settle_result = settle_with_hooks(facilitator, payment_payload, requirements, hooks)
 
         case settle_result do
           {:ok, settle_response} ->
@@ -505,6 +495,27 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             status: status_for_reason(reason),
             reason: reason
           )
+      end
+    end
+
+    @spec settle_with_hooks(
+            Facilitator.server(),
+            map(),
+            map(),
+            module()
+          ) ::
+            {:ok, map()}
+            | {:error, term(), term()}
+    defp settle_with_hooks(facilitator, payment_payload, requirements, hooks) do
+      case facilitator_settle(facilitator, payment_payload, requirements, hooks) do
+        {:ok, settle_response} ->
+          case ensure_settle_success(settle_response) do
+            :ok -> {:ok, settle_response}
+            {:error, reason} -> {:error, reason, settle_response.body}
+          end
+
+        {:error, reason} ->
+          {:error, reason, nil}
       end
     end
 
@@ -690,8 +701,6 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    defp validate_v2_payload_structure(_payload), do: {:error, :invalid_payload}
-
     # Equality on scheme, network, amount, asset, payTo — matches Go
     # FindMatchingRequirements.
     @spec find_matching_requirements([map()], map()) ::
@@ -727,20 +736,20 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec validate_upto_amount(map(), map()) :: :ok | {:error, term()}
     defp validate_upto_amount(payload, requirements) do
-      scheme = Utils.map_value(requirements, {"scheme", :scheme})
+      case Utils.map_value(requirements, {"scheme", :scheme}) do
+        "upto" -> validate_upto_max(payload, requirements)
+        _scheme -> :ok
+      end
+    end
 
-      case scheme do
-        "upto" ->
-          with {:ok, max_amount} <- extract_max_amount(requirements),
-               {:ok, payment_value} <- extract_payment_value(payload) do
-            case Utils.compare_decimal(payment_value, max_amount) do
-              :gt -> {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
-              _comparison -> :ok
-            end
-          end
-
-        _scheme ->
-          :ok
+    @spec validate_upto_max(map(), map()) :: :ok | {:error, term()}
+    defp validate_upto_max(payload, requirements) do
+      with {:ok, max_amount} <- extract_max_amount(requirements),
+           {:ok, payment_value} <- extract_payment_value(payload) do
+        case Utils.compare_decimal(payment_value, max_amount) do
+          :gt -> {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
+          _comparison -> :ok
+        end
       end
     end
 
@@ -960,8 +969,6 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         {:error, _reason} -> conn
       end
     end
-
-    defp put_payment_response_header(conn, _body), do: conn
 
     @spec payment_response_from_reason(term()) :: map() | nil
     defp payment_response_from_reason(body) when is_map(body), do: body

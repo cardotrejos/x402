@@ -227,7 +227,6 @@ defmodule X402.Facilitator.HTTP do
 
   defp decode_json_body(other), do: {:error, {:invalid_body_type, other}}
 
-  defp raw_body_map(nil), do: %{}
   defp raw_body_map(body) when is_binary(body), do: %{"raw_body" => body}
   defp raw_body_map(body), do: %{"raw_body" => inspect(body)}
 
