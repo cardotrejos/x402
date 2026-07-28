@@ -39,6 +39,8 @@
 - [ ] Facilitator client support for upto verification
 - [ ] Tests + docs
 
+### "batch" settlement scheme
+- [ ]
 ---
 
 ## v0.3 — SIWX (Sign-In-With-X)

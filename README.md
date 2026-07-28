@@ -45,18 +45,24 @@ end
 
 ### Accept payments in Phoenix
 
+Route specification according to V2 specification of x402.
+See https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md
+
 ```elixir
 # In your router or endpoint
 plug X402.Plug.PaymentGate,
   facilitator_url: "https://x402-facilitator-app.fly.dev",
-  routes: %{
-    "GET /api/weather" => %{
+  routes: [
+    %{
+      method: :get,
+      path: "/api/weather",
       price: "0.005",
       network: "eip155:8453",
+      asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       pay_to: "0xYourWalletAddress",
       description: "Weather data API"
     }
-  }
+  ]
 ```
 
 That's it. Requests without payment get a `402` response with payment instructions. Requests with a valid `PAYMENT-SIGNATURE` header are verified and passed through.
@@ -99,7 +105,16 @@ end
 plug X402.Plug.PaymentGate,
   facilitator_url: "https://x402-facilitator-app.fly.dev",
   hooks: MyApp.PaymentHooks,
-  routes: %{...}
+  routes: [
+    %{
+      method: :get,
+      path: "/api/data",
+      price: "0.01",
+      network: "eip155:8453",
+      asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      pay_to: "0xYourWalletAddress"
+    }
+  ]
 ```
 
 ### "upto" scheme — flexible pricing
@@ -108,15 +123,18 @@ plug X402.Plug.PaymentGate,
 # Server: accept up to a max price (agent bids what they're willing to pay)
 plug X402.Plug.PaymentGate,
   facilitator_url: "https://x402-facilitator-app.fly.dev",
-  routes: %{
-    "GET /api/premium" => %{
+  routes: [
+    %{
+      method: :get,
+      path: "/api/premium",
       scheme: "upto",
-      maxPrice: "1.00",
+      price: "1.00",
       network: "eip155:8453",
-      pay_to: "0xYourWallet",
+      asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      pay_to: "0xYourWalletAddress",
       description: "Premium data — pay what you want up to $1"
     }
-  }
+  ]
 
 # Encode/decode upto payment requirements
 {:ok, header} = X402.PaymentRequired.encode(%{

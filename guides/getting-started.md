@@ -9,7 +9,7 @@ Add `x402` and a HTTP client to your dependencies:
 ```elixir
 def deps do
   [
-    {:x402, "~> 0.1"},
+    {:x402, "~> 0.3"},
     {:finch, "~> 0.19"}
   ]
 end
@@ -62,13 +62,16 @@ For the simplest integration, use the Plug middleware in your Phoenix router:
 pipeline :paid_api do
   plug X402.Plug.PaymentGate,
     facilitator_url: "https://x402.org/facilitator",
-    routes: %{
-      "GET /api/data" => %{
+    routes: [
+      %{
+        method: :get,
+        path: "/api/data",
         price: "0.01",
         network: "eip155:8453",
+        asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
         pay_to: "0xYourWallet"
       }
-    }
+    ]
 end
 
 scope "/api" do
@@ -77,6 +80,9 @@ scope "/api" do
 end
 ```
 
-Unpaid requests receive a `402 Payment Required` response with the pricing details
-encoded in the `PAYMENT-REQUIRED` header. Clients that include a valid
-`PAYMENT-SIGNATURE` header are passed through to your controller.
+Unpaid requests receive a `402 Payment Required` response with a
+`PAYMENT-REQUIRED` header containing v2 payment options. Clients that include
+a valid `PAYMENT-SIGNATURE` header are verified, settled, and passed through
+to your controller. The decoded payment payload and matched requirements are
+available on `conn.assigns.x402_payment_payload` and
+`conn.assigns.x402_payment_requirements`.
