@@ -234,6 +234,7 @@ Facilitator requests use the v2 wire object:
 
 - [Getting Started](https://hexdocs.pm/x402/getting-started.html)
 - [Plug/Phoenix Integration](https://hexdocs.pm/x402/plug-integration.html)
+- [Live Smoke Tests](https://hexdocs.pm/x402/live-smoke-tests.html)
 - [API Reference](https://hexdocs.pm/x402/api-reference.html)
 - [Official x402 v2 specification](https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md)
 - [Official HTTP transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/http.md)

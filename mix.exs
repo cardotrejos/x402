@@ -50,7 +50,7 @@ defmodule X402.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :public_key]
+      extra_applications: [:logger, :crypto, :public_key]
     ]
   end
 
@@ -116,7 +116,8 @@ defmodule X402.MixProject do
         "CHANGELOG.md": [title: "Changelog"],
         LICENSE: [title: "License"],
         "guides/getting-started.md": [title: "Getting Started"],
-        "guides/plug-integration.md": [title: "Plug/Phoenix Integration"]
+        "guides/plug-integration.md": [title: "Plug/Phoenix Integration"],
+        "guides/live-smoke-tests.md": [title: "Live Smoke Tests"]
       ],
       groups_for_extras: [
         Guides: ~r/guides\/.*/
@@ -143,6 +144,7 @@ defmodule X402.MixProject do
           X402.Wallet
         ],
         Extensions: [
+          X402.Extensions.Bazaar,
           X402.Extensions.SIWX,
           X402.Extensions.SIWX.Verifier,
           X402.Extensions.SIWX.Verifier.Default,
@@ -152,7 +154,8 @@ defmodule X402.MixProject do
       ],
       groups_for_docs: [
         "Header Encoding": &(&1[:group] == :headers),
-        "Payment Verification": &(&1[:group] == :verification)
+        "Payment Verification": &(&1[:group] == :verification),
+        "Payment Settlement": &(&1[:group] == :settlement)
       ]
     ]
   end

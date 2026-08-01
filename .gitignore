@@ -24,3 +24,5 @@ x402-*.tar
 
 # Dialyzer PLTs generated locally.
 priv/plts/
+
+.envrc

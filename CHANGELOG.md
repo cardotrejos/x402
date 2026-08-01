@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `X402.Facilitator.Auth` behaviour and `X402.Facilitator.Auth.CDP` — per-request JWT authentication for the Coinbase Developer Platform x402 facilitator, configured via the new `auth:` option on `X402.Facilitator.start_link/1`
+- `X402.Facilitator` `otp_app:` option — Ecto-style runtime configuration where `config :app, <name>` supplies options (including auth credentials) and `config/runtime.exs` is the single source of truth; explicit options take precedence
+- `X402.Extensions.Bazaar.build_extension/1` — factory for the `bazaar` discovery extension payload (`info` + `schema`), supporting HTTP and MCP inputs
+
+### Fixed
+
+- CDP JWT `uris` claim now binds to the full request path (facilitator base URL path + endpoint) — the previous `host + /verify` binding caused the hosted CDP facilitator to reject all requests with 401 (`request_info.path` is now the fully-qualified path)
+
+### Testing
+
+- Live smoke tests against the CDP hosted facilitator (`cdp_live_test.exs`, tagged `:smoke`, excluded from the default run) covering negative-control, authentication, end-to-end verify, and settlement tiers
+- `X402.TestPayments` reworked around a `Config` struct with default values; payment configuration now comes from `from_env/1` (facilitator-agnostic `X402_*` vars only) — no hardcoded sample wallets, and end-to-end receivers default to a fresh burner wallet (never the payer, and never the zero address, which USDC rejects)
+- Removed `test_helper.exs` compile-time redefinition of `X402.Hooks` — the real module compiles cleanly and the test suite passes without the override
+
 ## [0.4.1] - 2026-08-15
 
 ### Fixed

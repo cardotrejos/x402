@@ -5,6 +5,9 @@ defmodule X402.Facilitator do
 
   use GenServer
 
+  require Logger
+
+  alias X402.Facilitator.Auth
   alias X402.Facilitator.Error
   alias X402.Facilitator.HTTP
   alias X402.Hooks
@@ -20,6 +23,14 @@ defmodule X402.Facilitator do
       type: :any,
       default: @default_name,
       doc: "Registered name of the facilitator client process."
+    ],
+    otp_app: [
+      type: :atom,
+      doc:
+        "Application that holds this facilitator's configuration. When set, " <>
+          "`config :app, <name>` is merged under the given options, with the " <>
+          "options taking precedence. Enables the Ecto-style pattern where " <>
+          "`config/runtime.exs` is the single source of truth."
     ],
     url: [
       type: :string,
@@ -50,6 +61,14 @@ defmodule X402.Facilitator do
       type: :non_neg_integer,
       default: 5_000,
       doc: "HTTP receive timeout in milliseconds."
+    ],
+    auth: [
+      type: {:custom, __MODULE__, :validate_auth, []},
+      default: nil,
+      doc:
+        "Request authentication. Either `nil` (no authentication), an " <>
+          "`X402.Facilitator.Auth` module, or a `{module, opts}` tuple. See " <>
+          "`X402.Facilitator.Auth.CDP` for the Coinbase Developer Platform facilitator."
     ]
   ]
 
@@ -65,6 +84,7 @@ defmodule X402.Facilitator do
           url: String.t(),
           finch: term(),
           hooks: module(),
+          auth: nil | Auth.t(),
           max_retries: non_neg_integer(),
           retry_backoff_ms: non_neg_integer(),
           receive_timeout_ms: non_neg_integer()
@@ -72,6 +92,21 @@ defmodule X402.Facilitator do
 
   @doc """
   Starts the facilitator client.
+
+  When an `otp_app` is given, options are merged over the `config :app, <name>`
+  configuration entry, with the explicit options taking precedence. This
+  enables configuring the facilitator at runtime without hardcoding secrets:
+
+      # config/runtime.exs
+      config :my_app, MyX402,
+        url: X402.Facilitator.Auth.CDP.facilitator_url(),
+        finch: MyFinch,
+        auth: {X402.Facilitator.Auth.CDP,
+               api_key_id: System.fetch_env!("CDP_API_KEY_ID"),
+               api_key_secret: System.fetch_env!("CDP_API_KEY_SECRET")}
+
+      # application.ex
+      children = [{X402.Facilitator, otp_app: :my_app, name: MyX402}]
 
   ## Options
 
@@ -81,9 +116,13 @@ defmodule X402.Facilitator do
   @spec start_link(keyword()) ::
           GenServer.on_start() | {:error, NimbleOptions.ValidationError.t()}
   def start_link(opts) when is_list(opts) do
-    with {:ok, validated_opts} <- NimbleOptions.validate(opts, @start_link_options_schema) do
+    with {:ok, validated_opts} <- validated_opts(opts),
+         {:ok, auth} <- Auth.new(Keyword.get(validated_opts, :auth)) do
       name = Keyword.fetch!(validated_opts, :name)
-      GenServer.start_link(__MODULE__, validated_opts, name: name)
+      GenServer.start_link(__MODULE__, Keyword.put(validated_opts, :auth, auth), name: name)
+    else
+      {:error, %NimbleOptions.ValidationError{} = error} -> {:error, error}
+      {:error, reason} -> {:error, {:invalid_auth, reason}}
     end
   end
 
@@ -93,7 +132,7 @@ defmodule X402.Facilitator do
   @doc since: "0.1.0"
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) when is_list(opts) do
-    validated_opts = NimbleOptions.validate!(opts, @start_link_options_schema)
+    validated_opts = validated_opts!(opts)
 
     %{
       id: Keyword.fetch!(validated_opts, :name),
@@ -102,6 +141,29 @@ defmodule X402.Facilitator do
       restart: :permanent,
       shutdown: 5_000
     }
+  end
+
+  defp validated_opts(opts) do
+    opts
+    |> merge_config()
+    |> NimbleOptions.validate(@start_link_options_schema)
+  end
+
+  defp validated_opts!(opts) do
+    opts
+    |> merge_config()
+    |> NimbleOptions.validate!(@start_link_options_schema)
+  end
+
+  defp merge_config(opts) do
+    case Keyword.fetch(opts, :otp_app) do
+      :error ->
+        opts
+
+      {:ok, app} ->
+        name = Keyword.get(opts, :name, @default_name)
+        Keyword.merge(Application.get_env(app, name, []), opts)
+    end
   end
 
   @doc """
@@ -143,7 +205,7 @@ defmodule X402.Facilitator do
   @doc """
   Settles a payment using the default facilitator process name.
   """
-  @doc group: :verification
+  @doc group: :settlement
   @doc since: "0.1.0"
   @spec settle(map(), map()) :: response()
   def settle(payment_payload, requirements)
@@ -154,7 +216,7 @@ defmodule X402.Facilitator do
   @doc """
   Settles a payment using the given facilitator process.
   """
-  @doc group: :verification
+  @doc group: :settlement
   @doc since: "0.1.0"
   @spec settle(server(), map(), map()) :: response()
   def settle(server, payment_payload, requirements)
@@ -168,7 +230,7 @@ defmodule X402.Facilitator do
   This overrides the hook module configured when the facilitator process
   started.
   """
-  @doc group: :verification
+  @doc group: :settlement
   @doc since: "0.1.0"
   @spec settle(server(), map(), map(), module()) :: response()
   def settle(server, payment_payload, requirements, hooks_module)
@@ -176,20 +238,53 @@ defmodule X402.Facilitator do
     GenServer.call(server, {:settle, payment_payload, requirements, hooks_module})
   end
 
-  @impl true
-  @spec init(keyword()) :: {:ok, state()}
-  def init(opts) do
-    state = %{
-      url: Keyword.fetch!(opts, :url),
-      finch: Keyword.fetch!(opts, :finch),
-      hooks: Keyword.fetch!(opts, :hooks),
-      max_retries: Keyword.fetch!(opts, :max_retries),
-      retry_backoff_ms: Keyword.fetch!(opts, :retry_backoff_ms),
-      receive_timeout_ms: Keyword.fetch!(opts, :receive_timeout_ms)
-    }
+  @doc false
+  @spec validate_auth(nil | module() | {module(), keyword()}) ::
+          {:ok, nil | module() | {module(), keyword()}} | {:error, String.t()}
+  def validate_auth(nil), do: {:ok, nil}
 
-    {:ok, state}
+  def validate_auth({module, opts}) when is_atom(module) and is_list(opts) do
+    validate_auth_module(module, {module, opts})
   end
+
+  def validate_auth(module) when is_atom(module), do: validate_auth_module(module, module)
+
+  def validate_auth(_invalid),
+    do: {:error, "must be nil, an auth module, or a {module, opts} tuple"}
+
+  defp validate_auth_module(module, value) do
+    if X402.Behaviour.implements?(module, new: 1, headers: 2) do
+      {:ok, value}
+    else
+      {:error, "expected a module implementing X402.Facilitator.Auth"}
+    end
+  end
+
+  @impl true
+  @spec init(keyword()) :: {:ok, state()} | {:stop, term()}
+  def init(opts) do
+    case normalize_auth(Keyword.get(opts, :auth)) do
+      {:ok, auth} ->
+        state = %{
+          url: Keyword.fetch!(opts, :url),
+          finch: Keyword.fetch!(opts, :finch),
+          hooks: Keyword.fetch!(opts, :hooks),
+          auth: auth,
+          max_retries: Keyword.fetch!(opts, :max_retries),
+          retry_backoff_ms: Keyword.fetch!(opts, :retry_backoff_ms),
+          receive_timeout_ms: Keyword.fetch!(opts, :receive_timeout_ms)
+        }
+
+        {:ok, state}
+
+      {:error, reason} ->
+        {:stop, {:invalid_auth, reason}}
+    end
+  end
+
+  defp normalize_auth(nil), do: {:ok, nil}
+  defp normalize_auth(%struct{} = auth) when is_atom(struct), do: {:ok, auth}
+  defp normalize_auth(other), do: Auth.new(other)
 
   @impl true
   @spec handle_call(term(), GenServer.from(), state()) :: {:reply, response(), state()}
@@ -230,6 +325,8 @@ defmodule X402.Facilitator do
             endpoint
           )
 
+        log_failure(result, operation, endpoint)
+
         {result, telemetry_result_metadata(result)}
       end
     )
@@ -247,7 +344,8 @@ defmodule X402.Facilitator do
                    operation,
                    before_context.payload,
                    before_context.requirements
-                 ) do
+                 ),
+               {:ok, headers} <- auth_headers(state, endpoint) do
             HTTP.request(
               state.finch,
               state.url,
@@ -260,7 +358,8 @@ defmodule X402.Facilitator do
               },
               max_retries: state.max_retries,
               retry_backoff_ms: state.retry_backoff_ms,
-              receive_timeout_ms: state.receive_timeout_ms
+              receive_timeout_ms: state.receive_timeout_ms,
+              headers: headers
             )
           end
 
@@ -268,6 +367,37 @@ defmodule X402.Facilitator do
 
       {:halt, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp auth_headers(state, endpoint) do
+    request_info = %{
+      method: :post,
+      host: request_host(state.url),
+      path: request_path(state.url) <> endpoint
+    }
+
+    case Auth.headers(state.auth, request_info) do
+      {:ok, headers} ->
+        {:ok, headers}
+
+      {:error, reason} ->
+        {:error, %Error{type: :auth_failed, reason: reason, retryable: false, attempt: nil}}
+    end
+  end
+
+  defp request_host(url) do
+    case URI.parse(url) do
+      %URI{authority: authority} when is_binary(authority) and authority != "" -> authority
+      %URI{host: host} when is_binary(host) -> host
+      _other -> ""
+    end
+  end
+
+  defp request_path(url) do
+    case URI.parse(url) do
+      %URI{path: path} when is_binary(path) and path != "" -> String.trim_trailing(path, "/")
+      _other -> ""
     end
   end
 
@@ -501,6 +631,18 @@ defmodule X402.Facilitator do
 
   defp operation_endpoint(:verify), do: "/verify"
   defp operation_endpoint(:settle), do: "/settle"
+
+  defp log_failure({:ok, _result}, _operation, _endpoint), do: :ok
+
+  defp log_failure({:error, %Error{} = error}, operation, endpoint) do
+    Logger.warning(
+      "[X402.Facilitator] #{operation} failed at #{endpoint}: #{Exception.message(error)}"
+    )
+  end
+
+  defp log_failure({:error, reason}, operation, endpoint) do
+    Logger.warning("[X402.Facilitator] #{operation} failed at #{endpoint}: #{inspect(reason)}")
+  end
 
   defp telemetry_result_metadata({:ok, %{status: status}}),
     do: %{status: status, success: true}

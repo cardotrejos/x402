@@ -105,6 +105,35 @@ defmodule X402.Facilitator.HTTPTest do
     end)
   end
 
+  test "request/5 sends additional :headers on the request" do
+    with_stubbed_finch(fn ->
+      Process.put(
+        :http_test_finch_response,
+        {:fun,
+         fn request, _name, _opts ->
+           assert {"authorization", "Bearer abc"} in request.headers
+           assert {"content-type", "application/json"} in request.headers
+           {:ok, %{status: 200, body: Jason.encode!(%{"ok" => true})}}
+         end}
+      )
+
+      assert {:ok, %{status: 200, body: %{"ok" => true}}} =
+               HTTP.request(:stub, "https://facilitator.test", "/verify", %{},
+                 headers: [{"authorization", "Bearer abc"}]
+               )
+    end)
+  end
+
+  test "request/5 rejects a non-list :headers option" do
+    assert {:error, %Error{type: :invalid_option, reason: {:headers, :nope}, retryable: false}} =
+             HTTP.request(:finch, "https://example.com", "/verify", %{}, headers: :nope)
+  end
+
+  test "request/5 rejects malformed :headers entries" do
+    assert {:error, %Error{type: :invalid_option, reason: {:headers, _}, retryable: false}} =
+             HTTP.request(:finch, "https://example.com", "/verify", %{}, headers: [{:bad, 1}])
+  end
+
   test "request/5 wraps non-Error setup failures from payload encoding" do
     assert {:error, %Error{type: :request_setup_failed, retryable: false, attempt: 1}} =
              HTTP.request(:finch, "https://example.com", "/verify", %{
