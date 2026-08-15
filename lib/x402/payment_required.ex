@@ -3,7 +3,9 @@ defmodule X402.PaymentRequired do
   Encodes and decodes the x402 `PAYMENT-REQUIRED` header value.
 
   The header value is Base64-encoded JSON. This module provides safe conversion
-  functions that return tagged tuples instead of raising.
+  functions that return tagged tuples instead of raising. x402 v2 payloads use
+  `x402Version`, `resource`, `accepts`, and `extensions`; legacy standalone
+  requirement maps remain supported for backwards compatibility.
   """
 
   alias X402.Telemetry
@@ -34,10 +36,11 @@ defmodule X402.PaymentRequired do
 
   ## Examples
 
-      iex> {:ok, value} = X402.PaymentRequired.encode(%{"scheme" => "exact", "maxAmountRequired" => "10"})
+      iex> payload = %{"x402Version" => 2, "resource" => %{"url" => "https://example.com/data"}, "accepts" => [], "extensions" => %{}}
+      iex> {:ok, value} = X402.PaymentRequired.encode(payload)
       iex> {:ok, decoded} = X402.PaymentRequired.decode(value)
-      iex> decoded["maxAmountRequired"]
-      "10"
+      iex> decoded["x402Version"]
+      2
 
       iex> X402.PaymentRequired.encode(nil)
       {:error, :invalid_payload}
@@ -81,9 +84,9 @@ defmodule X402.PaymentRequired do
 
   ## Examples
 
-      iex> {:ok, encoded} = X402.PaymentRequired.encode(%{"scheme" => "exact"})
+      iex> {:ok, encoded} = X402.PaymentRequired.encode(%{"x402Version" => 2, "accepts" => []})
       iex> X402.PaymentRequired.decode(encoded)
-      {:ok, %{"scheme" => "exact"}}
+      {:ok, %{"accepts" => [], "x402Version" => 2}}
 
       iex> X402.PaymentRequired.decode("%%%")
       {:error, :invalid_base64}

@@ -1,6 +1,6 @@
 # Architecture — x402 Elixir SDK
 
-> Last updated: 2026-04-01
+> Last updated: 2026-08-15
 
 ## Overview
 
@@ -20,6 +20,7 @@ X402                         # Top-level convenience API (delegates to submodule
 ├── Utils                    # Shared utilities (decimal parsing, common helpers)
 ├── Header                   # Shared header utilities
 ├── PaymentRequired          # Encode/decode PAYMENT-REQUIRED header (Base64 JSON)
+├── PaymentRequirements      # Validate and match v2 accepted requirements
 ├── PaymentSignature         # Decode and validate PAYMENT-SIGNATURE header
 ├── PaymentResponse          # Encode PAYMENT-RESPONSE header
 ├── Facilitator              # GenServer — HTTP client for /verify + /settle
@@ -42,19 +43,25 @@ Incoming HTTP request
         ▼
 X402.Plug.PaymentGate
         │
-        ├─ No PAYMENT-SIGNATURE header? → 402 response (PAYMENT-REQUIRED header)
+        ├─ No PAYMENT-SIGNATURE? → 402 + PAYMENT-REQUIRED (v2 PaymentRequired)
         │
-        └─ Signature present?
+        └─ PAYMENT-SIGNATURE present?
                 │
-                ├─ Call X402.Facilitator.verify/2
-                │       └─ POST /verify to facilitator URL
+                ├─ Decode PaymentPayload (x402Version must be 2)
+                │     malformed / wrong version → 400 + PAYMENT-REQUIRED
                 │
-                ├─ Verify OK? → Call X402.Facilitator.settle/2
-                │                       └─ POST /settle to facilitator URL
+                ├─ Match complete payload.accepted + extension echoes
+                │     no match → 402 + PAYMENT-REQUIRED
                 │
-                ├─ Hooks: before_verify → after_verify → on_failure
+                ├─ Facilitator.verify
+                │     invalid payment → 402; server/facilitator fault → 500
                 │
-                └─ Pass through to app handler (conn)
+                ├─ Assign payload/requirements → protected handler
+                │     handler status >= 400 → skip settlement
+                │
+                └─ Successful handler → Facilitator.settle before send
+                      success → PAYMENT-RESPONSE + original resource response
+                      payment failure → 402; server/facilitator fault → 500
 ```
 
 ## Optional Dependencies
@@ -62,45 +69,55 @@ X402.Plug.PaymentGate
 | Dep | When Required |
 |-----|--------------|
 | `finch` | HTTP calls to facilitator (`X402.Facilitator`) |
+| `plug` | Phoenix/Plug middleware (`X402.Plug.PaymentGate`) |
 | `ex_secp256k1` | SIWX signature verification (EVM) |
 | `ex_keccak` | SIWX keccak hashing |
 
-All optional deps are guarded by compile-time checks. Must `mix compile --no-optional-deps` successfully.
+All optional integrations are guarded by dependency-availability checks. The
+package must compile successfully with `mix compile --no-optional-deps`.
 
-## Data Formats
+## Data Formats (x402 v2)
 
 All x402 headers carry **Base64-encoded JSON payloads**:
 
-- `PAYMENT-REQUIRED`: `{scheme, network, maxAmountRequired, payTo, asset, extra}`
-- `PAYMENT-SIGNATURE`: `{x402Version, scheme, network, payload, authorization}`
-- `PAYMENT-RESPONSE`: `{success, transaction, networkId, errorReason?}`
+- `PAYMENT-REQUIRED`: `{x402Version: 2, error?, resource, accepts[], extensions?}`
+  - Each accept: `{scheme, network, amount, asset, payTo, maxTimeoutSeconds, extra}`
+  - `resource`: `{url, description?, mimeType?, serviceName?, tags?, iconUrl?}`
+- `PAYMENT-SIGNATURE` (PaymentPayload): `{x402Version: 2, resource?, accepted, payload, extensions?}`
+  - `accepted` is a full PaymentRequirements object (must match a server accept)
+- `PAYMENT-RESPONSE` (SettleResponse): `{success, transaction, network, payer?, amount?, errorReason?, extensions?}`
 
 Network IDs use CAIP-2 format: `"eip155:8453"` (Base mainnet), `"eip155:84532"` (Base Sepolia).
 
 ## Error Handling Convention
 
-All fallible public functions return `{:ok, result} | {:error, atom_reason}`.  
-Structured atoms, never string reasons: `{:error, :invalid_base64}` not `{:error, "bad base64"}`.  
-Only raise on programmer errors (wrong type passed to function, etc.).
+Fallible public functions return tagged tuples such as
+`{:ok, result} | {:error, atom_or_structured_reason}`. Expected protocol,
+validation, and transport failures are returned rather than raised. Option
+validation may raise only in APIs whose contract explicitly uses
+`NimbleOptions.validate!/2`, such as Plug initialization.
 
 ## Telemetry Events
 
 ```
-[:x402, :verify, :start]
-[:x402, :verify, :stop]
-[:x402, :verify, :exception]
-[:x402, :settle, :start]
-[:x402, :settle, :stop]
-[:x402, :settle, :exception]
+[:x402, :facilitator, :verify, :start]
+[:x402, :facilitator, :verify, :stop]
+[:x402, :facilitator, :verify, :exception]
+[:x402, :facilitator, :settle, :start]
+[:x402, :facilitator, :settle, :stop]
+[:x402, :facilitator, :settle, :exception]
+[:x402, :plug, :payment_required]
+[:x402, :plug, :payment_verified]
+[:x402, :plug, :payment_rejected]
 ```
 
-## Recent Changes (v0.3.2 → v0.3.3)
+## v0.4 payment lifecycle
 
-- **`X402.Utils`** — new centralized utilities module; decimal parsing optimized, shared helpers extracted from multiple modules
-- **`X402.Facilitator.HTTP`** — TLS peer verification now enforced; secure pool options exposed via `HTTP.secure_pool_opts/0`; HTTPS-only on `base_url` (rejects `http://` at config time)
-- **`X402.PaymentSignature`** — format validation tightened; 8KB size cap enforced to prevent oversized headers
-- **`X402.PaymentRequired` / `X402.PaymentResponse`** — 8KB payload size cap added
-- **`X402.Extensions.SIWX.ETSStorage`** — ETS size cap added; read consistency fixes; atomic claim to prevent double-settle; safe cache eviction
-- **Elixir minimum** — bumped to `~> 1.19`
-- **`X402.Header`** — new shared header utilities module
-- **`X402.Wallet`** — Solana address validation tightened
+- The Plug validates a v2 payload and verifies payment before invoking the handler.
+- Settlement is deferred until a successful handler response is ready to send.
+- `"upto"` routes may replace the advertised maximum with the actual metered
+  settlement amount through `put_settlement_amount/2`.
+- Missing facilitator decision fields fail closed, and internal/facilitator
+  failures are separated from client and payment failures by HTTP status.
+- Only authorization-flow timing is supported; upfront and escrow requirements
+  are rejected during route compilation.

@@ -1,7 +1,7 @@
 defmodule X402.MixProject do
   use Mix.Project
 
-  @version "0.3.3"
+  @version "0.4.0"
   @source_url "https://github.com/cardotrejos/x402"
   @description "Elixir SDK for the x402 HTTP payment protocol"
 
@@ -121,6 +121,7 @@ defmodule X402.MixProject do
       groups_for_modules: [
         "Core Protocol": [
           X402,
+          X402.PaymentRequirements,
           X402.PaymentRequired,
           X402.PaymentSignature,
           X402.PaymentResponse

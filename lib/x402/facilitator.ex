@@ -56,8 +56,8 @@ defmodule X402.Facilitator do
   @typedoc "Facilitator server identifier accepted by `GenServer.call/3`."
   @type server :: GenServer.server()
 
-  @typedoc "Facilitator response payload."
-  @type operation_result :: %{status: non_neg_integer(), body: map()}
+  @typedoc "Facilitator response payload, including values recovered or transformed by hooks."
+  @type operation_result :: map()
 
   @type response :: {:ok, operation_result()} | {:error, Error.t() | Hooks.hook_error() | term()}
 
@@ -242,14 +242,21 @@ defmodule X402.Facilitator do
     case run_before_hook(hooks_module, operation, context, metadata) do
       {:cont, %Context{} = before_context} ->
         result =
-          with :ok <- validate_scheme_payment(before_context.payload, before_context.requirements) do
+          with :ok <-
+                 validate_scheme_payment(
+                   operation,
+                   before_context.payload,
+                   before_context.requirements
+                 ) do
             HTTP.request(
               state.finch,
               state.url,
               endpoint,
               %{
-                payload: before_context.payload,
-                requirements: before_context.requirements
+                # x402 v2 facilitator wire format (§7.1 / §7.2)
+                "x402Version" => 2,
+                "paymentPayload" => before_context.payload,
+                "paymentRequirements" => before_context.requirements
               },
               max_retries: state.max_retries,
               retry_backoff_ms: state.retry_backoff_ms,
@@ -367,29 +374,44 @@ defmodule X402.Facilitator do
     kind, reason -> {:error, {kind, reason}}
   end
 
-  defp validate_scheme_payment(payload, requirements) do
+  defp validate_scheme_payment(operation, payload, requirements) do
     case Utils.map_value(requirements, {"scheme", :scheme}) ||
            Utils.map_value(payload, {"scheme", :scheme}) do
       "upto" ->
-        validate_upto_payment(payload, requirements)
+        validate_upto_payment(operation, payload, requirements)
 
       _scheme ->
         :ok
     end
   end
 
-  defp validate_upto_payment(payload, requirements) do
+  defp validate_upto_payment(:verify, payload, requirements) do
     with {:ok, max_price} <- extract_max_price(payload, requirements),
-         {:ok, payment_value} <- extract_payment_value(payload) do
-      ensure_not_exceeds(payment_value, max_price)
+         {:ok, authorized_amount} <- extract_authorized_amount(payload) do
+      ensure_not_exceeds(authorized_amount, max_price)
+    end
+  end
+
+  defp validate_upto_payment(:settle, payload, requirements) do
+    case Utils.map_value(requirements, {"amount", :amount}) do
+      nil ->
+        validate_upto_payment(:verify, payload, requirements)
+
+      settlement_amount ->
+        with {:ok, settlement_amount} <- parse_settlement_amount(settlement_amount),
+             {:ok, authorized_amount} <- extract_authorized_amount(payload) do
+          ensure_settlement_not_exceeds_authorized(settlement_amount, authorized_amount)
+        end
     end
   end
 
   defp extract_max_price(payload, requirements) do
     value =
       Utils.first_present([
+        Utils.map_value(requirements, {"amount", :amount}),
         Utils.map_value(requirements, {"maxPrice", :maxPrice}),
         Utils.map_value(requirements, {"maxAmountRequired", :maxAmountRequired}),
+        Utils.nested_map_value(payload, [{"accepted", :accepted}, {"amount", :amount}]),
         Utils.map_value(payload, {"maxPrice", :maxPrice}),
         Utils.map_value(payload, {"maxAmountRequired", :maxAmountRequired})
       ])
@@ -406,9 +428,22 @@ defmodule X402.Facilitator do
     end
   end
 
-  defp extract_payment_value(payload) do
+  defp extract_authorized_amount(payload) do
     value =
       Utils.first_present([
+        Utils.nested_map_value(payload, [
+          {"payload", :payload},
+          {"permit2Authorization", :permit2Authorization},
+          {"permitted", :permitted},
+          {"amount", :amount}
+        ]),
+        Utils.nested_map_value(payload, [
+          {"permit2Authorization", :permit2Authorization},
+          {"permitted", :permitted},
+          {"amount", :amount}
+        ]),
+        Utils.nested_map_value(payload, [{"payload", :payload}, {"maxAmount", :maxAmount}]),
+        Utils.map_value(payload, {"maxAmount", :maxAmount}),
         Utils.map_value(payload, {"value", :value}),
         Utils.nested_map_value(payload, [{"payload", :payload}, {"value", :value}]),
         Utils.nested_map_value(payload, [
@@ -431,10 +466,27 @@ defmodule X402.Facilitator do
     end
   end
 
+  defp parse_settlement_amount(value) do
+    case Utils.parse_decimal(value) do
+      {:ok, parsed} -> {:ok, parsed}
+      :error -> {:error, {:invalid_upto_payment, :invalid_settlement_amount}}
+    end
+  end
+
   defp ensure_not_exceeds(payment_value, max_price) do
     case Utils.compare_decimal(payment_value, max_price) do
       :gt -> {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
       _comparison -> :ok
+    end
+  end
+
+  defp ensure_settlement_not_exceeds_authorized(settlement_amount, authorized_amount) do
+    case Utils.compare_decimal(settlement_amount, authorized_amount) do
+      :gt ->
+        {:error, {:invalid_upto_payment, :settlement_amount_exceeds_authorized_amount}}
+
+      _comparison ->
+        :ok
     end
   end
 

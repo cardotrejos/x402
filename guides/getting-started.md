@@ -1,74 +1,61 @@
 # Getting Started
 
-This guide walks you through adding x402 payments to an Elixir application.
+This guide adds an x402 v2 payment gate to an Elixir application.
 
-## Installation
-
-Add `x402` and a HTTP client to your dependencies:
+## Install the integrations you use
 
 ```elixir
 def deps do
   [
-    {:x402, "~> 0.1"},
-    {:finch, "~> 0.19"}
+    {:x402, "~> 0.4"},
+    {:finch, "~> 0.19"},
+    {:plug, "~> 1.14"}
   ]
 end
 ```
 
-## Start the Facilitator Client
+Finch and Plug are optional library dependencies, so applications must include
+them when using the facilitator client or `X402.Plug.PaymentGate`.
 
-Add the facilitator to your application's supervision tree:
+## Start the payment processes
+
+Add Finch, the facilitator client, and an idempotency cache to the application
+supervision tree:
 
 ```elixir
-# lib/my_app/application.ex
 children = [
-  {Finch, name: MyApp.Finch},
+  {Finch,
+   name: MyApp.Finch,
+   pools: %{default: X402.Facilitator.HTTP.secure_pool_opts()}},
   {X402.Facilitator,
-    name: MyApp.X402,
-    url: "https://x402.org/facilitator",
-    finch: MyApp.Finch}
+   name: MyApp.Facilitator,
+   url: "https://facilitator.example.com",
+   finch: MyApp.Finch},
+  {X402.Extensions.PaymentIdentifier.ETSCache, name: MyApp.PaymentCache}
 ]
 ```
 
-## Verify a Payment
+Replace the example URL with the HTTPS endpoint for your facilitator.
+
+## Add the Plug
 
 ```elixir
-payment_payload = %{
-  "transactionHash" => "0xabc...",
-  "network" => "eip155:8453",
-  "scheme" => "exact",
-  "payerWallet" => "0x1234..."
-}
-
-requirements = %{
-  "scheme" => "exact",
-  "network" => "eip155:8453",
-  "price" => "0.01",
-  "payTo" => "0xYourWallet"
-}
-
-case X402.Facilitator.verify(MyApp.X402, payment_payload, requirements) do
-  {:ok, %{status: 200}} -> IO.puts("Payment verified!")
-  {:error, reason} -> IO.inspect(reason, label: "Verification failed")
-end
-```
-
-## Use the Plug Middleware
-
-For the simplest integration, use the Plug middleware in your Phoenix router:
-
-```elixir
-# lib/my_app_web/router.ex
 pipeline :paid_api do
   plug X402.Plug.PaymentGate,
-    facilitator_url: "https://x402.org/facilitator",
-    routes: %{
-      "GET /api/data" => %{
-        price: "0.01",
+    facilitator: MyApp.Facilitator,
+    payment_identifier_cache: MyApp.PaymentCache,
+    routes: [
+      %{
+        method: :get,
+        path: "/api/data",
+        scheme: "exact",
+        price: "10000",
         network: "eip155:8453",
-        pay_to: "0xYourWallet"
+        asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        pay_to: "0xYourWalletAddress",
+        description: "Premium data"
       }
-    }
+    ]
 end
 
 scope "/api" do
@@ -77,6 +64,39 @@ scope "/api" do
 end
 ```
 
-Unpaid requests receive a `402 Payment Required` response with the pricing details
-encoded in the `PAYMENT-REQUIRED` header. Clients that include a valid
-`PAYMENT-SIGNATURE` header are passed through to your controller.
+`price` is a string containing atomic token units. For a six-decimal asset,
+`"10000"` represents `0.01` tokens.
+
+An unpaid request receives HTTP 402 with a Base64-encoded v2
+`PAYMENT-REQUIRED` header. For a paid request, the Plug:
+
+1. Validates the v2 payload, complete accepted requirement, and extension echo.
+2. Calls the facilitator's `/verify` endpoint.
+3. Assigns the payload and matched requirements, then runs the protected handler.
+4. Skips settlement when the handler response is an error.
+5. Otherwise calls `/settle` immediately before sending the response and adds
+   `PAYMENT-RESPONSE`.
+
+The handler can read `conn.assigns.x402_payment_payload` and
+`conn.assigns.x402_payment_requirements` after verification.
+
+## Meter an `"upto"` request
+
+Set `scheme: "upto"` and advertise the maximum amount with `price`. The handler
+must put the actual charge on the connection before returning its response:
+
+```elixir
+def create(conn, params) do
+  result = generate(params)
+
+  {:ok, conn} =
+    X402.Plug.PaymentGate.put_settlement_amount(conn, billable_atomic_units(result))
+
+  json(conn, %{result: result})
+end
+```
+
+The actual amount may be zero but cannot exceed the advertised maximum. Omitting
+it settles the maximum. See the
+[Plug/Phoenix Integration](plug-integration.html) guide for route, hook, and
+error details.
