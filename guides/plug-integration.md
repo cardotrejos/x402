@@ -30,7 +30,7 @@ plug X402.Plug.PaymentGate,
     %{
       method: :get,
       path: "/api/data",
-      price: "0.01",
+      price: "10000",
       network: "eip155:8453",
       asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       pay_to: "0xYourWalletAddress"
@@ -61,6 +61,12 @@ plug X402.Plug.PaymentGate,
 
 When `:accepts` is empty (the default), a single payment option is built from
 the top-level `:scheme`, `:price`, `:network`, `:asset`, and `:pay_to` fields.
+Amounts are strings in atomic token units; for six-decimal USDC, `"10000"`
+represents `0.01` USDC.
+
+The Plug currently implements the post-handler `authorization` flow. It rejects
+requirements whose `extra.paymentFlow` is `"upfront"` or `"escrow"` because
+those flows require different handler and cancellation semantics.
 
 ### Multiple Accepts
 
@@ -74,14 +80,14 @@ amounts), use the `:accepts` list:
   accepts: [
     %{
       scheme: "exact",
-      price: "0.01",
+      price: "10000",
       network: "eip155:8453",
       asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       pay_to: "0xYourWallet"
     },
     %{
       scheme: "exact",
-      price: "0.005",
+      price: "5000",
       network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
       asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       pay_to: "YourSolanaAddress"
@@ -90,8 +96,33 @@ amounts), use the `:accepts` list:
 }
 ```
 
-The client's `PaymentPayload.accepted` is matched against the server's
-`accepts` by equality on `scheme`, `network`, `amount`, `asset`, and `payTo`.
+The client's `PaymentPayload.accepted` is matched against the complete
+server-advertised requirement. Every core field, including
+`maxTimeoutSeconds`, must be equal. Client metadata may be added under
+`accepted.extra`, but it cannot remove or mutate fields advertised by the
+server. Echoed protocol extensions are validated with the same fail-closed
+rule.
+
+### Metered `"upto"` settlement
+
+For an `"upto"` option, `price` is the maximum authorization. The maximum is
+sent to `/verify`; the protected handler can set the actual charge before
+returning its response:
+
+```elixir
+def create(conn, params) do
+  result = generate(params)
+
+  {:ok, conn} =
+    X402.Plug.PaymentGate.put_settlement_amount(conn, billable_atomic_units(result))
+
+  json(conn, %{result: result})
+end
+```
+
+The amount may be a non-negative integer or a digit-only string. It is written
+to `PaymentRequirements.amount` for `/settle` and must not exceed the
+advertised maximum. The maximum is settled when no override is supplied.
 
 ## Lifecycle Hooks
 
@@ -104,29 +135,29 @@ defmodule MyApp.PaymentHooks do
 
   @impl true
   def before_verify(context, _metadata) do
-    IO.inspect(context.payment, label: "Incoming payment")
-    {:ok, context}
+    IO.inspect(context.payload, label: "Incoming payment")
+    {:cont, context}
   end
 
   @impl true
   def after_verify(context, _metadata) do
-    {:ok, context}
+    {:cont, context}
   end
 
   @impl true
   def after_settle(context, _metadata) do
     # Post-settlement: update DB, send receipt, etc.
-    {:ok, context}
+    {:cont, context}
   end
 
   @impl true
-  def before_settle(context, _metadata), do: {:ok, context}
+  def before_settle(context, _metadata), do: {:cont, context}
 
   @impl true
-  def on_verify_failure(context, _metadata), do: {:ok, context}
+  def on_verify_failure(context, _metadata), do: {:cont, context}
 
   @impl true
-  def on_settle_failure(context, _metadata), do: {:ok, context}
+  def on_settle_failure(context, _metadata), do: {:cont, context}
 end
 ```
 
@@ -158,14 +189,15 @@ plug X402.Plug.PaymentGate,
   routes: [...]
 ```
 
-The plug performs an atomic `put_new` claim on the payment proof hash before
-settlement. If the claim fails (duplicate), the request is rejected with
-`"payment already processed"`.
+The Plug performs an atomic `put_new` claim on the payment proof hash after
+verification and before the handler. A handler error or failed settlement
+releases the claim; a successful settlement retains it. If the claim fails
+(duplicate), the request is rejected with `"payment already processed"`.
 
 ## Conn Assigns
 
-After successful verification and settlement, the plug assigns these to the
-connection:
+After successful verification, the Plug assigns these to the connection before
+the protected handler runs:
 
 | Assign | Value |
 |--------|-------|
@@ -188,8 +220,10 @@ end
 
 ## Payment Response
 
-On successful settlement, a `PAYMENT-RESPONSE` header is attached to the
-response. On settlement failure, the response includes both
+Settlement runs in a `before_send` callback only when the protected handler has
+produced a response below HTTP 400. On successful settlement, a
+`PAYMENT-RESPONSE` header is attached to the response. On payment failure, the
+response includes both
 `PAYMENT-REQUIRED` (so the client can retry) and `PAYMENT-RESPONSE` (with
 the error reason).
 
@@ -201,6 +235,7 @@ The plug follows the x402 v2 HTTP transport status mapping:
 |--------|------|
 | **402** | Payment required (no `PAYMENT-SIGNATURE` header), no matching requirements, or payment verification/settlement failed |
 | **400** | Malformed `PAYMENT-SIGNATURE` header, invalid Base64, invalid JSON, payload too large, or wrong `x402Version` |
+| **500** | Facilitator transport failure, malformed facilitator response, invalid server-provided settlement amount, or response-encoding failure |
 
 ## Telemetry Events
 
@@ -231,7 +266,7 @@ defmodule MyAppWeb.Router do
         %{
           method: :get,
           path: "/api/weather",
-          price: "0.005",
+          price: "5000",
           network: "eip155:8453",
           asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
           pay_to: "0xYourWalletAddress",
@@ -240,7 +275,7 @@ defmodule MyAppWeb.Router do
         %{
           method: :post,
           path: "/api/generate",
-          price: "0.05",
+          price: "50000",
           network: "eip155:8453",
           asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
           pay_to: "0xYourWalletAddress",
@@ -252,14 +287,14 @@ defmodule MyAppWeb.Router do
           accepts: [
             %{
               scheme: "exact",
-              price: "0.01",
+              price: "10000",
               network: "eip155:8453",
               asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
               pay_to: "0xYourWalletAddress"
             },
             %{
               scheme: "upto",
-              price: "1.00",
+              price: "1000000",
               network: "eip155:8453",
               asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
               pay_to: "0xYourWalletAddress"

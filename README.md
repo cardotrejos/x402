@@ -4,59 +4,72 @@
 [![Downloads](https://img.shields.io/hexpm/dt/x402.svg)](https://hex.pm/packages/x402)
 [![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/x402)
 [![CI](https://github.com/cardotrejos/x402/actions/workflows/ci.yml/badge.svg)](https://github.com/cardotrejos/x402/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-89%25-green.svg)](https://github.com/cardotrejos/x402)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**The Elixir SDK for the [x402](https://x402.org) HTTP payment protocol.**
+The Elixir SDK for the [x402](https://x402.org) HTTP payment protocol.
 
-x402 is an open standard for internet-native payments built around the HTTP `402 Payment Required` status code. This library provides everything you need to accept or make x402 payments in Elixir.
+X402 is a library, not an application. It provides protocol headers, a facilitator
+client, and optional Plug middleware without tying an application to a specific
+facilitator, chain, or web framework.
 
 ## Features
 
-- **Protocol primitives** — encode/decode `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, and `PAYMENT-RESPONSE` headers
-- **Facilitator client** — verify and settle payments via any x402 facilitator
-- **Plug middleware** — drop-in payment gate for Phoenix and Plug apps
-- **Lifecycle hooks** — before/after/failure callbacks for verify & settle flows
-- **Payment identifier** — idempotency extension with pluggable cache
-- **"upto" scheme** — max-price bidding for flexible payments
-- **SIWX (Sign-In-With-X)** — wallet-authenticated repeat access without repayment
-- **Wallet validation** — EVM (Ethereum, Base, Polygon) and Solana address validation
-- **Zero lock-in** — works with any facilitator, any chain, any framework
-- **Fully typed** — comprehensive typespecs and Dialyzer-clean
+- x402 v2 `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, and `PAYMENT-RESPONSE` headers
+- Complete v2 payment-requirement and extension-echo validation
+- Facilitator `/verify` and `/settle` client with retries, hooks, and telemetry
+- Plug/Phoenix payment gate that settles only after successful resource handling
+- `"exact"` and metered `"upto"` authorization flows
+- Optional payment-identifier idempotency cache and SIWX support
+- EVM and Solana wallet validation
+- Optional Finch, Plug, and cryptography dependencies
 
 ## Installation
 
-Add `x402` to your list of dependencies in `mix.exs`:
+Add the library and only the optional integrations your application uses:
 
 ```elixir
 def deps do
   [
-    {:x402, "~> 0.3"},
-    {:finch, "~> 0.19"},        # HTTP client (required for facilitator calls)
-    {:ex_secp256k1, "~> 0.8"},  # Only if using SIWX signature verification
-    {:ex_keccak, "~> 0.7"}      # Only if using SIWX signature verification
+    {:x402, "~> 0.4"},
+    {:finch, "~> 0.19"}, # facilitator HTTP calls
+    {:plug, "~> 1.14"}   # PaymentGate
   ]
 end
 ```
 
-> `finch`, `ex_secp256k1`, and `ex_keccak` are optional. Only add what you need.
+Add `ex_secp256k1` and `ex_keccak` only when using the default EVM SIWX
+signature verifier.
 
-## Quick Start
+## Phoenix quick start
 
-### Accept payments in Phoenix
-
-Route specification according to V2 specification of x402.
-See https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md
+Start Finch, the facilitator client, and the idempotency cache in your
+application supervision tree:
 
 ```elixir
-# In your router or endpoint
+children = [
+  {Finch,
+   name: MyApp.Finch,
+   pools: %{default: X402.Facilitator.HTTP.secure_pool_opts()}},
+  {X402.Facilitator,
+   name: MyApp.Facilitator,
+   url: "https://facilitator.example.com",
+   finch: MyApp.Finch},
+  {X402.Extensions.PaymentIdentifier.ETSCache, name: MyApp.PaymentCache}
+]
+```
+
+Configure the Plug with the facilitator process, not a URL:
+
+```elixir
 plug X402.Plug.PaymentGate,
-  facilitator_url: "https://x402-facilitator-app.fly.dev",
+  facilitator: MyApp.Facilitator,
+  payment_identifier_cache: MyApp.PaymentCache,
   routes: [
     %{
       method: :get,
       path: "/api/weather",
-      price: "0.005",
+      scheme: "exact",
+      price: "10000", # atomic units: 0.01 USDC when the asset has 6 decimals
       network: "eip155:8453",
       asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       pay_to: "0xYourWalletAddress",
@@ -65,9 +78,61 @@ plug X402.Plug.PaymentGate,
   ]
 ```
 
-That's it. Requests without payment get a `402` response with payment instructions. Requests with a valid `PAYMENT-SIGNATURE` header are verified and passed through.
+An unpaid request receives HTTP 402 and a Base64-encoded v2
+`PAYMENT-REQUIRED` header. A paid request is decoded and matched against the
+complete advertised requirement, verified, passed to the protected handler,
+and settled immediately before a successful response is sent. Handler responses
+with status 400 or greater are not settled.
 
-### With lifecycle hooks
+The verified payload and matched requirement are available to the handler as
+`conn.assigns.x402_payment_payload` and
+`conn.assigns.x402_payment_requirements`.
+
+## Metered `"upto"` payments
+
+For an `"upto"` route, `price` is the maximum authorization in atomic token
+units:
+
+```elixir
+%{
+  method: :post,
+  path: "/api/generate",
+  scheme: "upto",
+  price: "1000000", # authorize up to 1 USDC for a 6-decimal asset
+  network: "eip155:8453",
+  asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  pay_to: "0xYourWalletAddress"
+}
+```
+
+After measuring resource use, store the actual amount on the connection before
+building the response:
+
+```elixir
+def create(conn, params) do
+  result = generate(params)
+  actual_atomic_amount = billable_amount(result)
+
+  {:ok, conn} =
+    X402.Plug.PaymentGate.put_settlement_amount(conn, actual_atomic_amount)
+
+  json(conn, %{result: result})
+end
+```
+
+The facilitator receives the advertised maximum during `/verify` and the actual
+amount during `/settle`. An amount above the authorized maximum fails closed.
+If no actual amount is supplied, the advertised maximum is settled.
+
+This release implements the post-handler `authorization` flow used by current
+EVM `exact` and `upto` schemes. Route options declaring `paymentFlow: "upfront"`
+or `paymentFlow: "escrow"` are rejected because those flows require different
+handler and cancellation semantics.
+
+## Lifecycle hooks
+
+Hooks receive an `X402.Hooks.Context` and must use the return contract defined by
+`X402.Hooks`:
 
 ```elixir
 defmodule MyApp.PaymentHooks do
@@ -75,219 +140,103 @@ defmodule MyApp.PaymentHooks do
 
   @impl true
   def before_verify(context, _metadata) do
-    IO.inspect(context.payment, label: "Incoming payment")
-    {:ok, context}
+    IO.inspect(context.payload, label: "Incoming payment")
+    {:cont, context}
   end
 
   @impl true
-  def after_verify(context, _metadata) do
-    # Log successful verification, trigger webhooks, etc.
-    {:ok, context}
-  end
+  def after_verify(context, _metadata), do: {:cont, context}
 
   @impl true
-  def after_settle(context, _metadata) do
-    # Post-settlement logic: update DB, send receipt
-    {:ok, context}
-  end
+  def on_verify_failure(context, _metadata), do: {:cont, context}
 
   @impl true
-  def on_verify_failure(context, _metadata), do: {:ok, context}
+  def before_settle(context, _metadata), do: {:cont, context}
 
   @impl true
-  def before_settle(context, _metadata), do: {:ok, context}
+  def after_settle(context, _metadata), do: {:cont, context}
 
   @impl true
-  def on_settle_failure(context, _metadata), do: {:ok, context}
+  def on_settle_failure(context, _metadata), do: {:cont, context}
 end
+```
 
-# Use in PaymentGate
-plug X402.Plug.PaymentGate,
-  facilitator_url: "https://x402-facilitator-app.fly.dev",
-  hooks: MyApp.PaymentHooks,
-  routes: [
+Pass the module with `hooks: MyApp.PaymentHooks`. Before hooks may return
+`{:halt, reason}`; failure hooks may return `{:recover, result}`.
+
+## Multiple payment options
+
+Use `accepts` to advertise more than one valid requirement:
+
+```elixir
+%{
+  method: :get,
+  path: "/api/data",
+  accepts: [
     %{
-      method: :get,
-      path: "/api/data",
-      price: "0.01",
+      scheme: "exact",
+      price: "10000",
       network: "eip155:8453",
       asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       pay_to: "0xYourWalletAddress"
-    }
-  ]
-```
-
-### "upto" scheme — flexible pricing
-
-```elixir
-# Server: accept up to a max price (agent bids what they're willing to pay)
-plug X402.Plug.PaymentGate,
-  facilitator_url: "https://x402-facilitator-app.fly.dev",
-  routes: [
+    },
     %{
-      method: :get,
-      path: "/api/premium",
-      scheme: "upto",
-      price: "1.00",
-      network: "eip155:8453",
-      asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-      pay_to: "0xYourWalletAddress",
-      description: "Premium data — pay what you want up to $1"
+      scheme: "exact",
+      price: "5000",
+      network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+      asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      pay_to: "YourSolanaAddress"
     }
   ]
-
-# Encode/decode upto payment requirements
-{:ok, header} = X402.PaymentRequired.encode(%{
-  accepts: [%{
-    scheme: "upto",
-    network: "eip155:8453",
-    maxPrice: "1.00",
-    pay_to: "0xYourWallet"
-  }],
-  description: "Pay up to $1"
-})
+}
 ```
 
-### Payment identifier — idempotency
+Every core field must match exactly. Client-added metadata is allowed only
+under `accepted.extra` and cannot remove or mutate values advertised by the
+server.
 
-Prevent duplicate payments by attaching unique payment IDs:
+## Facilitator API
+
+The lower-level client can be called directly:
 
 ```elixir
-# Start the ETS cache in your supervision tree
-children = [
-  {X402.Extensions.PaymentIdentifier.ETSCache, []}
-]
+case X402.Facilitator.verify(
+       MyApp.Facilitator,
+       payment_payload,
+       payment_requirements
+     ) do
+  {:ok, %{status: 200, body: %{"isValid" => true} = result}} ->
+    {:ok, result}
 
-# Encode a payment ID into a payload
-{:ok, encoded} = X402.Extensions.PaymentIdentifier.encode("pay-abc-123")
+  {:ok, %{status: 200, body: %{"isValid" => false} = result}} ->
+    {:error, result}
 
-# Decode it back
-{:ok, payment_id} = X402.Extensions.PaymentIdentifier.decode(encoded)
-#=> {:ok, "pay-abc-123"}
-
-# Check/store in cache for deduplication
-:ok = X402.Extensions.PaymentIdentifier.ETSCache.put("pay-abc-123")
-{:ok, true} = X402.Extensions.PaymentIdentifier.ETSCache.exists?("pay-abc-123")
+  {:error, reason} ->
+    {:error, reason}
+end
 ```
 
-### SIWX — Sign-In-With-X (repeat access)
+Facilitator requests use the v2 wire object:
+`%{"x402Version" => 2, "paymentPayload" => payload,
+"paymentRequirements" => requirements}`.
 
-Let paying users prove wallet ownership to access content again without repaying:
+## HTTP outcomes
 
-```elixir
-# 1. Build a SIWX challenge message (CAIP-122 / EIP-4361)
-message = X402.Extensions.SIWX.build_message(%{
-  domain: "api.example.com",
-  address: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
-  uri: "https://api.example.com/premium",
-  chain_id: 8453,
-  nonce: X402.Extensions.SIWX.generate_nonce(),
-  statement: "Sign in to access premium content"
-})
+`X402.Plug.PaymentGate` follows the v2 HTTP transport mapping:
 
-# 2. Verify the wallet's signature (EVM)
-{:ok, true} = X402.Extensions.SIWX.Verifier.Default.verify_signature(
-  message,
-  signature_hex,
-  "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-)
-
-# 3. Store access record with TTL
-{:ok, _pid} = X402.Extensions.SIWX.ETSStorage.start_link([])
-
-:ok = X402.Extensions.SIWX.ETSStorage.put(
-  "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
-  "/premium",
-  %{tx: "0xabc..."},
-  :timer.hours(24)  # 24-hour access
-)
-
-# 4. Check if wallet has valid access
-{:ok, record} = X402.Extensions.SIWX.ETSStorage.get(
-  "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
-  "/premium"
-)
-```
-
-### Encode/decode headers manually
-
-```elixir
-# Build a PAYMENT-REQUIRED response
-{:ok, header} = X402.PaymentRequired.encode(%{
-  accepts: [%{
-    scheme: "exact",
-    network: "eip155:8453",
-    price: "0.01",
-    pay_to: "0xYourWallet"
-  }],
-  description: "Premium API access"
-})
-
-# Decode an incoming PAYMENT-SIGNATURE
-{:ok, payload} = X402.PaymentSignature.decode(signature_header)
-
-# Verify payment via facilitator
-{:ok, result} = X402.Facilitator.verify(payload, requirements)
-```
-
-### Verify payments programmatically
-
-```elixir
-# Start the facilitator client in your supervision tree
-children = [
-  {Finch, name: MyApp.Finch},
-  {X402.Facilitator, name: MyApp.Facilitator, finch: MyApp.Finch}
-]
-
-# Then verify payments
-{:ok, %{status: 200}} = X402.Facilitator.verify(
-  MyApp.Facilitator,
-  payment_payload,
-  payment_requirements
-)
-```
-
-## Architecture
-
-```
-┌─────────────┐     ┌──────────────────────┐     ┌──────────────┐
-│  AI Agent    │────▶│  Your API + x402     │────▶│  Facilitator │
-│  (payer)     │◀────│  PaymentGate Plug    │◀────│  (verify/    │
-└─────────────┘     │                      │     │   settle)    │
-                    │  ┌──────────────┐    │     └──────────────┘
-                    │  │ Hooks        │    │
-                    │  │ PaymentID    │    │
-                    │  │ SIWX Storage │    │
-                    │  └──────────────┘    │
-                    └──────────────────────┘
-```
+| Status | Meaning |
+|--------|---------|
+| 400 | Malformed or invalid payment input |
+| 402 | Payment required, unmatched terms, or verification/settlement failure |
+| 500 | Facilitator transport failure, malformed facilitator response, or internal payment-processing error |
 
 ## Documentation
-
-Full documentation is available at [HexDocs](https://hexdocs.pm/x402).
 
 - [Getting Started](https://hexdocs.pm/x402/getting-started.html)
 - [Plug/Phoenix Integration](https://hexdocs.pm/x402/plug-integration.html)
 - [API Reference](https://hexdocs.pm/x402/api-reference.html)
-
-## x402 Protocol
-
-x402 is an open standard by [Coinbase](https://coinbase.com) for HTTP-native payments:
-
-1. Client requests a paid resource
-2. Server returns `402 Payment Required` with pricing info
-3. Client pays (USDC on Base, Solana, etc.)
-4. Client retries with `PAYMENT-SIGNATURE` header
-5. Server verifies via facilitator and serves the resource
-
-Learn more at [x402.org](https://x402.org) and [docs.x402.org](https://docs.x402.org).
-
-## Related
-
-- [`x402_proxy`](https://github.com/cardotrejos/x402_proxy) — reverse proxy that adds x402 payment gating to any API
-- [`x402_facilitator`](https://github.com/cardotrejos/x402_facilitator) — x402 facilitator + payment gateway ([live](https://x402-facilitator-app.fly.dev))
-- [x402 TypeScript SDK](https://github.com/coinbase/x402) — official Coinbase SDK
-- [x402 Python SDK](https://pypi.org/project/x402/) — Python implementation
+- [Official x402 v2 specification](https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md)
+- [Official HTTP transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/http.md)
 
 ## License
 

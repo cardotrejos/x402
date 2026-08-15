@@ -2,15 +2,16 @@ defmodule X402.PaymentSignature do
   @moduledoc """
   Decodes and validates x402 `PAYMENT-SIGNATURE` header values.
 
-  The header value is Base64-encoded JSON. After decoding, this module validates
-  the required x402 signature fields:
+  The header value is Base64-encoded JSON. This module supports both the legacy
+  v1 signature fields and the v2 `PaymentPayload` envelope.
 
-  - `"transactionHash"`
-  - `"network"`
-  - `"scheme"`
-  - `"payerWallet"`
+  For v2, `accepted` must be a complete `X402.PaymentRequirements` object and
+  `payload` must contain the scheme-specific signed data. When requirements are
+  passed to `validate/2`, every core field is matched and advertised `extra`
+  values must be preserved.
   """
 
+  alias X402.PaymentRequirements
   alias X402.Telemetry
   alias X402.Utils
 
@@ -43,7 +44,11 @@ defmodule X402.PaymentSignature do
 
   @type validate_error ::
           :invalid_payload
+          | :invalid_payment_requirements
+          | :invalid_x402_version
+          | :no_matching_requirements
           | {:missing_fields, [String.t()]}
+          | {:invalid_fields, [String.t()]}
           | {:invalid_upto_payment, upto_validation_error()}
           | {:invalid_format, [{field :: String.t(), reason :: atom()}]}
 
@@ -67,7 +72,7 @@ defmodule X402.PaymentSignature do
 
   ## Examples
 
-      iex> payload = %{"transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "network" => "eip155:8453", "scheme" => "exact", "payerWallet" => "0x1111111111111111111111111111111111111111"}
+      iex> payload = %{"x402Version" => 2, "accepted" => %{"scheme" => "exact"}, "payload" => %{}}
       iex> value = payload |> Jason.encode!() |> Base.encode64()
       iex> X402.PaymentSignature.decode(value)
       {:ok, payload}
@@ -134,24 +139,35 @@ defmodule X402.PaymentSignature do
 
   @doc since: "0.1.0", group: :verification
   @doc """
-  Validates that all required signature fields are present and non-empty.
+  Validates a decoded v1 or v2 `PAYMENT-SIGNATURE` payload.
+
+  Payloads with `x402Version: 2` are validated against the v2
+  `PaymentPayload` structure. Payloads with version `1`, or without an explicit
+  version, retain the legacy field validation used by x402 v1.
 
   ## Examples
 
       iex> payload = %{
-      ...>   "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      ...>   "network" => "eip155:8453",
-      ...>   "scheme" => "exact",
-      ...>   "payerWallet" => "0x1111111111111111111111111111111111111111"
+      ...>   "x402Version" => 2,
+      ...>   "accepted" => %{
+      ...>     "scheme" => "exact",
+      ...>     "network" => "eip155:8453",
+      ...>     "amount" => "10000",
+      ...>     "asset" => "0xasset",
+      ...>     "payTo" => "0xreceiver",
+      ...>     "maxTimeoutSeconds" => 60,
+      ...>     "extra" => %{}
+      ...>   },
+      ...>   "payload" => %{"signature" => "0xsignature"}
       ...> }
       iex> X402.PaymentSignature.validate(payload)
       {:ok, payload}
 
-      iex> X402.PaymentSignature.validate(%{"network" => "eip155:8453"})
-      {:error, {:missing_fields, ["payerWallet", "scheme", "transactionHash"]}}
+      iex> X402.PaymentSignature.validate(%{"x402Version" => 2})
+      {:error, :invalid_payload}
   """
   @spec validate(map()) :: {:ok, map()} | {:error, validate_error()}
-  def validate(payload) when is_map(payload), do: validate(payload, %{})
+  def validate(payload) when is_map(payload), do: do_validate(payload, %{})
 
   def validate(_payload) do
     Telemetry.emit(:payment_signature, :validate, :error, %{reason: :invalid_payload})
@@ -162,11 +178,30 @@ defmodule X402.PaymentSignature do
   @doc """
   Validates a decoded `PAYMENT-SIGNATURE` payload against payment requirements.
 
-  For the `"upto"` scheme, this ensures the payment value is less than or equal
-  to `maxPrice`.
+  For v2, this matches the complete `accepted` object. For the `"upto"` scheme,
+  it also ensures the signed maximum does not exceed the advertised `amount`.
   """
   @spec validate(map(), map()) :: {:ok, map()} | {:error, validate_error()}
   def validate(payload, requirements) when is_map(payload) and is_map(requirements) do
+    do_validate(payload, requirements)
+  end
+
+  def validate(_payload, _requirements) do
+    Telemetry.emit(:payment_signature, :validate, :error, %{reason: :invalid_payload})
+    {:error, :invalid_payload}
+  end
+
+  @spec do_validate(map(), map()) :: {:ok, map()} | {:error, validate_error()}
+  defp do_validate(payload, requirements) do
+    case Utils.map_value(payload, {"x402Version", :x402Version}) do
+      2 -> validate_v2(payload, requirements)
+      version when version in [nil, 1] -> validate_v1(payload, requirements)
+      _version -> validation_error(:invalid_x402_version)
+    end
+  end
+
+  @spec validate_v1(map(), map()) :: {:ok, map()} | {:error, validate_error()}
+  defp validate_v1(payload, requirements) do
     with :ok <- check_missing_fields(payload),
          :ok <- check_field_formats(payload) do
       case validate_scheme(payload, requirements) do
@@ -185,9 +220,53 @@ defmodule X402.PaymentSignature do
     end
   end
 
-  def validate(_payload, _requirements) do
-    Telemetry.emit(:payment_signature, :validate, :error, %{reason: :invalid_payload})
-    {:error, :invalid_payload}
+  @spec validate_v2(map(), map()) :: {:ok, map()} | {:error, validate_error()}
+  defp validate_v2(payload, requirements) do
+    accepted = Utils.map_value(payload, {"accepted", :accepted})
+    scheme_payload = Utils.map_value(payload, {"payload", :payload})
+    resource = Utils.map_value(payload, {"resource", :resource})
+    extensions = Utils.map_value(payload, {"extensions", :extensions})
+
+    with true <- is_map(accepted),
+         true <- is_map(scheme_payload),
+         true <- is_nil(resource) or is_map(resource),
+         true <- is_nil(extensions) or is_map(extensions),
+         :ok <- PaymentRequirements.validate(accepted),
+         :ok <- match_v2_requirements(requirements, accepted),
+         :ok <- validate_scheme(payload, effective_requirements(requirements, accepted)) do
+      validation_success(payload)
+    else
+      false -> validation_error(:invalid_payload)
+      {:error, reason} -> validation_error(reason)
+    end
+  end
+
+  @spec match_v2_requirements(map(), map()) :: :ok | {:error, :no_matching_requirements}
+  defp match_v2_requirements(requirements, _accepted) when map_size(requirements) == 0, do: :ok
+
+  defp match_v2_requirements(requirements, accepted) do
+    case PaymentRequirements.match?(requirements, accepted) do
+      true -> :ok
+      false -> {:error, :no_matching_requirements}
+    end
+  end
+
+  @spec effective_requirements(map(), map()) :: map()
+  defp effective_requirements(requirements, accepted) when map_size(requirements) == 0,
+    do: accepted
+
+  defp effective_requirements(requirements, _accepted), do: requirements
+
+  @spec validation_success(map()) :: {:ok, map()}
+  defp validation_success(payload) do
+    Telemetry.emit(:payment_signature, :validate, :ok, %{x402_version: 2})
+    {:ok, payload}
+  end
+
+  @spec validation_error(validate_error()) :: {:error, validate_error()}
+  defp validation_error(reason) do
+    Telemetry.emit(:payment_signature, :validate, :error, %{reason: reason})
+    {:error, reason}
   end
 
   defp check_missing_fields(payload) do
@@ -226,7 +305,7 @@ defmodule X402.PaymentSignature do
 
   ## Examples
 
-      iex> payload = %{"transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "network" => "eip155:8453", "scheme" => "exact", "payerWallet" => "0x1111111111111111111111111111111111111111"}
+      iex> payload = %{"x402Version" => 2, "accepted" => %{"scheme" => "exact", "network" => "eip155:8453", "amount" => "1", "asset" => "asset", "payTo" => "receiver", "maxTimeoutSeconds" => 60, "extra" => %{}}, "payload" => %{}}
       iex> value = payload |> Jason.encode!() |> Base.encode64()
       iex> X402.PaymentSignature.decode_and_validate(value)
       {:ok, payload}
@@ -332,7 +411,8 @@ defmodule X402.PaymentSignature do
   @spec effective_scheme(map(), map()) :: String.t() | atom() | nil
   defp effective_scheme(payload, requirements) do
     Utils.map_value(requirements, {"scheme", :scheme}) ||
-      Utils.map_value(payload, {"scheme", :scheme})
+      Utils.map_value(payload, {"scheme", :scheme}) ||
+      Utils.nested_map_value(payload, [{"accepted", :accepted}, {"scheme", :scheme}])
   end
 
   @spec extract_max_price(map(), map()) ::
@@ -341,8 +421,10 @@ defmodule X402.PaymentSignature do
   defp extract_max_price(payload, requirements) do
     value =
       Utils.first_present([
+        Utils.map_value(requirements, {"amount", :amount}),
         Utils.map_value(requirements, {"maxPrice", :maxPrice}),
         Utils.map_value(requirements, {"maxAmountRequired", :maxAmountRequired}),
+        Utils.nested_map_value(payload, [{"accepted", :accepted}, {"amount", :amount}]),
         Utils.map_value(payload, {"maxPrice", :maxPrice}),
         Utils.map_value(payload, {"maxAmountRequired", :maxAmountRequired})
       ])
@@ -365,6 +447,19 @@ defmodule X402.PaymentSignature do
   defp extract_payment_value(payload) do
     value =
       Utils.first_present([
+        Utils.nested_map_value(payload, [
+          {"payload", :payload},
+          {"permit2Authorization", :permit2Authorization},
+          {"permitted", :permitted},
+          {"amount", :amount}
+        ]),
+        Utils.nested_map_value(payload, [
+          {"permit2Authorization", :permit2Authorization},
+          {"permitted", :permitted},
+          {"amount", :amount}
+        ]),
+        Utils.nested_map_value(payload, [{"payload", :payload}, {"maxAmount", :maxAmount}]),
+        Utils.map_value(payload, {"maxAmount", :maxAmount}),
         Utils.map_value(payload, {"value", :value}),
         Utils.nested_map_value(payload, [{"payload", :payload}, {"value", :value}]),
         Utils.nested_map_value(payload, [

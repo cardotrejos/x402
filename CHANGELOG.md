@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-15
+
+### Added
+
+- x402 v2 `PaymentPayload` validation and complete `PaymentRequirements` matching
+- Extension-echo validation for server-advertised extension data
+- `X402.Plug.PaymentGate.put_settlement_amount/2` for metered `"upto"` routes
+- Multi-option `accepts` and v2 `ResourceInfo` support in `X402.Plug.PaymentGate`
+
+### Changed
+
+- `X402.Plug.PaymentGate` now verifies before the protected handler and settles only
+  after a successful handler response
+- Facilitator requests now use the v2 `{x402Version, paymentPayload,
+  paymentRequirements}` wire format
+- `"upto"` verification uses `PaymentRequirements.amount` as the authorized maximum;
+  settlement uses it as the actual atomic amount charged
+- Plug route prices and all documentation examples use atomic token units
+
+### Fixed
+
+- Fail closed when facilitator responses omit or mistype `isValid`, `success`,
+  `transaction`, or `network`
+- Preserve the full request URL, including its query string, in `ResourceInfo.url`
+- Reject partial or mutated accepted requirements instead of matching only five fields
+- Return HTTP 500 for facilitator transport failures and malformed facilitator responses
+  while retaining HTTP 400 for invalid input and HTTP 402 for payment failure
+- Reject unsupported `upfront` and `escrow` flows instead of applying unsafe
+  authorization-flow timing
+- Avoid creating atoms from untrusted string route keys
+- Compile cleanly without optional SIWX crypto dependencies and return
+  `:missing_dependency` when the default verifier cannot load them
+
+### Migration
+
+- Replace the removed Plug option `facilitator_url:` with a supervised
+  `X402.Facilitator` process and pass it via `facilitator:`.
+- Replace decimal display amounts such as `"0.01"` with atomic-unit strings such as
+  `"10000"` for six-decimal USDC.
+- Hook callbacks use `context.payload` / `context.requirements` and return
+  `{:cont, context}`, `{:halt, reason}`, or `{:recover, result}` as documented by
+  `X402.Hooks`.
+
 ## [0.3.3] - 2026-03-29
 
 ### Fixed

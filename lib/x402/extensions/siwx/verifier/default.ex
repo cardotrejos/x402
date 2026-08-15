@@ -17,7 +17,8 @@ defmodule X402.Extensions.SIWX.Verifier.Default do
   Verifies a SIWX signature for an EVM address.
 
   Returns `{:ok, true}` when the recovered signer address matches the provided
-  address (case-insensitive).
+  address (case-insensitive). Returns `{:error, :missing_dependency}` when the
+  optional `ex_secp256k1` or `ex_keccak` dependency is unavailable.
 
   ## Examples
 
@@ -31,10 +32,11 @@ defmodule X402.Extensions.SIWX.Verifier.Default do
       when is_binary(message) and is_binary(signature) and is_binary(address) do
     with :ok <- validate_address(address),
          {:ok, compact_signature, recovery_id} <- decode_signature(signature),
-         message_hash <- message_hash(message),
+         {:ok, secp256k1_module, keccak_module} <- crypto_modules(),
+         message_hash <- message_hash(message, keccak_module),
          {:ok, public_key} <-
-           ExSecp256k1.recover_compact(message_hash, compact_signature, recovery_id),
-         {:ok, recovered_address} <- public_key_to_address(public_key) do
+           secp256k1_module.recover_compact(message_hash, compact_signature, recovery_id),
+         {:ok, recovered_address} <- public_key_to_address(public_key, keccak_module) do
       {:ok, String.downcase(recovered_address) == String.downcase(address)}
     else
       {:error, :recovery_failure} -> {:ok, false}
@@ -86,24 +88,38 @@ defmodule X402.Extensions.SIWX.Verifier.Default do
 
   defp normalize_recovery_id(_recovery_id), do: {:error, :invalid_signature}
 
-  @spec message_hash(String.t()) :: binary()
-  defp message_hash(message) do
-    prefixed = @eth_sign_prefix <> Integer.to_string(byte_size(message)) <> message
-    ExKeccak.hash_256(prefixed)
+  @spec crypto_modules() :: {:ok, module(), module()} | {:error, :missing_dependency}
+  defp crypto_modules do
+    secp256k1_module = Module.concat(["ExSecp256k1"])
+    keccak_module = Module.concat(["ExKeccak"])
+
+    case Code.ensure_loaded?(secp256k1_module) and
+           function_exported?(secp256k1_module, :recover_compact, 3) and
+           Code.ensure_loaded?(keccak_module) and function_exported?(keccak_module, :hash_256, 1) do
+      true -> {:ok, secp256k1_module, keccak_module}
+      false -> {:error, :missing_dependency}
+    end
   end
 
-  @spec public_key_to_address(binary()) :: {:ok, String.t()} | {:error, :invalid_public_key}
-  defp public_key_to_address(<<4, public_key::binary-size(64)>>),
-    do: hashed_public_key_to_address(public_key)
+  @spec message_hash(String.t(), module()) :: binary()
+  defp message_hash(message, keccak_module) do
+    prefixed = @eth_sign_prefix <> Integer.to_string(byte_size(message)) <> message
+    keccak_module.hash_256(prefixed)
+  end
 
-  defp public_key_to_address(<<public_key::binary-size(64)>>),
-    do: hashed_public_key_to_address(public_key)
+  @spec public_key_to_address(binary(), module()) ::
+          {:ok, String.t()} | {:error, :invalid_public_key}
+  defp public_key_to_address(<<4, public_key::binary-size(64)>>, keccak_module),
+    do: hashed_public_key_to_address(public_key, keccak_module)
 
-  defp public_key_to_address(_public_key), do: {:error, :invalid_public_key}
+  defp public_key_to_address(<<public_key::binary-size(64)>>, keccak_module),
+    do: hashed_public_key_to_address(public_key, keccak_module)
 
-  @spec hashed_public_key_to_address(binary()) :: {:ok, String.t()}
-  defp hashed_public_key_to_address(public_key) do
-    hash = ExKeccak.hash_256(public_key)
+  defp public_key_to_address(_public_key, _keccak_module), do: {:error, :invalid_public_key}
+
+  @spec hashed_public_key_to_address(binary(), module()) :: {:ok, String.t()}
+  defp hashed_public_key_to_address(public_key, keccak_module) do
+    hash = keccak_module.hash_256(public_key)
     address = binary_part(hash, byte_size(hash) - 20, 20)
     {:ok, "0x" <> Base.encode16(address, case: :lower)}
   end

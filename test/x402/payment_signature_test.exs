@@ -5,6 +5,16 @@ defmodule X402.PaymentSignatureTest do
 
   alias X402.PaymentSignature
 
+  @v2_requirements %{
+    "scheme" => "upto",
+    "network" => "eip155:84532",
+    "amount" => "10000",
+    "asset" => "0xasset",
+    "payTo" => "0xreceiver",
+    "maxTimeoutSeconds" => 60,
+    "extra" => %{}
+  }
+
   describe "header_name/0" do
     test "returns PAYMENT-SIGNATURE" do
       assert PaymentSignature.header_name() == "PAYMENT-SIGNATURE"
@@ -102,6 +112,25 @@ defmodule X402.PaymentSignatureTest do
 
       assert PaymentSignature.validate(payload) == {:ok, payload}
     end
+
+    test "validates v2 payloads through the public API" do
+      payload = v2_payload("9000")
+
+      assert PaymentSignature.validate(payload) == {:ok, payload}
+    end
+
+    test "rejects unsupported explicit protocol versions" do
+      assert PaymentSignature.validate(%{"x402Version" => 3}) ==
+               {:error, :invalid_x402_version}
+    end
+
+    test "validates v2 accepted fields and optional object types" do
+      assert PaymentSignature.validate(put_in(v2_payload("9000"), ["accepted", "amount"], 9_000)) ==
+               {:error, {:invalid_fields, ["amount"]}}
+
+      assert PaymentSignature.validate(Map.put(v2_payload("9000"), "extensions", [])) ==
+               {:error, :invalid_payload}
+    end
   end
 
   describe "validate/2" do
@@ -159,6 +188,44 @@ defmodule X402.PaymentSignatureTest do
 
       assert PaymentSignature.validate(payload, :bad) == {:error, :invalid_payload}
     end
+
+    test "matches the complete v2 requirements object" do
+      payload = v2_payload("9000")
+
+      assert PaymentSignature.validate(payload, @v2_requirements) == {:ok, payload}
+
+      changed_timeout = put_in(payload, ["accepted", "maxTimeoutSeconds"], 30)
+
+      assert PaymentSignature.validate(changed_timeout, @v2_requirements) ==
+               {:error, :no_matching_requirements}
+    end
+
+    test "validates v2 upto value against accepted amount" do
+      assert PaymentSignature.validate(v2_payload("10001")) ==
+               {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
+    end
+
+    test "reads the authorized maximum from the v2 Permit2 payload" do
+      payload =
+        v2_payload("ignored")
+        |> put_in(
+          ["payload"],
+          %{
+            "signature" => "0xsignature",
+            "permit2Authorization" => %{
+              "permitted" => %{"token" => "0xasset", "amount" => "10000"}
+            }
+          }
+        )
+
+      assert PaymentSignature.validate(payload, @v2_requirements) == {:ok, payload}
+
+      oversized =
+        put_in(payload, ["payload", "permit2Authorization", "permitted", "amount"], "10001")
+
+      assert PaymentSignature.validate(oversized, @v2_requirements) ==
+               {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
+    end
   end
 
   describe "decode_and_validate/1" do
@@ -209,5 +276,17 @@ defmodule X402.PaymentSignatureTest do
       encoded = "payload"
       assert PaymentSignature.decode_and_validate(encoded, :invalid) == {:error, :invalid_payload}
     end
+  end
+
+  defp v2_payload(value) do
+    %{
+      "x402Version" => 2,
+      "accepted" => @v2_requirements,
+      "payload" => %{
+        "signature" => "0xsignature",
+        "authorization" => %{"value" => value}
+      },
+      "extensions" => %{}
+    }
   end
 end

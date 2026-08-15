@@ -8,18 +8,22 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     1. Requests without a `PAYMENT-SIGNATURE` header receive **402** with a
        Base64-encoded `PAYMENT-REQUIRED` header (`PaymentRequired` v2 schema).
     2. Requests with `PAYMENT-SIGNATURE` are decoded as `PaymentPayload` v2.
-    3. `PaymentPayload.accepted` is matched against the route's advertised
-       `accepts` (`scheme`, `network`, `amount`, `asset`, `payTo`).
-    4. Matched requirements are verified and settled via the facilitator.
-    5. Successful settlements attach a `PAYMENT-RESPONSE` header and assign
+    3. `PaymentPayload.accepted` and echoed extensions are matched against the
+       complete requirements advertised by the route.
+    4. Matched requirements are verified before the protected handler runs.
+    5. Successful handler responses are settled immediately before they are
+       sent. Successful settlements attach a `PAYMENT-RESPONSE` header and assign
        `:x402_payment_payload` / `:x402_payment_requirements` on the conn.
 
     HTTP status mapping (HTTP transport v2):
 
     - **402** — payment required, no matching requirements, or payment failed
     - **400** — malformed / invalid payment payload (including wrong `x402Version`)
+    - **500** — facilitator transport failures or malformed facilitator responses
 
-    See `docs/x402-specification-v2.md` and the
+    See the official
+    [x402 v2 specification](https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md)
+    and
     [HTTP transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/http.md).
     """
 
@@ -27,9 +31,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     alias X402.Extensions.PaymentIdentifier.ETSCache
     alias X402.Facilitator
+    alias X402.Facilitator.Error
     alias X402.Hooks
     alias X402.Hooks.Default
     alias X402.PaymentRequired
+    alias X402.PaymentRequirements
     alias X402.PaymentResponse
     alias X402.PaymentSignature
     alias X402.Utils
@@ -39,17 +45,21 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     import Plug.Conn,
       only: [
         assign: 3,
+        delete_resp_header: 2,
         get_req_header: 2,
         halt: 1,
         put_resp_content_type: 2,
         put_resp_header: 3,
-        send_resp: 3
+        register_before_send: 2,
+        resp: 3,
+        send_resp: 1
       ]
 
     @http_methods [:any, :delete, :get, :head, :options, :patch, :post, :put, :trace]
-    # TODO Implement batch-settlement scheme
     @route_schemes ["exact", "upto"]
     @x402_version 2
+    @supported_payment_flow "authorization"
+    @settlement_amount_private :x402_settlement_amount
     @default_max_timeout_seconds 60
     @default_description "Payment required"
     @default_mime_type "application/json"
@@ -71,7 +81,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         doc: "Payment scheme (`exact` or `upto`)."
       ],
       price: [
-        type: :string,
+        type: {:custom, __MODULE__, :validate_atomic_amount, []},
         required: true,
         doc: """
         Payment amount in atomic token units (PaymentRequirements `amount`).
@@ -132,7 +142,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         doc: "Single-option scheme (used when `:accepts` is empty)."
       ],
       price: [
-        type: :string,
+        type: {:custom, __MODULE__, :validate_atomic_amount, []},
         doc: "Single-option amount (required when `:accepts` is empty)."
       ],
       network: [
@@ -251,27 +261,44 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             extensions: map()
           }
 
+    @typedoc false
+    @type settlement_context :: %{
+            facilitator: Facilitator.server(),
+            hooks: module(),
+            payment_identifier_cache: ETSCache.server() | nil,
+            payment_id: String.t(),
+            payment_payload: map(),
+            requirements: map(),
+            route: compiled_route(),
+            request_method: atom(),
+            request_path: String.t()
+          }
+
     @doc false
     @spec validate_extra_map(term()) :: {:ok, map()} | {:error, String.t()}
     def validate_extra_map(value) when is_map(value), do: {:ok, value}
     def validate_extra_map(_value), do: {:error, "expected a map"}
 
     @doc false
+    @spec validate_atomic_amount(term()) :: {:ok, String.t()} | {:error, String.t()}
+    def validate_atomic_amount(value) when is_binary(value) do
+      case Regex.match?(~r/^\d+$/, value) do
+        true -> {:ok, value}
+        false -> {:error, "expected a digit-only atomic-unit amount"}
+      end
+    end
+
+    def validate_atomic_amount(_value), do: {:error, "expected a digit-only atomic-unit amount"}
+
+    @doc false
     @spec validate_route(term()) :: {:ok, map()} | {:error, String.t()}
     def validate_route(route) when is_map(route) do
-      keyword_route = map_to_keyword(route)
-
-      case NimbleOptions.validate(keyword_route, @route_schema) do
-        {:ok, validated} ->
-          validated_map = Map.new(validated)
-
-          case ensure_accepts_source(validated_map) do
-            :ok -> {:ok, validated_map}
-            {:error, message} -> {:error, message}
-          end
-
-        {:error, %NimbleOptions.ValidationError{} = error} ->
-          {:error, Exception.message(error)}
+      with {:ok, keyword_route} <- map_to_keyword(route),
+           {:ok, validated} <- validate_route_options(keyword_route),
+           validated_map = Map.new(validated),
+           :ok <- ensure_accepts_source(validated_map),
+           :ok <- ensure_supported_payment_flow(validated_map) do
+        {:ok, validated_map}
       end
     end
 
@@ -318,6 +345,35 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           |> Keyword.fetch!(:routes)
           |> Enum.map(&compile_route/1)
       }
+    end
+
+    @doc since: "0.4.0"
+    @doc """
+    Stores the actual atomic amount to settle for an `"upto"` route.
+
+    Call this from the protected handler after resource consumption is known.
+    When omitted, the route's advertised maximum is settled.
+
+    ## Examples
+
+        iex> conn = Plug.Test.conn(:get, "/paid")
+        iex> {:ok, conn} = X402.Plug.PaymentGate.put_settlement_amount(conn, "7500")
+        iex> conn.private[:x402_settlement_amount]
+        "7500"
+
+        iex> X402.Plug.PaymentGate.put_settlement_amount(Plug.Test.conn(:get, "/paid"), "1.5")
+        {:error, :invalid_settlement_amount}
+    """
+    @spec put_settlement_amount(Plug.Conn.t(), String.t() | non_neg_integer()) ::
+            {:ok, Plug.Conn.t()} | {:error, :invalid_settlement_amount}
+    def put_settlement_amount(%Plug.Conn{} = conn, amount) do
+      case normalize_atomic_amount(amount) do
+        {:ok, normalized} ->
+          {:ok, Plug.Conn.put_private(conn, @settlement_amount_private, normalized)}
+
+        :error ->
+          {:error, :invalid_settlement_amount}
+      end
     end
 
     @doc since: "0.1.0"
@@ -385,7 +441,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           )
 
         {:ok, header} ->
-          verify_and_settle(
+          verify_and_prepare_settlement(
             conn,
             facilitator,
             hooks,
@@ -415,7 +471,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec verify_and_settle(
+    @spec verify_and_prepare_settlement(
             Plug.Conn.t(),
             Facilitator.server(),
             module(),
@@ -425,7 +481,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             String.t(),
             String.t()
           ) :: Plug.Conn.t()
-    defp verify_and_settle(
+    defp verify_and_prepare_settlement(
            conn,
            facilitator,
            hooks,
@@ -439,45 +495,29 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       payment_id = :crypto.hash(:sha256, header) |> Base.encode16(case: :lower)
 
       with {:ok, payment_payload, requirements} <-
-             decode_and_validate_payment(header, accepts),
+             decode_and_validate_payment(header, accepts, route.extensions),
            {:ok, verify_response} <-
              facilitator_verify(facilitator, payment_payload, requirements, hooks),
            :ok <- ensure_verify_success(verify_response),
            :ok <- claim_payment(payment_identifier_cache, payment_id) do
-        settle_result = settle_with_hooks(facilitator, payment_payload, requirements, hooks)
+        settlement_context = %{
+          facilitator: facilitator,
+          hooks: hooks,
+          payment_identifier_cache: payment_identifier_cache,
+          payment_id: payment_id,
+          payment_payload: payment_payload,
+          requirements: requirements,
+          route: route,
+          request_method: request_method,
+          request_path: request_path
+        }
 
-        case settle_result do
-          {:ok, settle_response} ->
-            emit(:payment_verified, %{
-              method: request_method,
-              path: request_path,
-              route: route.path
-            })
-
-            conn
-            |> assign(:x402_payment_payload, payment_payload)
-            |> assign(:x402_payment_requirements, requirements)
-            |> put_payment_response_header(settle_response.body)
-
-          {:error, reason, settle_body} ->
-            release_claim(payment_identifier_cache, payment_id)
-
-            emit(:payment_rejected, %{
-              method: request_method,
-              path: request_path,
-              route: route.path,
-              reason: reason
-            })
-
-            payment_error_response(
-              conn,
-              route,
-              request_path,
-              rejection_error(reason),
-              status: status_for_reason(reason),
-              reason: settle_body || reason
-            )
-        end
+        conn
+        |> assign(:x402_payment_payload, payment_payload)
+        |> assign(:x402_payment_requirements, requirements)
+        |> register_before_send(fn response_conn ->
+          settle_after_resource(response_conn, settlement_context)
+        end)
       else
         {:error, reason} ->
           emit(:payment_rejected, %{
@@ -498,6 +538,216 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    @spec settle_after_resource(Plug.Conn.t(), settlement_context()) :: Plug.Conn.t()
+    defp settle_after_resource(conn, settlement_context) do
+      case successful_resource_response?(conn) do
+        true ->
+          settle_successful_resource(conn, settlement_context)
+
+        false ->
+          release_claim(
+            settlement_context.payment_identifier_cache,
+            settlement_context.payment_id
+          )
+
+          conn
+      end
+    end
+
+    @spec successful_resource_response?(Plug.Conn.t()) :: boolean()
+    defp successful_resource_response?(%Plug.Conn{status: status}) when is_integer(status),
+      do: status < 400
+
+    defp successful_resource_response?(_conn), do: false
+
+    @spec settle_successful_resource(Plug.Conn.t(), settlement_context()) :: Plug.Conn.t()
+    defp settle_successful_resource(conn, settlement_context) do
+      case settlement_requirements(conn, settlement_context.requirements) do
+        {:ok, requirements} ->
+          perform_settlement(conn, settlement_context, requirements)
+
+        {:error, reason} ->
+          fail_settlement(conn, settlement_context, reason, reason)
+      end
+    end
+
+    @spec perform_settlement(Plug.Conn.t(), settlement_context(), map()) :: Plug.Conn.t()
+    defp perform_settlement(conn, settlement_context, requirements) do
+      result =
+        settle_with_hooks(
+          settlement_context.facilitator,
+          settlement_context.payment_payload,
+          requirements,
+          settlement_context.hooks
+        )
+
+      case result do
+        {:ok, settle_response} ->
+          complete_successful_settlement(
+            conn,
+            settle_response,
+            settlement_context.route,
+            settlement_context.request_method,
+            settlement_context.request_path
+          )
+
+        {:error, reason, settle_body} ->
+          fail_settlement(conn, settlement_context, reason, settle_body || reason)
+      end
+    end
+
+    @spec fail_settlement(Plug.Conn.t(), settlement_context(), term(), term()) :: Plug.Conn.t()
+    defp fail_settlement(conn, settlement_context, reason, response_reason) do
+      release_claim(
+        settlement_context.payment_identifier_cache,
+        settlement_context.payment_id
+      )
+
+      reject_settlement(
+        conn,
+        settlement_context.route,
+        settlement_context.request_method,
+        settlement_context.request_path,
+        reason,
+        response_reason
+      )
+    end
+
+    @spec complete_successful_settlement(
+            Plug.Conn.t(),
+            map(),
+            compiled_route(),
+            atom(),
+            String.t()
+          ) :: Plug.Conn.t()
+    defp complete_successful_settlement(
+           conn,
+           settle_response,
+           route,
+           request_method,
+           request_path
+         ) do
+      case put_payment_response_header(conn, settle_response.body) do
+        {:ok, response_conn} ->
+          emit(:payment_verified, %{
+            method: request_method,
+            path: request_path,
+            route: route.path
+          })
+
+          response_conn
+
+        {:error, reason} ->
+          emit(:payment_rejected, %{
+            method: request_method,
+            path: request_path,
+            route: route.path,
+            reason: reason
+          })
+
+          internal_error_conn(conn)
+      end
+    end
+
+    @spec reject_settlement(
+            Plug.Conn.t(),
+            compiled_route(),
+            atom(),
+            String.t(),
+            term(),
+            term()
+          ) :: Plug.Conn.t()
+    defp reject_settlement(
+           conn,
+           route,
+           request_method,
+           request_path,
+           reason,
+           response_reason
+         ) do
+      emit(:payment_rejected, %{
+        method: request_method,
+        path: request_path,
+        route: route.path,
+        reason: reason
+      })
+
+      payment_error_conn(
+        conn,
+        route,
+        request_path,
+        rejection_error(reason),
+        status: status_for_reason(reason),
+        reason: response_reason
+      )
+    end
+
+    @spec settlement_requirements(Plug.Conn.t(), map()) ::
+            {:ok, map()} | {:error, {:invalid_settlement_amount, atom()}}
+    defp settlement_requirements(conn, requirements) do
+      case Utils.map_value(requirements, {"scheme", :scheme}) do
+        "upto" -> upto_settlement_requirements(conn, requirements)
+        _scheme -> {:ok, requirements}
+      end
+    end
+
+    @spec upto_settlement_requirements(Plug.Conn.t(), map()) ::
+            {:ok, map()} | {:error, {:invalid_settlement_amount, atom()}}
+    defp upto_settlement_requirements(conn, requirements) do
+      authorized_amount = Utils.map_value(requirements, {"amount", :amount})
+      requested_amount = Map.get(conn.private, @settlement_amount_private, authorized_amount)
+
+      with {:ok, normalized_authorized} <- normalize_settlement_amount(authorized_amount),
+           {:ok, normalized_requested} <- normalize_settlement_amount(requested_amount),
+           :ok <-
+             ensure_settlement_not_above_authorized(normalized_requested, normalized_authorized) do
+        {:ok, Utils.map_put(requirements, {"amount", :amount}, normalized_requested)}
+      end
+    end
+
+    @spec normalize_settlement_amount(term()) ::
+            {:ok, String.t()} | {:error, {:invalid_settlement_amount, :invalid_format}}
+    defp normalize_settlement_amount(amount) do
+      case normalize_atomic_amount(amount) do
+        {:ok, normalized} -> {:ok, normalized}
+        :error -> {:error, {:invalid_settlement_amount, :invalid_format}}
+      end
+    end
+
+    @spec normalize_atomic_amount(term()) :: {:ok, String.t()} | :error
+    defp normalize_atomic_amount(amount) when is_integer(amount) and amount >= 0,
+      do: {:ok, Integer.to_string(amount)}
+
+    defp normalize_atomic_amount(amount) when is_binary(amount) do
+      case Regex.match?(~r/^\d+$/, amount) do
+        true -> {:ok, amount}
+        false -> :error
+      end
+    end
+
+    defp normalize_atomic_amount(_amount), do: :error
+
+    @spec ensure_settlement_not_above_authorized(String.t(), String.t()) ::
+            :ok | {:error, {:invalid_settlement_amount, :exceeds_authorized_amount}}
+    defp ensure_settlement_not_above_authorized(requested_amount, authorized_amount) do
+      requested = canonical_atomic_amount(requested_amount)
+      authorized = canonical_atomic_amount(authorized_amount)
+
+      case byte_size(requested) < byte_size(authorized) or
+             (byte_size(requested) == byte_size(authorized) and requested <= authorized) do
+        true -> :ok
+        false -> {:error, {:invalid_settlement_amount, :exceeds_authorized_amount}}
+      end
+    end
+
+    @spec canonical_atomic_amount(String.t()) :: String.t()
+    defp canonical_atomic_amount(amount) do
+      case String.trim_leading(amount, "0") do
+        "" -> "0"
+        canonical -> canonical
+      end
+    end
+
     @spec settle_with_hooks(
             Facilitator.server(),
             map(),
@@ -508,10 +758,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             | {:error, term(), term()}
     defp settle_with_hooks(facilitator, payment_payload, requirements, hooks) do
       case facilitator_settle(facilitator, payment_payload, requirements, hooks) do
-        {:ok, settle_response} ->
+        {:ok, settle_response} when is_map(settle_response) ->
           case ensure_settle_success(settle_response) do
             :ok -> {:ok, settle_response}
-            {:error, reason} -> {:error, reason, settle_response.body}
+            {:error, reason} -> {:error, reason, Map.get(settle_response, :body)}
           end
 
         {:error, reason} ->
@@ -570,6 +820,38 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         keys ->
           {:error,
            "route requires either non-empty :accepts or top-level fields #{inspect(keys)}"}
+      end
+    end
+
+    @spec validate_route_options(keyword()) :: {:ok, keyword()} | {:error, String.t()}
+    defp validate_route_options(route) do
+      case NimbleOptions.validate(route, @route_schema) do
+        {:ok, validated} -> {:ok, validated}
+        {:error, error} -> {:error, Exception.message(error)}
+      end
+    end
+
+    @spec ensure_supported_payment_flow(map()) :: :ok | {:error, String.t()}
+    defp ensure_supported_payment_flow(%{accepts: accepts})
+         when is_list(accepts) and accepts != [] do
+      Enum.reduce_while(accepts, :ok, fn accept, :ok ->
+        case ensure_authorization_flow(Map.get(accept, :extra, %{})) do
+          :ok -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+    end
+
+    defp ensure_supported_payment_flow(route) do
+      ensure_authorization_flow(Map.get(route, :extra, %{}))
+    end
+
+    @spec ensure_authorization_flow(map()) :: :ok | {:error, String.t()}
+    defp ensure_authorization_flow(extra) do
+      case Utils.map_value(extra, {"paymentFlow", :paymentFlow}) do
+        nil -> :ok
+        @supported_payment_flow -> :ok
+        flow -> {:error, "unsupported payment flow: #{inspect(flow)}"}
       end
     end
 
@@ -669,40 +951,27 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec decode_and_validate_payment(String.t(), [map()]) ::
+    @spec decode_and_validate_payment(String.t(), [map()], map()) ::
             {:ok, map(), map()} | {:error, term()}
-    defp decode_and_validate_payment(header, accepts) when is_list(accepts) do
+    defp decode_and_validate_payment(header, accepts, advertised_extensions)
+         when is_list(accepts) and is_map(advertised_extensions) do
       with {:ok, payload} <- PaymentSignature.decode(header),
-           :ok <- validate_v2_payload_structure(payload),
+           :ok <- ensure_v2_payload(payload),
+           {:ok, payload} <- PaymentSignature.validate(payload),
            {:ok, matched} <- find_matching_requirements(accepts, payload),
-           :ok <- validate_upto_amount(payload, matched) do
+           :ok <- validate_extensions(payload, advertised_extensions) do
         {:ok, payload, matched}
       end
     end
 
-    @spec validate_v2_payload_structure(map()) :: :ok | {:error, term()}
-    defp validate_v2_payload_structure(payload) when is_map(payload) do
-      accepted = Utils.map_value(payload, {"accepted", :accepted})
-      scheme_payload = Utils.map_value(payload, {"payload", :payload})
-      version = Utils.map_value(payload, {"x402Version", :x402Version})
-
-      cond do
-        version != @x402_version ->
-          {:error, :invalid_x402_version}
-
-        not is_map(accepted) ->
-          {:error, :invalid_payload}
-
-        not is_map(scheme_payload) ->
-          {:error, :invalid_payload}
-
-        true ->
-          :ok
+    @spec ensure_v2_payload(map()) :: :ok | {:error, :invalid_x402_version}
+    defp ensure_v2_payload(payload) do
+      case Utils.map_value(payload, {"x402Version", :x402Version}) do
+        2 -> :ok
+        _version -> {:error, :invalid_x402_version}
       end
     end
 
-    # Equality on scheme, network, amount, asset, payTo — matches Go
-    # FindMatchingRequirements.
     @spec find_matching_requirements([map()], map()) ::
             {:ok, map()} | {:error, :no_matching_requirements}
     defp find_matching_requirements(accepts, payment_payload) when is_list(accepts) do
@@ -719,120 +988,91 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     @spec requirements_match?(map(), map()) :: boolean()
-    defp requirements_match?(requirement, accepted) do
-      requirement_field(requirement, "scheme") == requirement_field(accepted, "scheme") and
-        requirement_field(requirement, "network") == requirement_field(accepted, "network") and
-        requirement_field(requirement, "amount") == requirement_field(accepted, "amount") and
-        requirement_field(requirement, "asset") == requirement_field(accepted, "asset") and
-        requirement_field(requirement, "payTo") == requirement_field(accepted, "payTo")
-    end
+    defp requirements_match?(requirement, accepted),
+      do: PaymentRequirements.match?(requirement, accepted)
 
-    @spec requirement_field(map(), String.t()) :: term()
-    defp requirement_field(map, "scheme"), do: Utils.map_value(map, {"scheme", :scheme})
-    defp requirement_field(map, "network"), do: Utils.map_value(map, {"network", :network})
-    defp requirement_field(map, "amount"), do: Utils.map_value(map, {"amount", :amount})
-    defp requirement_field(map, "asset"), do: Utils.map_value(map, {"asset", :asset})
-    defp requirement_field(map, "payTo"), do: Utils.map_value(map, {"payTo", :payTo})
+    @spec validate_extensions(map(), map()) :: :ok | {:error, :extension_echo_mismatch}
+    defp validate_extensions(payload, advertised_extensions) do
+      client_extensions = Utils.map_value(payload, {"extensions", :extensions})
 
-    @spec validate_upto_amount(map(), map()) :: :ok | {:error, term()}
-    defp validate_upto_amount(payload, requirements) do
-      case Utils.map_value(requirements, {"scheme", :scheme}) do
-        "upto" -> validate_upto_max(payload, requirements)
-        _scheme -> :ok
+      case PaymentRequirements.extensions_match?(advertised_extensions, client_extensions) do
+        true -> :ok
+        false -> {:error, :extension_echo_mismatch}
       end
     end
 
-    @spec validate_upto_max(map(), map()) :: :ok | {:error, term()}
-    defp validate_upto_max(payload, requirements) do
-      with {:ok, max_amount} <- extract_max_amount(requirements),
-           {:ok, payment_value} <- extract_payment_value(payload) do
-        case Utils.compare_decimal(payment_value, max_amount) do
-          :gt -> {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
-          _comparison -> :ok
-        end
-      end
-    end
-
-    @spec extract_max_amount(map()) ::
-            {:ok, {non_neg_integer(), non_neg_integer()}}
-            | {:error, {:invalid_upto_payment, atom()}}
-    defp extract_max_amount(requirements) do
-      value =
-        Utils.first_present([
-          Utils.map_value(requirements, {"amount", :amount}),
-          Utils.map_value(requirements, {"maxPrice", :maxPrice}),
-          Utils.map_value(requirements, {"maxAmountRequired", :maxAmountRequired})
-        ])
-
-      case value do
-        nil ->
-          {:error, {:invalid_upto_payment, :missing_max_price}}
-
-        max_amount ->
-          case Utils.parse_decimal(max_amount) do
-            {:ok, parsed} -> {:ok, parsed}
-            :error -> {:error, {:invalid_upto_payment, :invalid_max_price}}
-          end
-      end
-    end
-
-    @spec extract_payment_value(map()) ::
-            {:ok, {non_neg_integer(), non_neg_integer()}}
-            | {:error, {:invalid_upto_payment, atom()}}
-    defp extract_payment_value(payload) do
-      value =
-        Utils.first_present([
-          Utils.map_value(payload, {"value", :value}),
-          Utils.nested_map_value(payload, [{"payload", :payload}, {"value", :value}]),
-          Utils.nested_map_value(payload, [
-            {"payload", :payload},
-            {"authorization", :authorization},
-            {"value", :value}
-          ]),
-          Utils.nested_map_value(payload, [{"authorization", :authorization}, {"value", :value}])
-        ])
-
-      case value do
-        nil ->
-          {:error, {:invalid_upto_payment, :missing_payment_value}}
-
-        payment_value ->
-          case Utils.parse_decimal(payment_value) do
-            {:ok, parsed} -> {:ok, parsed}
-            :error -> {:error, {:invalid_upto_payment, :invalid_payment_value}}
-          end
-      end
-    end
-
-    @spec ensure_verify_success(%{status: non_neg_integer(), body: map()}) ::
+    @spec ensure_verify_success(map()) ::
             :ok
             | {:error,
-               {:unexpected_facilitator_status, non_neg_integer()}
-               | {:verification_failed, term()}}
-    defp ensure_verify_success(%{status: status, body: body}) when status in 200..299 do
-      case Map.get(body, "isValid", Map.get(body, :isValid, true)) do
-        true -> :ok
-        _invalid -> {:error, {:verification_failed, Map.get(body, "invalidReason")}}
+               {:unexpected_facilitator_status, integer()}
+               | {:verification_failed, term()}
+               | {:malformed_facilitator_response, :verify}}
+    defp ensure_verify_success(%{status: status, body: body})
+         when status in 200..299 and is_map(body) do
+      case Utils.map_value(body, {"isValid", :isValid}) do
+        true ->
+          :ok
+
+        false ->
+          {:error,
+           {:verification_failed, Utils.map_value(body, {"invalidReason", :invalidReason})}}
+
+        _missing_or_invalid ->
+          {:error, {:malformed_facilitator_response, :verify}}
       end
     end
 
-    defp ensure_verify_success(%{status: status}),
+    defp ensure_verify_success(%{status: status}) when status in 200..299,
+      do: {:error, {:malformed_facilitator_response, :verify}}
+
+    defp ensure_verify_success(%{status: status}) when is_integer(status),
       do: {:error, {:unexpected_facilitator_status, status}}
 
-    @spec ensure_settle_success(%{status: non_neg_integer(), body: map()}) ::
+    defp ensure_verify_success(%{}),
+      do: {:error, {:malformed_facilitator_response, :verify}}
+
+    @spec ensure_settle_success(map()) ::
             :ok
             | {:error,
-               {:unexpected_facilitator_status, non_neg_integer()}
-               | {:settlement_failed, term()}}
-    defp ensure_settle_success(%{status: status, body: body}) when status in 200..299 do
-      case Map.get(body, "success", Map.get(body, :success, true)) do
-        true -> :ok
-        _failed -> {:error, {:settlement_failed, Map.get(body, "errorReason")}}
+               {:unexpected_facilitator_status, integer()}
+               | {:settlement_failed, term()}
+               | {:malformed_facilitator_response, :settle}}
+    defp ensure_settle_success(%{status: status, body: body})
+         when status in 200..299 and is_map(body) do
+      case Utils.map_value(body, {"success", :success}) do
+        true ->
+          validate_settle_response_fields(body)
+
+        false ->
+          with :ok <- validate_settle_response_fields(body) do
+            {:error, {:settlement_failed, Utils.map_value(body, {"errorReason", :errorReason})}}
+          end
+
+        _missing_or_invalid ->
+          {:error, {:malformed_facilitator_response, :settle}}
       end
     end
 
-    defp ensure_settle_success(%{status: status}),
+    defp ensure_settle_success(%{status: status}) when status in 200..299,
+      do: {:error, {:malformed_facilitator_response, :settle}}
+
+    defp ensure_settle_success(%{status: status}) when is_integer(status),
       do: {:error, {:unexpected_facilitator_status, status}}
+
+    defp ensure_settle_success(%{}),
+      do: {:error, {:malformed_facilitator_response, :settle}}
+
+    @spec validate_settle_response_fields(map()) ::
+            :ok | {:error, {:malformed_facilitator_response, :settle}}
+    defp validate_settle_response_fields(body) do
+      transaction = Utils.map_value(body, {"transaction", :transaction})
+      network = Utils.map_value(body, {"network", :network})
+
+      case is_binary(transaction) and is_binary(network) and network != "" do
+        true -> :ok
+        false -> {:error, {:malformed_facilitator_response, :settle}}
+      end
+    end
 
     defp warn_no_idempotency_cache_once do
       key = {__MODULE__, :no_idempotency_cache_warned}
@@ -901,21 +1141,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp maybe_put_tags(map, _tags), do: map
 
     @spec resource_url(Plug.Conn.t(), String.t()) :: String.t()
-    defp resource_url(conn, request_path) do
-      scheme = conn.scheme |> to_string()
-      host = conn.host || "localhost"
-      port = conn.port
-
-      authority =
-        cond do
-          scheme == "https" and port in [443, nil] -> host
-          scheme == "http" and port in [80, nil] -> host
-          is_integer(port) -> "#{host}:#{port}"
-          true -> host
-        end
-
-      "#{scheme}://#{authority}#{request_path}"
-    end
+    defp resource_url(conn, _request_path), do: Plug.Conn.request_url(conn)
 
     @spec payment_error_response(
             Plug.Conn.t(),
@@ -925,29 +1151,34 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             keyword()
           ) :: Plug.Conn.t()
     defp payment_error_response(conn, route, request_path, error_message, opts) do
+      conn
+      |> payment_error_conn(route, request_path, error_message, opts)
+      |> send_resp()
+      |> halt()
+    end
+
+    @spec payment_error_conn(
+            Plug.Conn.t(),
+            compiled_route(),
+            String.t(),
+            String.t(),
+            keyword()
+          ) :: Plug.Conn.t()
+    defp payment_error_conn(conn, route, request_path, error_message, opts) do
       status = Keyword.get(opts, :status, 402)
       reason = Keyword.get(opts, :reason)
       required_payload = payment_required_payload(conn, route, request_path, error_message)
 
-      conn =
-        case PaymentRequired.encode(required_payload) do
-          {:ok, encoded} ->
-            put_resp_header(conn, "payment-required", encoded)
-
-          {:error, _reason} ->
-            conn
-        end
-
-      conn =
-        case payment_response_from_reason(reason) do
-          nil -> conn
-          settle_body -> put_payment_response_header(conn, settle_body)
-        end
-
-      conn
-      |> put_resp_content_type("application/json")
-      |> send_resp(status, "{}")
-      |> halt()
+      with {:ok, encoded_required} <- PaymentRequired.encode(required_payload),
+           {:ok, response_conn} <- maybe_put_payment_response_header(conn, reason) do
+        response_conn
+        |> put_resp_header("payment-required", encoded_required)
+        |> delete_resp_header("content-length")
+        |> put_resp_content_type("application/json")
+        |> resp(status, "{}")
+      else
+        {:error, _reason} -> internal_error_conn(conn)
+      end
     end
 
     @spec payment_required_payload(Plug.Conn.t(), compiled_route(), String.t(), String.t()) ::
@@ -962,15 +1193,36 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       }
     end
 
-    @spec put_payment_response_header(Plug.Conn.t(), map()) :: Plug.Conn.t()
+    @spec put_payment_response_header(Plug.Conn.t(), map()) ::
+            {:ok, Plug.Conn.t()} | {:error, {:payment_response_encoding_failed, term()}}
     defp put_payment_response_header(conn, body) when is_map(body) do
       case PaymentResponse.encode(body) do
-        {:ok, encoded} -> put_resp_header(conn, "payment-response", encoded)
-        {:error, _reason} -> conn
+        {:ok, encoded} -> {:ok, put_resp_header(conn, "payment-response", encoded)}
+        {:error, reason} -> {:error, {:payment_response_encoding_failed, reason}}
       end
     end
 
+    @spec maybe_put_payment_response_header(Plug.Conn.t(), term()) ::
+            {:ok, Plug.Conn.t()} | {:error, {:payment_response_encoding_failed, term()}}
+    defp maybe_put_payment_response_header(conn, reason) do
+      case payment_response_from_reason(reason) do
+        nil -> {:ok, conn}
+        settle_body -> put_payment_response_header(conn, settle_body)
+      end
+    end
+
+    @spec internal_error_conn(Plug.Conn.t()) :: Plug.Conn.t()
+    defp internal_error_conn(conn) do
+      conn
+      |> delete_resp_header("content-length")
+      |> delete_resp_header("payment-required")
+      |> delete_resp_header("payment-response")
+      |> put_resp_content_type("application/json")
+      |> resp(500, "{}")
+    end
+
     @spec payment_response_from_reason(term()) :: map() | nil
+    defp payment_response_from_reason(%_struct{}), do: nil
     defp payment_response_from_reason(body) when is_map(body), do: body
 
     defp payment_response_from_reason({:settlement_failed, reason}) when is_binary(reason) do
@@ -993,12 +1245,24 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp payment_response_from_reason(_reason), do: nil
 
-    @spec status_for_reason(term()) :: 400 | 402
+    @spec status_for_reason(term()) :: 400 | 402 | 500
     defp status_for_reason(reason) when reason in @invalid_request_reasons, do: 400
     defp status_for_reason({:missing_fields, _fields}), do: 400
     defp status_for_reason({:invalid_upto_payment, _reason}), do: 400
     defp status_for_reason({:invalid_format, _fields}), do: 400
-    defp status_for_reason(_reason), do: 402
+    defp status_for_reason({:invalid_fields, _fields}), do: 400
+    defp status_for_reason(:invalid_payment_requirements), do: 400
+    defp status_for_reason(:extension_echo_mismatch), do: 400
+    defp status_for_reason(:no_matching_requirements), do: 402
+    defp status_for_reason(:already_exists), do: 402
+    defp status_for_reason({:verification_failed, _reason}), do: 402
+    defp status_for_reason({:settlement_failed, _reason}), do: 402
+    defp status_for_reason(%Error{}), do: 500
+    defp status_for_reason({:unexpected_facilitator_status, _status}), do: 500
+    defp status_for_reason({:malformed_facilitator_response, _operation}), do: 500
+    defp status_for_reason({:invalid_settlement_amount, _reason}), do: 500
+    defp status_for_reason({:payment_response_encoding_failed, _reason}), do: 500
+    defp status_for_reason(_reason), do: 500
 
     @spec normalize_method(String.t()) :: atom()
     defp normalize_method("DELETE"), do: :delete
@@ -1015,18 +1279,26 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp normalize_path("/"), do: "/"
     defp normalize_path(path), do: String.trim_trailing(path, "/")
 
-    @spec map_to_keyword(map()) :: keyword()
+    @spec map_to_keyword(map()) :: {:ok, keyword()} | {:error, String.t()}
     defp map_to_keyword(map) do
-      Enum.map(map, fn
-        {key, value} when is_atom(key) -> {key, value}
-        {key, value} when is_binary(key) -> {String.to_existing_atom(key), value}
+      Enum.reduce_while(map, {:ok, []}, fn
+        {key, value}, {:ok, options} when is_atom(key) ->
+          {:cont, {:ok, [{key, value} | options]}}
+
+        {key, value}, {:ok, options} when is_binary(key) ->
+          try do
+            {:cont, {:ok, [{String.to_existing_atom(key), value} | options]}}
+          rescue
+            ArgumentError -> {:halt, {:error, "unknown route option: #{inspect(key)}"}}
+          end
+
+        {key, _value}, {:ok, _options} ->
+          {:halt, {:error, "invalid route option key: #{inspect(key)}"}}
       end)
-    rescue
-      ArgumentError ->
-        Enum.map(map, fn
-          {key, value} when is_atom(key) -> {key, value}
-          {key, value} when is_binary(key) -> {String.to_atom(key), value}
-        end)
+      |> case do
+        {:ok, options} -> {:ok, Enum.reverse(options)}
+        {:error, reason} -> {:error, reason}
+      end
     end
 
     @spec rejection_error(term()) :: String.t()
@@ -1041,13 +1313,25 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error({:missing_fields, _fields}), do: "invalid_payload"
     defp rejection_error({:invalid_upto_payment, _reason}), do: "invalid_payload"
     defp rejection_error({:invalid_format, _fields}), do: "invalid_payload"
+    defp rejection_error({:invalid_fields, _fields}), do: "invalid_payload"
+    defp rejection_error(:invalid_payment_requirements), do: "invalid_payload"
+    defp rejection_error(:extension_echo_mismatch), do: "invalid_payload"
     defp rejection_error({:verification_failed, _reason}), do: "facilitator rejected payment"
     defp rejection_error({:settlement_failed, _reason}), do: "facilitator rejected payment"
 
     defp rejection_error({:unexpected_facilitator_status, _status}),
-      do: "facilitator rejected payment"
+      do: "payment processing failed"
 
-    defp rejection_error(_reason), do: "payment verification failed"
+    defp rejection_error({:malformed_facilitator_response, _operation}),
+      do: "payment processing failed"
+
+    defp rejection_error(%Error{}), do: "payment processing failed"
+    defp rejection_error({:invalid_settlement_amount, _reason}), do: "payment processing failed"
+
+    defp rejection_error({:payment_response_encoding_failed, _reason}),
+      do: "payment processing failed"
+
+    defp rejection_error(_reason), do: "payment processing failed"
 
     @spec emit(:pass_through | :payment_required | :payment_verified | :payment_rejected, map()) ::
             :ok
@@ -1079,6 +1363,15 @@ else
     """
     @spec call(term(), map()) :: no_return()
     def call(_conn, _opts) do
+      raise ArgumentError, "X402.Plug.PaymentGate requires the optional :plug dependency"
+    end
+
+    @doc since: "0.4.0"
+    @doc """
+    Raises because Plug is not available.
+    """
+    @spec put_settlement_amount(term(), term()) :: no_return()
+    def put_settlement_amount(_conn, _amount) do
       raise ArgumentError, "X402.Plug.PaymentGate requires the optional :plug dependency"
     end
   end

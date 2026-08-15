@@ -9,7 +9,7 @@ defmodule X402.Plug.PaymentGateTest do
   * Route matching (HTTP method/path)
   * PaymentRequired signaling (402 + PAYMENT-REQUIRED header)
   * PaymentPayload validation and accepted matching
-  * HTTP status mapping (400 invalid request vs 402 payment required/failed)
+  * HTTP status mapping (400 invalid, 402 payment failed, 500 server failure)
   * Facilitator verify/settle + PAYMENT-RESPONSE
   * Multi-accept routes
   * ResourceInfo / extensions
@@ -17,9 +17,14 @@ defmodule X402.Plug.PaymentGateTest do
   """
 
   use ExUnit.Case, async: false
+  doctest X402.Plug.PaymentGate
+
   import Plug.Conn
   import Plug.Test
 
+  alias X402.Extensions.PaymentIdentifier.ETSCache
+  alias X402.Facilitator
+  alias X402.Facilitator.Error
   alias X402.PaymentRequired
   alias X402.PaymentResponse
   alias X402.Plug.PaymentGate
@@ -142,6 +147,16 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 402
       assert required["resource"]["url"] =~ "/api/resource"
+    end
+
+    test "preserves the request query in ResourceInfo.url" do
+      required =
+        conn(:get, "/api/resource?cursor=next&limit=10")
+        |> run_request(routes: [@route], facilitator: self())
+        |> decode_payment_required!()
+
+      assert required["resource"]["url"] ==
+               "http://www.example.com/api/resource?cursor=next&limit=10"
     end
 
     test "matches glob routes" do
@@ -384,7 +399,8 @@ defmodule X402.Plug.PaymentGateTest do
           {"network", "eip155:8453"},
           {"asset", "0x0000000000000000000000000000000000000001"},
           {"payTo", "0x2222222222222222222222222222222222222222"},
-          {"amount", "99999"}
+          {"amount", "99999"},
+          {"maxTimeoutSeconds", 120}
         ] do
       test "rejects accepted.#{field} mismatch with 402 and no facilitator call" do
         facilitator = start_mock_facilitator()
@@ -405,6 +421,69 @@ defmodule X402.Plug.PaymentGateTest do
         assert decode_payment_required!(conn)["error"] == "No matching payment requirements"
         refute_received {:verify_called, _, _, _}
       end
+    end
+
+    test "rejects removal or mutation of advertised extra fields" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :extra, %{"name" => "USDC", "version" => "2"})
+
+      for extra <- [%{}, %{"name" => "USDT", "version" => "2"}] do
+        header =
+          valid_payment_payload()
+          |> put_in(["accepted", "extra"], extra)
+          |> encode_header()
+
+        conn =
+          conn(:get, "/api/resource")
+          |> put_req_header("payment-signature", header)
+          |> run_request(routes: [route], facilitator: facilitator)
+
+        assert conn.status == 402
+        assert decode_payment_required!(conn)["error"] == "No matching payment requirements"
+      end
+
+      refute_received {:verify_called, _, _, _}
+    end
+
+    test "allows additive client metadata under accepted.extra" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :extra, %{"name" => "USDC"})
+
+      header =
+        valid_payment_payload()
+        |> put_in(["accepted", "extra"], %{"name" => "USDC", "version" => "2"})
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert_receive {:verify_called, _, _, _}
+    end
+
+    test "rejects mutated extension echoes before facilitator verification" do
+      facilitator = start_mock_facilitator()
+
+      route =
+        Map.put(@route, :extensions, %{
+          "bazaar" => %{"info" => %{"resource" => "premium"}, "schema" => %{"type" => "object"}}
+        })
+
+      header =
+        valid_payment_payload()
+        |> put_in(["extensions"], %{"bazaar" => %{"info" => %{"resource" => "free"}}})
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [route], facilitator: facilitator)
+
+      assert conn.status == 400
+      assert decode_payment_required!(conn)["error"] == "invalid_payload"
+      refute_received {:verify_called, _, _, _}
     end
 
     test "uses matched requirements for verify and settle" do
@@ -522,6 +601,74 @@ defmodule X402.Plug.PaymentGateTest do
   # ---------------------------------------------------------------------------
 
   describe "successful payment flow" do
+    test "verifies before the handler and settles only when its response is sent" do
+      facilitator = start_mock_facilitator()
+
+      gated_conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> gate_request(routes: [@route], facilitator: facilitator)
+
+      assert_receive {:verify_called, _, _, _}
+      refute_received {:settle_called, _, _, _}
+
+      response_conn = Plug.Conn.send_resp(gated_conn, 201, "created")
+
+      assert response_conn.status == 201
+      assert_receive {:settle_called, _, _, _}
+      assert decode_payment_response!(response_conn)["success"] == true
+    end
+
+    test "does not settle when the protected handler returns an error" do
+      facilitator = start_mock_facilitator()
+
+      response_conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> gate_request(routes: [@route], facilitator: facilitator)
+        |> Plug.Conn.send_resp(500, "handler failed")
+
+      assert response_conn.status == 500
+      assert response_conn.resp_body == "handler failed"
+      assert_receive {:verify_called, _, _, _}
+      refute_received {:settle_called, _, _, _}
+      assert get_resp_header(response_conn, "payment-response") == []
+    end
+
+    test "releases the idempotency claim when the protected handler fails" do
+      facilitator = start_mock_facilitator()
+      cache_name = String.to_atom("payment_gate_cache_#{System.unique_integer([:positive])}")
+      cache = start_supervised!({ETSCache, name: cache_name})
+      header = valid_payment_header()
+
+      first_response =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> gate_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: cache
+        )
+        |> Plug.Conn.send_resp(500, "handler failed")
+
+      assert first_response.status == 500
+      assert_receive {:verify_called, _, _, _}
+      refute_received {:settle_called, _, _, _}
+
+      retry_response =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: cache
+        )
+
+      assert retry_response.status == 200
+      assert_receive {:verify_called, _, _, _}
+      assert_receive {:settle_called, _, _, _}
+    end
+
     test "verifies, settles, attaches PAYMENT-RESPONSE, and assigns payload" do
       facilitator = start_mock_facilitator()
 
@@ -561,21 +708,53 @@ defmodule X402.Plug.PaymentGateTest do
       assert_receive {:settle_called, _, ^requirements, TrackingHooks}
     end
 
-    test "verifies and settles valid upto payments under max amount" do
+    test "verifies and settles an upto payment at the advertised maximum by default" do
       facilitator = start_mock_facilitator()
 
       conn =
         conn(:get, "/api/resource")
-        |> put_req_header("payment-signature", valid_upto_payment_header("9000"))
+        |> put_req_header("payment-signature", valid_upto_payment_header(@amount))
         |> run_request(routes: [@upto_route], facilitator: facilitator)
 
       assert conn.status == 200
       assert_receive {:verify_called, payload, requirements, nil}
       assert payload["accepted"]["scheme"] == "upto"
-      assert payload["payload"]["authorization"]["value"] == "9000"
+      assert payload["payload"]["permit2Authorization"]["permitted"]["amount"] == @amount
       assert requirements["scheme"] == "upto"
       assert requirements["amount"] == @amount
       assert_receive {:settle_called, _, ^requirements, nil}
+    end
+
+    test "settles an upto payment using the handler's actual atomic amount" do
+      facilitator = start_mock_facilitator()
+
+      gated_conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_upto_payment_header(@amount))
+        |> gate_request(routes: [@upto_route], facilitator: facilitator)
+
+      assert {:ok, gated_conn} = PaymentGate.put_settlement_amount(gated_conn, "2500")
+      response_conn = Plug.Conn.send_resp(gated_conn, 200, "usage complete")
+
+      assert response_conn.status == 200
+      assert_receive {:verify_called, _, %{"amount" => @amount}, _}
+      assert_receive {:settle_called, _, %{"amount" => "2500"}, _}
+    end
+
+    test "fails closed when an upto settlement amount exceeds the authorized maximum" do
+      facilitator = start_mock_facilitator()
+
+      gated_conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_upto_payment_header(@amount))
+        |> gate_request(routes: [@upto_route], facilitator: facilitator)
+
+      assert {:ok, gated_conn} = PaymentGate.put_settlement_amount(gated_conn, "10001")
+      response_conn = Plug.Conn.send_resp(gated_conn, 200, "usage complete")
+
+      assert response_conn.status == 500
+      assert decode_payment_required!(response_conn)["error"] == "payment processing failed"
+      refute_received {:settle_called, _, _, _}
     end
 
     test "rejects upto payments when authorization value exceeds route amount" do
@@ -592,21 +771,102 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
+  describe "real facilitator client integration" do
+    test "sends the upto ceiling to verify and the handler amount to settle" do
+      bypass = Bypass.open()
+      finch = String.to_atom("payment_gate_finch_#{System.unique_integer([:positive])}")
+
+      facilitator_name =
+        String.to_atom("payment_gate_facilitator_#{System.unique_integer([:positive])}")
+
+      start_supervised!({Finch, name: finch})
+
+      Bypass.expect(bypass, "POST", "/verify", fn bypass_conn ->
+        assert {:ok, body, bypass_conn} = Plug.Conn.read_body(bypass_conn)
+        decoded = Jason.decode!(body)
+
+        assert decoded["x402Version"] == 2
+        assert decoded["paymentRequirements"]["amount"] == @amount
+
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{"isValid" => true, "payer" => @receiver})
+        )
+      end)
+
+      Bypass.expect(bypass, "POST", "/settle", fn bypass_conn ->
+        assert {:ok, body, bypass_conn} = Plug.Conn.read_body(bypass_conn)
+        decoded = Jason.decode!(body)
+
+        assert decoded["paymentRequirements"]["amount"] == "2500"
+
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{
+            "success" => true,
+            "transaction" => "0xsettled",
+            "network" => @network,
+            "payer" => @receiver
+          })
+        )
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: facilitator_name,
+           finch: finch,
+           url: "http://localhost:#{bypass.port}",
+           max_retries: 0}
+        )
+
+      gated_conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_upto_payment_header(@amount))
+        |> gate_request(routes: [@upto_route], facilitator: facilitator)
+
+      assert {:ok, gated_conn} = PaymentGate.put_settlement_amount(gated_conn, "2500")
+      response_conn = Plug.Conn.send_resp(gated_conn, 200, "usage complete")
+
+      assert response_conn.status == 200
+      assert decode_payment_response!(response_conn)["success"] == true
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Facilitator failure modes + PAYMENT-RESPONSE
   # ---------------------------------------------------------------------------
 
   describe "facilitator failures" do
-    test "returns 402 when verify returns error" do
-      facilitator =
-        start_mock_facilitator(verify: fn _, _ -> {:error, :verification_failed} end)
+    test "returns 500 when verify has a transport failure" do
+      error = %Error{type: :transport_error, reason: :closed, retryable: true}
+      facilitator = start_mock_facilitator(verify: {:error, error})
 
       conn =
         conn(:get, "/api/resource")
         |> put_req_header("payment-signature", valid_payment_header())
         |> run_request(routes: [@route], facilitator: facilitator)
 
-      assert conn.status == 402
+      assert conn.status == 500
+      assert decode_payment_required!(conn)["error"] == "payment processing failed"
+      refute_received {:settle_called, _, _, _}
+    end
+
+    test "fails closed when verify omits or mistypes isValid" do
+      for body <- [%{}, %{"isValid" => "true"}, []] do
+        facilitator = start_mock_facilitator(verify: {:ok, %{status: 200, body: body}})
+
+        conn =
+          conn(:get, "/api/resource")
+          |> put_req_header("payment-signature", valid_payment_header())
+          |> run_request(routes: [@route], facilitator: facilitator)
+
+        assert conn.status == 500
+        assert decode_payment_required!(conn)["error"] == "payment processing failed"
+      end
+
       refute_received {:settle_called, _, _, _}
     end
 
@@ -631,17 +891,61 @@ defmodule X402.Plug.PaymentGateTest do
       refute_received {:settle_called, _, _, _}
     end
 
-    test "returns 402 when settle fails with transport error" do
-      facilitator =
-        start_mock_facilitator(settle: fn _, _ -> {:error, :settlement_failed} end)
+    test "returns 500 when settle has a transport failure" do
+      error = %Error{type: :timeout, reason: :timeout, retryable: true}
+      facilitator = start_mock_facilitator(settle: {:error, error})
 
       conn =
         conn(:get, "/api/resource")
         |> put_req_header("payment-signature", valid_payment_header())
         |> run_request(routes: [@route], facilitator: facilitator)
 
-      assert conn.status == 402
-      assert decode_payment_required!(conn)["error"] == "payment verification failed"
+      assert conn.status == 500
+      assert decode_payment_required!(conn)["error"] == "payment processing failed"
+    end
+
+    test "fails closed when settle omits required success fields" do
+      for body <- [%{}, %{"success" => true}, []] do
+        facilitator = start_mock_facilitator(settle: {:ok, %{status: 200, body: body}})
+
+        conn =
+          conn(:get, "/api/resource")
+          |> put_req_header("payment-signature", valid_payment_header())
+          |> run_request(routes: [@route], facilitator: facilitator)
+
+        assert conn.status == 500
+        assert decode_payment_required!(conn)["error"] == "payment processing failed"
+      end
+    end
+
+    test "returns 500 when PAYMENT-REQUIRED cannot be encoded" do
+      route = Map.put(@route, :extensions, %{"invalid" => %{"value" => self()}})
+      conn = run_request(conn(:get, "/api/resource"), routes: [route], facilitator: self())
+
+      assert conn.status == 500
+      assert conn.resp_body == "{}"
+      assert get_resp_header(conn, "payment-required") == []
+    end
+
+    test "returns 500 when PAYMENT-RESPONSE cannot be encoded" do
+      settle_body = %{
+        "success" => true,
+        "transaction" => "0xsettled",
+        "network" => @network,
+        "unencodable" => self()
+      }
+
+      facilitator =
+        start_mock_facilitator(settle: {:ok, %{status: 200, body: settle_body}})
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 500
+      assert conn.resp_body == "{}"
+      assert get_resp_header(conn, "payment-response") == []
     end
 
     test "returns 402 with PAYMENT-RESPONSE when settle success is false" do
@@ -669,7 +973,7 @@ defmodule X402.Plug.PaymentGateTest do
       assert response["errorReason"] == "insufficient_funds"
     end
 
-    test "returns 402 when verify or settle return non-2xx HTTP status" do
+    test "returns 500 when the facilitator adapter returns non-2xx responses" do
       for {key, result} <- [
             {:verify, {:ok, %{status: 400, body: %{"error" => "invalid"}}}},
             {:settle, {:ok, %{status: 500, body: %{"error" => "failed"}}}}
@@ -681,8 +985,8 @@ defmodule X402.Plug.PaymentGateTest do
           |> put_req_header("payment-signature", valid_payment_header())
           |> run_request(routes: [@route], facilitator: facilitator)
 
-        assert conn.status == 402
-        assert decode_payment_required!(conn)["error"] == "facilitator rejected payment"
+        assert conn.status == 500
+        assert decode_payment_required!(conn)["error"] == "payment processing failed"
       end
     end
 
@@ -734,6 +1038,32 @@ defmodule X402.Plug.PaymentGateTest do
       assert_raise NimbleOptions.ValidationError, fn ->
         PaymentGate.init(routes: [Map.put(@route, :scheme, "invalid")])
       end
+
+      assert_raise NimbleOptions.ValidationError, ~r/atomic-unit amount/, fn ->
+        PaymentGate.init(routes: [Map.put(@route, :price, "0.01")])
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/unsupported payment flow/, fn ->
+        PaymentGate.init(
+          routes: [Map.put(@route, :extra, %{"paymentFlow" => "upfront"})],
+          facilitator: self()
+        )
+      end
+    end
+
+    test "rejects unknown string options without creating atoms" do
+      unknown_key = "untrusted_route_option_#{System.unique_integer([:positive])}"
+
+      assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_key) end
+
+      assert_raise NimbleOptions.ValidationError, ~r/unknown route option/, fn ->
+        PaymentGate.init(
+          routes: [Map.put(@route, unknown_key, true)],
+          facilitator: self()
+        )
+      end
+
+      assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_key) end
     end
 
     test "accepts multi-accept routes without top-level price fields" do
@@ -767,7 +1097,12 @@ defmodule X402.Plug.PaymentGateTest do
   describe "telemetry" do
     test "emits pass_through, payment_required, payment_verified, payment_rejected" do
       ok = start_mock_facilitator()
-      reject = start_mock_facilitator(verify: fn _, _ -> {:error, :declined} end)
+
+      reject =
+        start_mock_facilitator(
+          verify:
+            {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "declined"}}}
+        )
 
       handler_id = "payment-gate-#{System.unique_integer([:positive, :monotonic])}"
       parent = self()
@@ -825,9 +1160,11 @@ defmodule X402.Plug.PaymentGateTest do
 
   defp run_request(conn, opts) do
     conn
-    |> PaymentGate.call(PaymentGate.init(opts))
+    |> gate_request(opts)
     |> maybe_send_ok()
   end
+
+  defp gate_request(conn, opts), do: PaymentGate.call(conn, PaymentGate.init(opts))
 
   defp maybe_send_ok(%Plug.Conn{halted: true} = conn), do: conn
   defp maybe_send_ok(conn), do: Plug.Conn.send_resp(conn, 200, "ok")
@@ -882,7 +1219,20 @@ defmodule X402.Plug.PaymentGateTest do
   defp valid_upto_payment_header(value) do
     valid_payment_payload()
     |> put_in(["accepted", "scheme"], "upto")
-    |> put_in(["payload", "authorization", "value"], value)
+    |> put_in(
+      ["payload"],
+      %{
+        "signature" => "0xpermit2-signature",
+        "permit2Authorization" => %{
+          "permitted" => %{"token" => @asset, "amount" => value},
+          "from" => @receiver,
+          "spender" => "0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002",
+          "nonce" => "1",
+          "deadline" => "1740672154",
+          "witness" => %{"to" => @receiver, "facilitator" => @receiver, "validAfter" => "0"}
+        }
+      }
+    )
     |> encode_header()
   end
 

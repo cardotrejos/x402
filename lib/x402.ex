@@ -6,6 +6,7 @@ defmodule X402 do
   delegating implementation details to dedicated modules:
 
   - `X402.PaymentRequired` for `PAYMENT-REQUIRED`
+  - `X402.PaymentRequirements` for x402 v2 requirement validation and matching
   - `X402.PaymentSignature` for `PAYMENT-SIGNATURE`
   - `X402.PaymentResponse` for `PAYMENT-RESPONSE`
   - `X402.Wallet` for wallet address detection and validation
@@ -22,7 +23,7 @@ defmodule X402 do
 
   ## Examples
 
-      iex> {:ok, header} = X402.encode_payment_required(%{"scheme" => "exact"})
+      iex> {:ok, header} = X402.encode_payment_required(%{"x402Version" => 2, "accepts" => []})
       iex> is_binary(header)
       true
   """
@@ -36,10 +37,10 @@ defmodule X402 do
 
   ## Examples
 
-      iex> {:ok, encoded} = X402.PaymentRequired.encode(%{"scheme" => "exact"})
+      iex> {:ok, encoded} = X402.PaymentRequired.encode(%{"x402Version" => 2, "accepts" => []})
       iex> {:ok, decoded} = X402.decode_payment_required(encoded)
-      iex> decoded["scheme"]
-      "exact"
+      iex> decoded["x402Version"]
+      2
   """
   @spec decode_payment_required(String.t()) ::
           {:ok, map()} | {:error, :invalid_base64 | :invalid_json | :payload_too_large}
@@ -51,19 +52,14 @@ defmodule X402 do
 
   ## Examples
 
-      iex> payload = %{
-      ...>   "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      ...>   "network" => "eip155:8453",
-      ...>   "scheme" => "exact",
-      ...>   "payerWallet" => "0x1111111111111111111111111111111111111111"
-      ...> }
+      iex> payload = %{"x402Version" => 2, "accepted" => %{}, "payload" => %{}}
       iex> encoded = payload |> Jason.encode!() |> Base.encode64()
       iex> {:ok, decoded} = X402.decode_payment_signature(encoded)
-      iex> decoded["network"]
-      "eip155:8453"
+      iex> decoded["x402Version"]
+      2
   """
   @spec decode_payment_signature(String.t()) ::
-          {:ok, map()} | {:error, :invalid_base64 | :invalid_json}
+          {:ok, map()} | {:error, PaymentSignature.decode_error()}
   defdelegate decode_payment_signature(header), to: PaymentSignature, as: :decode
 
   @doc since: "0.1.0", group: :verification
@@ -72,25 +68,16 @@ defmodule X402 do
 
   ## Examples
 
-      iex> X402.validate_payment_signature(%{
-      ...>   "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      ...>   "network" => "eip155:8453",
-      ...>   "scheme" => "exact",
-      ...>   "payerWallet" => "0x1111111111111111111111111111111111111111"
-      ...> })
-      {:ok, %{
-        "network" => "eip155:8453",
-        "payerWallet" => "0x1111111111111111111111111111111111111111",
-        "scheme" => "exact",
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      }}
+      iex> payload = %{
+      ...>   "x402Version" => 2,
+      ...>   "accepted" => %{"scheme" => "exact", "network" => "eip155:8453", "amount" => "1", "asset" => "asset", "payTo" => "receiver", "maxTimeoutSeconds" => 60, "extra" => %{}},
+      ...>   "payload" => %{}
+      ...> }
+      iex> X402.validate_payment_signature(payload)
+      {:ok, payload}
   """
   @spec validate_payment_signature(map()) ::
-          {:ok, map()}
-          | {:error,
-             :invalid_payload
-             | {:missing_fields, [String.t()]}
-             | {:invalid_upto_payment, X402.PaymentSignature.upto_validation_error()}}
+          {:ok, map()} | {:error, PaymentSignature.validate_error()}
   defdelegate validate_payment_signature(payload), to: PaymentSignature, as: :validate
 
   @doc since: "0.1.0", group: :verification
@@ -100,22 +87,15 @@ defmodule X402 do
   ## Examples
 
       iex> payload = %{
-      ...>   "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      ...>   "network" => "eip155:8453",
-      ...>   "scheme" => "exact",
-      ...>   "payerWallet" => "0x1111111111111111111111111111111111111111"
+      ...>   "x402Version" => 2,
+      ...>   "accepted" => %{"scheme" => "exact", "network" => "eip155:8453", "amount" => "1", "asset" => "asset", "payTo" => "receiver", "maxTimeoutSeconds" => 60, "extra" => %{}},
+      ...>   "payload" => %{}
       ...> }
       iex> encoded = payload |> Jason.encode!() |> Base.encode64()
       iex> {:ok, _decoded} = X402.decode_and_validate_payment_signature(encoded)
   """
   @spec decode_and_validate_payment_signature(String.t()) ::
-          {:ok, map()}
-          | {:error,
-             :invalid_base64
-             | :invalid_json
-             | :invalid_payload
-             | {:missing_fields, [String.t()]}
-             | {:invalid_upto_payment, X402.PaymentSignature.upto_validation_error()}}
+          {:ok, map()} | {:error, PaymentSignature.decode_and_validate_error()}
   defdelegate decode_and_validate_payment_signature(header),
     to: PaymentSignature,
     as: :decode_and_validate
@@ -126,7 +106,7 @@ defmodule X402 do
 
   ## Examples
 
-      iex> {:ok, header} = X402.encode_payment_response(%{"settled" => true})
+      iex> {:ok, header} = X402.encode_payment_response(%{"success" => true, "transaction" => "0xabc", "network" => "eip155:8453"})
       iex> is_binary(header)
       true
   """
@@ -140,9 +120,9 @@ defmodule X402 do
 
   ## Examples
 
-      iex> {:ok, encoded} = X402.PaymentResponse.encode(%{"settled" => true})
+      iex> {:ok, encoded} = X402.PaymentResponse.encode(%{"success" => true, "transaction" => "0xabc", "network" => "eip155:8453"})
       iex> {:ok, decoded} = X402.decode_payment_response(encoded)
-      iex> decoded["settled"]
+      iex> decoded["success"]
       true
   """
   @spec decode_payment_response(String.t()) ::

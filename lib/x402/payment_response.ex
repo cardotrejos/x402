@@ -33,9 +33,10 @@ defmodule X402.PaymentResponse do
 
   ## Examples
 
-      iex> {:ok, value} = X402.PaymentResponse.encode(%{"settled" => true})
+      iex> response = %{"success" => true, "transaction" => "0xabc", "network" => "eip155:8453"}
+      iex> {:ok, value} = X402.PaymentResponse.encode(response)
       iex> X402.PaymentResponse.decode(value)
-      {:ok, %{"settled" => true}}
+      {:ok, response}
   """
   @spec encode(map()) :: {:ok, String.t()} | {:error, encode_error()}
   def encode(payload) when is_map(payload) do
@@ -74,9 +75,10 @@ defmodule X402.PaymentResponse do
 
   ## Examples
 
-      iex> {:ok, value} = X402.PaymentResponse.encode(%{"settled" => true})
+      iex> response = %{"success" => true, "transaction" => "0xabc", "network" => "eip155:8453"}
+      iex> {:ok, value} = X402.PaymentResponse.encode(response)
       iex> X402.PaymentResponse.decode(value)
-      {:ok, %{"settled" => true}}
+      {:ok, response}
 
       iex> X402.PaymentResponse.decode("%%%")
       {:error, :invalid_base64}
