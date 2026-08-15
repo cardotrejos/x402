@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-15
+
+### Fixed
+
+- Declare `:telemetry` as a required runtime dependency so telemetry events and
+  facilitator calls work in downstream installs without optional dependencies
+- Start the OTP `:public_key` application used by
+  `X402.Facilitator.HTTP.secure_pool_opts/0`
+- Exercise the library from a minimal downstream Mix project in CI to catch
+  missing runtime dependencies before publishing
+
 ## [0.4.0] - 2026-08-15
 
 ### Added

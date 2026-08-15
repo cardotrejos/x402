@@ -36,6 +36,12 @@ jobs:
           MIX_ENV: test
       - run: mix compile --no-optional-deps --warnings-as-errors
         name: Compile without optional deps
+      - name: Compile as a downstream consumer
+        working-directory: integration/consumer
+        run: |
+          mix deps.get
+          mix compile --warnings-as-errors
+          mix run smoke.exs
 
   dialyzer:
     runs-on: ubuntu-latest

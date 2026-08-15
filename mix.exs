@@ -1,7 +1,7 @@
 defmodule X402.MixProject do
   use Mix.Project
 
-  @version "0.4.0"
+  @version "0.4.1"
   @source_url "https://github.com/cardotrejos/x402"
   @description "Elixir SDK for the x402 HTTP payment protocol"
 
@@ -50,7 +50,7 @@ defmodule X402.MixProject do
 
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger, :public_key]
     ]
   end
 
@@ -70,6 +70,9 @@ defmodule X402.MixProject do
 
       # Option validation (Dashbit style)
       {:nimble_options, "~> 1.0"},
+
+      # Runtime instrumentation
+      {:telemetry, "~> 1.0"},
 
       # EVM signature verification (optional — only needed for SIWX)
       {:ex_secp256k1, "~> 0.8.0", optional: true},

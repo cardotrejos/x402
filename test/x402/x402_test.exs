@@ -3,6 +3,15 @@ defmodule X402Test do
 
   doctest X402
 
+  describe "OTP application dependencies" do
+    test "declares every required runtime application" do
+      applications = Application.spec(:x402, :applications)
+
+      assert :telemetry in applications
+      assert :public_key in applications
+    end
+  end
+
   describe "convenience delegates" do
     test "delegates payment-required encode/decode" do
       payload = %{"scheme" => "exact"}
