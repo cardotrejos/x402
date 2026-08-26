@@ -195,9 +195,15 @@ defmodule X402.Extensions.Bazaar do
   defp put_http_input(info_input, method, opts) when method in @body_methods do
     body_type = body_type!(opts)
 
+    body =
+      case Keyword.get(opts, :input) do
+        nil -> default_body(body_type)
+        input -> input
+      end
+
     info_input
     |> Map.put("bodyType", body_type)
-    |> Map.put("body", Keyword.get(opts, :input, default_body(body_type)))
+    |> Map.put("body", body)
   end
 
   defp put_http_input(info_input, _method, opts) do

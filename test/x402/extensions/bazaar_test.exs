@@ -64,6 +64,9 @@ defmodule X402.Extensions.BazaarTest do
     test "body method with no input defaults body to empty map" do
       ext = Bazaar.build_extension(method: :post)
       assert ext["info"]["input"]["body"] == %{}
+
+      nil_ext = Bazaar.build_extension(method: :post, input: nil)
+      assert nil_ext["info"]["input"]["body"] == %{}
     end
 
     test "text body methods accept strings and emit a matching schema" do
@@ -77,6 +80,9 @@ defmodule X402.Extensions.BazaarTest do
 
       default_ext = Bazaar.build_extension(method: :post, body_type: "text")
       assert default_ext["info"]["input"]["body"] == ""
+
+      nil_ext = Bazaar.build_extension(method: :post, body_type: "text", input: nil)
+      assert nil_ext["info"]["input"]["body"] == ""
     end
 
     test "custom body_type is reflected in info" do
