@@ -66,6 +66,19 @@ defmodule X402.Extensions.BazaarTest do
       assert ext["info"]["input"]["body"] == %{}
     end
 
+    test "text body methods accept strings and emit a matching schema" do
+      ext = Bazaar.build_extension(method: :post, body_type: "text", input: "hello")
+
+      assert ext["info"]["input"]["body"] == "hello"
+
+      assert ext["schema"]["properties"]["input"]["properties"]["body"] == %{
+               "type" => "string"
+             }
+
+      default_ext = Bazaar.build_extension(method: :post, body_type: "text")
+      assert default_ext["info"]["input"]["body"] == ""
+    end
+
     test "custom body_type is reflected in info" do
       ext = Bazaar.build_extension(method: :post, input: %{}, body_type: "form-data")
       assert ext["info"]["input"]["bodyType"] == "form-data"
@@ -176,7 +189,7 @@ defmodule X402.Extensions.BazaarTest do
       output_schema = ext["schema"]["properties"]["output"]
       assert output_schema["required"] == ["type"]
       assert output_schema["properties"]["type"] == %{"type" => "string"}
-      assert output_schema["properties"]["example"] == %{"type" => "object"}
+      assert output_schema["properties"]["example"] == %{}
       refute Map.has_key?(output_schema["properties"], "format")
     end
 
@@ -217,6 +230,26 @@ defmodule X402.Extensions.BazaarTest do
       assert ext["schema"]["properties"]["output"]["properties"]["example"] == %{
                "type" => "object"
              }
+    end
+
+    test "schema output example matches scalar and array JSON types" do
+      examples = [
+        {"ok", "string"},
+        {42, "integer"},
+        {1.5, "number"},
+        {true, "boolean"},
+        {["ok"], "array"}
+      ]
+
+      for {example, expected_type} <- examples do
+        ext = Bazaar.build_extension(method: :get, output: [example: example])
+
+        assert ext["info"]["output"]["example"] == example
+
+        assert ext["schema"]["properties"]["output"]["properties"]["example"] == %{
+                 "type" => expected_type
+               }
+      end
     end
 
     test "accepts a keyword list with format, example, and schema" do
@@ -290,9 +323,25 @@ defmodule X402.Extensions.BazaarTest do
       end
     end
 
-    test "raises when input is not a map" do
-      assert_raise NimbleOptions.ValidationError, ~r/input/, fn ->
+    test "raises when query input is not a map" do
+      assert_raise ArgumentError, ~r/expected query :input to be a map/, fn ->
         Bazaar.build_extension(method: :get, input: "bad")
+      end
+    end
+
+    test "raises when body input does not match its body_type" do
+      assert_raise ArgumentError, ~r/expected json :input to be a map/, fn ->
+        Bazaar.build_extension(method: :post, body_type: "json", input: "bad")
+      end
+
+      assert_raise ArgumentError, ~r/expected text :input to be a string/, fn ->
+        Bazaar.build_extension(method: :post, body_type: "text", input: %{})
+      end
+    end
+
+    test "raises when body_type is provided for a query method" do
+      assert_raise ArgumentError, ~r/:body_type is only supported/, fn ->
+        Bazaar.build_extension(method: :get, body_type: "text")
       end
     end
 

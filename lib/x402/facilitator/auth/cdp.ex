@@ -38,9 +38,10 @@ defmodule X402.Facilitator.Auth.CDP do
         auth: {X402.Facilitator.Auth.CDP, api_key_id: "...", api_key_secret: "..."}
       )
 
-  The JWT is generated per request with a fresh nonce and timestamps, so it is
-  never reused across retries. The `aud` claim is intentionally omitted to
-  match the reference CDP SDK's x402 facilitator client.
+  The JWT is generated per facilitator operation with a fresh nonce and
+  timestamps. Transport retries reuse it within its 120-second validity
+  window. The `aud` claim is intentionally omitted to match the reference CDP
+  SDK's x402 facilitator client.
   """
 
   @behaviour X402.Facilitator.Auth

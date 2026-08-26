@@ -109,7 +109,7 @@ defmodule X402.MixProject do
   defp docs do
     [
       main: "readme",
-      source_ref: "main",
+      source_ref: "v#{@version}",
       source_url: @source_url,
       extras: [
         "README.md": [title: "Overview"],
@@ -132,6 +132,8 @@ defmodule X402.MixProject do
         ],
         "Facilitator Client": [
           X402.Facilitator,
+          X402.Facilitator.Auth,
+          X402.Facilitator.Auth.CDP,
           X402.Facilitator.HTTP,
           X402.Hooks,
           X402.Hooks.Context,

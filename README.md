@@ -30,7 +30,7 @@ Add the library and only the optional integrations your application uses:
 ```elixir
 def deps do
   [
-    {:x402, "~> 0.5"},
+    {:x402, "~> 0.5.0"},
     {:finch, "~> 0.19"}, # facilitator HTTP calls
     {:plug, "~> 1.14"}   # PaymentGate
   ]

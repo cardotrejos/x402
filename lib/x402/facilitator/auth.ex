@@ -20,8 +20,8 @@ defmodule X402.Facilitator.Auth do
   `{module, opts}` tuple.
 
   Implementations are built once at `start_link` so invalid credentials fail
-  fast, and `c:headers/2` is called once per request so time-based credentials
-  (JWTs, etc.) are never reused across retries.
+  fast, and `c:headers/2` is called once per facilitator operation. Transport
+  retries reuse those headers within the credential's validity window.
   """
 
   @typedoc """
@@ -53,8 +53,8 @@ defmodule X402.Facilitator.Auth do
   @doc """
   Builds the HTTP headers for a single request.
 
-  Called once per request so time-based credentials are never reused across
-  retries. Returns a list of `{name, value}` header tuples.
+  Called once per facilitator operation. Returns a list of `{name, value}`
+  header tuples.
   """
   @callback headers(t(), request_info()) ::
               {:ok, [{String.t(), String.t()}]} | {:error, term()}

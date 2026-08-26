@@ -5,7 +5,7 @@ The Elixir SDK for the x402 HTTP payment protocol — published on Hex.pm. A **l
 
 ## Quick Context
 - **Language:** Elixir (OTP)
-- **Published:** Hex.pm (`x402 ~> 0.3`)
+- **Published:** Hex.pm (`x402 ~> 0.5.0`)
 - **CI:** GitHub Actions → `mix test --cover`
 - **Docs:** Generated via ExDoc, hosted on hexdocs.pm
 
