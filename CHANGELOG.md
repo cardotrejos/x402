@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.2] - 2026-08-26
 
 ### Added
 
@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - CDP JWT `uris` claim now binds to the full request path (facilitator base URL path + endpoint) — the previous `host + /verify` binding caused the hosted CDP facilitator to reject all requests with 401 (`request_info.path` is now the fully-qualified path)
+- The auth request host is now derived from the URI host and port (port included only when non-default, matching JavaScript `URL.host` semantics) instead of the deprecated `URI.authority` field, which is no longer populated on recent Elixir and failed dialyzer
 
 ### Testing
 
