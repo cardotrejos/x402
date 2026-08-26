@@ -17,8 +17,8 @@ defmodule X402.Extensions.Bazaar do
 
   `info.output` describes the expected response format. It is always present
   (defaulting to a `"json"` content type). The schema's `output` property
-  declares `type` (and optionally `format`) as strings and `example` as an
-  object, optionally constrained by the `:schema` option.
+  declares `type` (and optionally `format`) as strings and infers the JSON
+  type of `example`, optionally refined by the `:schema` option.
 
   The factory returns a plain, string-keyed map ready for JSON encoding:
 
@@ -46,7 +46,7 @@ defmodule X402.Extensions.Bazaar do
 
   @http_schema [
     method: [type: :any],
-    input: [type: {:custom, __MODULE__, :validate_map, []}],
+    input: [type: :any],
     input_schema: [type: {:custom, __MODULE__, :validate_map, []}],
     body_type: [type: :string],
     headers: [type: {:custom, __MODULE__, :validate_map, []}],
@@ -78,8 +78,9 @@ defmodule X402.Extensions.Bazaar do
     * `:method` — (required) HTTP method: `:get`, `:head`, `:delete`,
       `:post`, `:put`, `:patch` (or the uppercase string). Query methods
       produce a read-only signature; body methods add `bodyType` and `body`.
-    * `:input` — example input values (query parameters for query methods,
-      request body for body methods).
+    * `:input` — example input values (a map of query parameters for query
+      methods, a map for `"json"` / `"form-data"` bodies, or a string for
+      `"text"` bodies).
     * `:input_schema` — JSON Schema merged into the schema's `queryParams`
       or `body` property.
     * `:body_type` — request body content type for body methods: `"json"`
@@ -174,6 +175,7 @@ defmodule X402.Extensions.Bazaar do
   @spec build_http_extension(keyword()) :: t()
   defp build_http_extension(opts) do
     method = method!(opts)
+    validate_http_input!(method, opts)
 
     info_input =
       %{"type" => "http", "method" => method}
@@ -191,9 +193,17 @@ defmodule X402.Extensions.Bazaar do
 
   @spec put_http_input(map(), String.t(), keyword()) :: map()
   defp put_http_input(info_input, method, opts) when method in @body_methods do
+    body_type = body_type!(opts)
+
+    body =
+      case Keyword.get(opts, :input) do
+        nil -> default_body(body_type)
+        input -> input
+      end
+
     info_input
-    |> Map.put("bodyType", body_type!(opts))
-    |> Map.put("body", Keyword.get(opts, :input, %{}))
+    |> Map.put("bodyType", body_type)
+    |> Map.put("body", body)
   end
 
   defp put_http_input(info_input, _method, opts) do
@@ -253,7 +263,7 @@ defmodule X402.Extensions.Bazaar do
   @spec body_schema(keyword()) :: map()
   defp body_schema(opts) do
     case Keyword.get(opts, :input_schema) do
-      nil -> %{"type" => "object"}
+      nil -> default_body_schema(body_type!(opts))
       schema -> schema
     end
   end
@@ -341,7 +351,7 @@ defmodule X402.Extensions.Bazaar do
     properties =
       %{"type" => %{"type" => "string"}}
       |> maybe_put_any("format", format_schema(Keyword.get(output, :format)))
-      |> Map.put("example", output_example_schema(Keyword.get(output, :schema)))
+      |> Map.put("example", output_example_schema(output))
 
     output_property = %{
       "type" => "object",
@@ -356,9 +366,15 @@ defmodule X402.Extensions.Bazaar do
   defp format_schema(nil), do: nil
   defp format_schema(_format), do: %{"type" => "string"}
 
-  @spec output_example_schema(map() | nil) :: map()
-  defp output_example_schema(nil), do: %{"type" => "object"}
-  defp output_example_schema(schema), do: Map.merge(%{"type" => "object"}, schema)
+  @spec output_example_schema(keyword()) :: map()
+  defp output_example_schema(output) do
+    example = Keyword.get(output, :example)
+    custom_schema = Keyword.get(output, :schema)
+
+    example
+    |> inferred_example_schema(custom_schema)
+    |> Map.merge(custom_schema || %{})
+  end
 
   # --- option accessors ---
 
@@ -403,6 +419,73 @@ defmodule X402.Extensions.Bazaar do
             "invalid :body_type #{inspect(value)}; expected one of #{Enum.join(@body_types, ", ")}"
     end
   end
+
+  @spec validate_http_input!(String.t(), keyword()) :: :ok
+  defp validate_http_input!(method, opts) when method in @query_methods do
+    if Keyword.has_key?(opts, :body_type) do
+      raise ArgumentError, ":body_type is only supported for POST, PUT, and PATCH inputs"
+    end
+
+    case Keyword.get(opts, :input) do
+      nil -> :ok
+      input when is_map(input) -> :ok
+      input -> raise ArgumentError, "expected query :input to be a map, got: #{inspect(input)}"
+    end
+  end
+
+  defp validate_http_input!(method, opts) when method in @body_methods do
+    body_type = body_type!(opts)
+
+    case {body_type, Keyword.get(opts, :input)} do
+      {_body_type, nil} ->
+        :ok
+
+      {"text", input} when is_binary(input) ->
+        :ok
+
+      {body_type, input} when body_type in ["json", "form-data"] and is_map(input) ->
+        :ok
+
+      {"text", input} ->
+        raise ArgumentError, "expected text :input to be a string, got: #{inspect(input)}"
+
+      {body_type, input} ->
+        raise ArgumentError,
+              "expected #{body_type} :input to be a map, got: #{inspect(input)}"
+    end
+  end
+
+  @spec default_body(String.t()) :: map() | String.t()
+  defp default_body("text"), do: ""
+  defp default_body(_body_type), do: %{}
+
+  @spec default_body_schema(String.t()) :: map()
+  defp default_body_schema("text"), do: %{"type" => "string"}
+  defp default_body_schema(_body_type), do: %{"type" => "object"}
+
+  @spec inferred_example_schema(term(), map() | nil) :: map()
+  defp inferred_example_schema(nil, nil), do: %{}
+  defp inferred_example_schema(nil, _custom_schema), do: %{"type" => "object"}
+
+  defp inferred_example_schema(example, _custom_schema) when is_map(example),
+    do: %{"type" => "object"}
+
+  defp inferred_example_schema(example, _custom_schema) when is_list(example),
+    do: %{"type" => "array"}
+
+  defp inferred_example_schema(example, _custom_schema) when is_binary(example),
+    do: %{"type" => "string"}
+
+  defp inferred_example_schema(example, _custom_schema) when is_boolean(example),
+    do: %{"type" => "boolean"}
+
+  defp inferred_example_schema(example, _custom_schema) when is_integer(example),
+    do: %{"type" => "integer"}
+
+  defp inferred_example_schema(example, _custom_schema) when is_float(example),
+    do: %{"type" => "number"}
+
+  defp inferred_example_schema(_example, _custom_schema), do: %{}
 
   @spec transport(keyword()) :: String.t() | nil
   defp transport(opts) do
