@@ -30,7 +30,7 @@ defmodule X402.Facilitator do
         "Application that holds this facilitator's configuration. When set, " <>
           "`config :app, <name>` is merged under the given options, with the " <>
           "options taking precedence. Enables the Ecto-style pattern where " <>
-          "`config/runtime.exs` is the single source of truth."
+          "`config/runtime.exs` is the single source of truth. Available since v0.5.0."
     ],
     url: [
       type: :string,
@@ -68,7 +68,8 @@ defmodule X402.Facilitator do
       doc:
         "Request authentication. Either `nil` (no authentication), an " <>
           "`X402.Facilitator.Auth` module, or a `{module, opts}` tuple. See " <>
-          "`X402.Facilitator.Auth.CDP` for the Coinbase Developer Platform facilitator."
+          "`X402.Facilitator.Auth.CDP` for the Coinbase Developer Platform " <>
+          "facilitator. Available since v0.5.0."
     ]
   ]
 
@@ -388,11 +389,20 @@ defmodule X402.Facilitator do
 
   defp request_host(url) do
     case URI.parse(url) do
-      %URI{authority: authority} when is_binary(authority) and authority != "" -> authority
-      %URI{host: host} when is_binary(host) -> host
+      %URI{host: host} = uri when is_binary(host) and host != "" -> host_with_port(host, uri)
       _other -> ""
     end
   end
+
+  # Matches JavaScript `URL.host` semantics (used by the CDP SDK): the port is
+  # included only when it differs from the scheme's default.
+  defp host_with_port(host, %URI{port: port, scheme: scheme})
+       when is_integer(port) and is_binary(scheme) do
+    if URI.default_port(scheme) == port, do: host, else: "#{host}:#{port}"
+  end
+
+  defp host_with_port(host, %URI{port: port}) when is_integer(port), do: "#{host}:#{port}"
+  defp host_with_port(host, _uri), do: host
 
   defp request_path(url) do
     case URI.parse(url) do

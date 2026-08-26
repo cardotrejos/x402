@@ -67,7 +67,7 @@ defmodule X402.Extensions.Bazaar do
   @typedoc "A built `extensions.bazaar` discovery extension payload."
   @type t :: %{binary() => map()}
 
-  @doc since: "0.4.0"
+  @doc since: "0.5.0"
   @doc """
   Builds a `bazaar` discovery extension payload (`info` + `schema`).
 

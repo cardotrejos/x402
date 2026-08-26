@@ -68,7 +68,7 @@ defmodule X402.Facilitator.Auth do
     * a module implementing `X402.Facilitator.Auth` — built with default options
     * `{module, opts}` — built with the given options
   """
-  @doc since: "0.4.2"
+  @doc since: "0.5.0"
   @spec new(nil | module() | {module(), keyword()}) :: {:ok, nil | t()} | {:error, term()}
   def new(nil), do: {:ok, nil}
 
@@ -81,7 +81,7 @@ defmodule X402.Facilitator.Auth do
 
   When no auth is configured this returns `{:ok, []}`.
   """
-  @doc since: "0.4.2"
+  @doc since: "0.5.0"
   @spec headers(nil | t(), request_info()) ::
           {:ok, [{String.t(), String.t()}]} | {:error, term()}
   def headers(nil, _request_info), do: {:ok, []}

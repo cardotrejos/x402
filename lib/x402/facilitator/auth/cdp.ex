@@ -69,7 +69,7 @@ defmodule X402.Facilitator.Auth.CDP do
   Note that this URL is never used as a default; a facilitator must be
   configured with an explicit `url:` option.
   """
-  @doc since: "0.4.2"
+  @doc since: "0.5.0"
   @spec facilitator_url() :: String.t()
   def facilitator_url, do: @facilitator_url
 
@@ -81,7 +81,7 @@ defmodule X402.Facilitator.Auth.CDP do
   a valid Ed25519 or P-256 key. For config-driven credentials, see the
   `otp_app` option on `X402.Facilitator.start_link/1`.
   """
-  @doc since: "0.4.2"
+  @doc since: "0.5.0"
   @spec new(keyword()) :: {:ok, t()} | {:error, term()}
   def new(opts) when is_list(opts) do
     api_key_id = Keyword.get(opts, :api_key_id)
@@ -106,7 +106,7 @@ defmodule X402.Facilitator.Auth.CDP do
   The JWT binds the request method, host, and path in its `uris` claim and is
   signed fresh for every call.
   """
-  @doc since: "0.4.2"
+  @doc since: "0.5.0"
   @spec headers(t(), Auth.request_info()) :: {:ok, [{String.t(), String.t()}]}
   def headers(%__MODULE__{} = auth, %{method: method, host: host, path: path}) do
     token = jwt(auth, method, host, path)

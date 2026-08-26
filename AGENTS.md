@@ -52,7 +52,7 @@ mix compile --no-optional-deps  # Must compile without Finch
   ```bash
   CDP_API_KEY_ID=... CDP_API_KEY_SECRET=... \
     X402_PAYER_KEY=... X402_SETTLE=1 \
-    mix test apps/x402/test/x402/facilitator/auth/cdp_live_test.exs --only smoke
+    mix test test/x402/facilitator/auth/cdp_live_test.exs --only smoke
   ```
 - >90% line coverage required
 

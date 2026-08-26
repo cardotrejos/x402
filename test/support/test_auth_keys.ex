@@ -14,6 +14,11 @@ defmodule X402.TestAuthKeys do
   def ec_p256 do
     {public_key, private_key} = :crypto.generate_key(:ecdh, :secp256r1)
 
+    # :crypto returns the scalar as an unpadded big-endian integer, which is
+    # occasionally shorter than 32 bytes; the fixed-length DER template below
+    # needs exactly 32.
+    private_key = pad_left(private_key, 32)
+
     der =
       <<48, 119, 2, 1, 1, 4, 32, private_key::binary, 160, 10, 6, 8, 42, 134, 72, 206, 61, 3, 1,
         7, 161, 68, 3, 66, 0, public_key::binary>>
@@ -40,4 +45,9 @@ defmodule X402.TestAuthKeys do
     do: <<2, byte_size(bin) + 1, 0, bin::binary>>
 
   defp der_int(bin), do: <<2, byte_size(bin), bin::binary>>
+
+  defp pad_left(bin, width) when byte_size(bin) < width,
+    do: <<0::size((width - byte_size(bin)) * 8), bin::binary>>
+
+  defp pad_left(bin, _width), do: bin
 end
