@@ -30,7 +30,7 @@ defmodule X402.Facilitator do
         "Application that holds this facilitator's configuration. When set, " <>
           "`config :app, <name>` is merged under the given options, with the " <>
           "options taking precedence. Enables the Ecto-style pattern where " <>
-          "`config/runtime.exs` is the single source of truth."
+          "`config/runtime.exs` is the single source of truth. Available since v0.5.0."
     ],
     url: [
       type: :string,
@@ -68,7 +68,8 @@ defmodule X402.Facilitator do
       doc:
         "Request authentication. Either `nil` (no authentication), an " <>
           "`X402.Facilitator.Auth` module, or a `{module, opts}` tuple. See " <>
-          "`X402.Facilitator.Auth.CDP` for the Coinbase Developer Platform facilitator."
+          "`X402.Facilitator.Auth.CDP` for the Coinbase Developer Platform " <>
+          "facilitator. Available since v0.5.0."
     ]
   ]
 
