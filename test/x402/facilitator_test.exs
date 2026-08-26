@@ -1,6 +1,8 @@
 defmodule X402.FacilitatorTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias X402.Facilitator
   alias X402.Facilitator.Error
   alias X402.Hooks.Context
@@ -130,6 +132,19 @@ defmodule X402.FacilitatorTest do
 
     def after_settle(%Context{} = context, _metadata), do: {:cont, context}
     def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule FailingAuth do
+    @moduledoc false
+    @behaviour X402.Facilitator.Auth
+
+    defstruct [:ref]
+
+    @impl true
+    def new(_opts), do: {:ok, %__MODULE__{}}
+
+    @impl true
+    def headers(_auth, _request_info), do: {:error, :no_headers_available}
   end
 
   setup :setup_bypass
@@ -409,6 +424,76 @@ defmodule X402.FacilitatorTest do
              Facilitator.verify(facilitator, %{}, %{})
   end
 
+  test "logs a warning when the facilitator declines verification", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      Plug.Conn.resp(conn, 400, Jason.encode!(%{"error" => "bad request"}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    log =
+      capture_log(fn ->
+        assert {:error, %Error{type: :http_error, status: 400}} =
+                 Facilitator.verify(facilitator, %{}, %{})
+      end)
+
+    assert log =~ "[X402.Facilitator] verify failed at /verify"
+    assert log =~ "type=http_error"
+    assert log =~ "status=400"
+  end
+
+  test "logs a warning for non-HTTP processing failures", %{
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    log =
+      capture_log(fn ->
+        assert {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}} =
+                 Facilitator.verify(
+                   facilitator,
+                   %{"value" => "11"},
+                   %{"scheme" => "upto", "maxPrice" => "10"}
+                 )
+      end)
+
+    assert log =~ "[X402.Facilitator] verify failed at /verify"
+    assert log =~ "payment_value_exceeds_max_price"
+  end
+
+  test "does not log a warning on success", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %{status: 200}} = Facilitator.verify(facilitator, %{}, %{})
+      end)
+
+    refute log =~ "[X402.Facilitator]"
+  end
+
   test "verify/3 rejects upto payments above maxPrice before HTTP request", %{
     bypass: bypass,
     finch: finch,
@@ -556,6 +641,206 @@ defmodule X402.FacilitatorTest do
              Facilitator.start_link(finch: :finch, hooks: :not_a_hook_module)
   end
 
+  test "start_link validates the auth option shape" do
+    assert {:error, %NimbleOptions.ValidationError{}} =
+             Facilitator.start_link(finch: :finch, auth: {NotAnAuthModule, []})
+
+    assert {:error, %NimbleOptions.ValidationError{}} =
+             Facilitator.start_link(finch: :finch, auth: :not_a_module)
+  end
+
+  test "start_link fails fast on invalid auth credentials" do
+    assert {:error, {:invalid_auth, :invalid_secret_format}} =
+             Facilitator.start_link(
+               finch: :finch,
+               auth: {X402.Facilitator.Auth.CDP, api_key_id: "key", api_key_secret: "not-base64"}
+             )
+  end
+
+  test "verify/3 uses the configuration from the otp_app", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    {secret, _public_key} = X402.TestAuthKeys.ed25519()
+    name = unique_name("config_facilitator")
+
+    set_facilitator_config(:x402, name,
+      finch: finch,
+      url: facilitator_url,
+      auth: {X402.Facilitator.Auth.CDP, api_key_id: "key-123", api_key_secret: secret}
+    )
+
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      [authorization] = Plug.Conn.get_req_header(conn, "authorization")
+      assert String.starts_with?(authorization, "Bearer ")
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator = start_supervised!({Facilitator, otp_app: :x402, name: name})
+
+    assert {:ok, %{status: 200, body: %{"verified" => true}}} =
+             Facilitator.verify(facilitator, %{}, %{})
+  end
+
+  test "explicit options take precedence over the otp_app's configuration", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    {secret, _public_key} = X402.TestAuthKeys.ed25519()
+    name = unique_name("config_override_facilitator")
+
+    set_facilitator_config(:x402, name,
+      finch: finch,
+      url: "https://wrong.example",
+      auth: {X402.Facilitator.Auth.CDP, api_key_id: "wrong-key", api_key_secret: secret}
+    )
+
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         otp_app: :x402,
+         name: name,
+         url: facilitator_url,
+         auth: {X402.Facilitator.Auth.CDP, api_key_id: "key-123", api_key_secret: secret}}
+      )
+
+    assert {:ok, %{status: 200, body: %{"verified" => true}}} =
+             Facilitator.verify(facilitator, %{}, %{})
+  end
+
+  test "verify/3 sends a CDP JWT Authorization header", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    {secret, public_key} = X402.TestAuthKeys.ed25519()
+
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      [authorization] = Plug.Conn.get_req_header(conn, "authorization")
+      assert String.starts_with?(authorization, "Bearer ")
+
+      token = String.replace_prefix(authorization, "Bearer ", "")
+      assert verify_jwt(token, public_key)
+
+      assert jwt_payload(token)["uris"] ==
+               ["POST localhost:#{bypass.port}/verify"]
+
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         auth: {X402.Facilitator.Auth.CDP, api_key_id: "key-123", api_key_secret: secret}}
+      )
+
+    assert {:ok, %{status: 200, body: %{"verified" => true}}} =
+             Facilitator.verify(facilitator, %{}, %{})
+  end
+
+  test "settle/3 sends a CDP JWT Authorization header", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    {secret, public_key} = X402.TestAuthKeys.ed25519()
+
+    Bypass.expect(bypass, "POST", "/settle", fn conn ->
+      [authorization] = Plug.Conn.get_req_header(conn, "authorization")
+      token = String.replace_prefix(authorization, "Bearer ", "")
+      assert verify_jwt(token, public_key)
+      assert jwt_payload(token)["uris"] == ["POST localhost:#{bypass.port}/settle"]
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"settled" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: facilitator_url,
+         auth: {X402.Facilitator.Auth.CDP, api_key_id: "key-123", api_key_secret: secret}}
+      )
+
+    assert {:ok, %{status: 200, body: %{"settled" => true}}} =
+             Facilitator.settle(facilitator, %{}, %{})
+  end
+
+  test "verify/3 binds the CDP JWT to the base URL path plus the endpoint", %{
+    bypass: bypass,
+    finch: finch
+  } do
+    {secret, public_key} = X402.TestAuthKeys.ed25519()
+    base_url = "http://localhost:#{bypass.port}/platform/v2/x402"
+
+    Bypass.expect(bypass, "POST", "/platform/v2/x402/verify", fn conn ->
+      [authorization] = Plug.Conn.get_req_header(conn, "authorization")
+      token = String.replace_prefix(authorization, "Bearer ", "")
+      assert verify_jwt(token, public_key)
+
+      assert jwt_payload(token)["uris"] ==
+               ["POST localhost:#{bypass.port}/platform/v2/x402/verify"]
+
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"),
+         finch: finch,
+         url: base_url,
+         auth: {X402.Facilitator.Auth.CDP, api_key_id: "key-123", api_key_secret: secret}}
+      )
+
+    assert {:ok, %{status: 200, body: %{"verified" => true}}} =
+             Facilitator.verify(facilitator, %{}, %{})
+  end
+
+  test "verify/3 sends no Authorization header without auth config", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    parent = self()
+
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      send(parent, {:auth_headers, Plug.Conn.get_req_header(conn, "authorization")})
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    assert {:ok, %{status: 200}} = Facilitator.verify(facilitator, %{}, %{})
+    assert_receive {:auth_headers, []}
+  end
+
+  test "returns auth_failed error when auth headers cannot be built", %{
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    facilitator =
+      start_supervised!(
+        {Facilitator,
+         name: unique_name("facilitator"), finch: finch, url: facilitator_url, auth: FailingAuth}
+      )
+
+    assert {:error, %Error{type: :auth_failed, reason: :no_headers_available, retryable: false}} =
+             Facilitator.verify(facilitator, %{}, %{})
+  end
+
   test "hook context struct includes payload and requirements" do
     assert %Context{payload: %{a: 1}, requirements: %{b: 2}, result: nil, error: nil} =
              Context.new(%{a: 1}, %{b: 2})
@@ -563,5 +848,29 @@ defmodule X402.FacilitatorTest do
 
   defp unique_name(prefix) do
     String.to_atom("#{prefix}_#{System.unique_integer([:positive, :monotonic])}")
+  end
+
+  defp set_facilitator_config(app, name, opts) do
+    previous = Application.get_env(app, name)
+    Application.put_env(app, name, opts)
+
+    on_exit(fn ->
+      case previous do
+        nil -> Application.delete_env(app, name)
+        value -> Application.put_env(app, name, value)
+      end
+    end)
+  end
+
+  defp verify_jwt(token, public_key) do
+    [header_part, payload_part, signature_part] = String.split(token, ".")
+    signing_input = header_part <> "." <> payload_part
+    signature = Base.url_decode64!(signature_part, padding: false)
+    :crypto.verify(:eddsa, :none, signing_input, signature, [public_key, :ed25519])
+  end
+
+  defp jwt_payload(token) do
+    [_header_part, payload_part, _signature_part] = String.split(token, ".")
+    payload_part |> Base.url_decode64!(padding: false) |> Jason.decode!()
   end
 end

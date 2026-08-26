@@ -19,6 +19,8 @@ defmodule X402.Facilitator.HTTP do
   - `:max_retries` (default: `2`)
   - `:retry_backoff_ms` (default: `100`)
   - `:receive_timeout_ms` (default: `5_000`)
+  - `:headers` (default: `[]`) — additional `{name, value}` request headers,
+    merged after the JSON content headers.
 
   ## TLS Verification
 
@@ -53,6 +55,7 @@ defmodule X402.Facilitator.HTTP do
          {:ok, max_retries} <- fetch_non_negative_integer(opts, :max_retries, 2),
          {:ok, retry_backoff_ms} <- fetch_non_negative_integer(opts, :retry_backoff_ms, 100),
          {:ok, receive_timeout_ms} <- fetch_non_negative_integer(opts, :receive_timeout_ms, 5_000),
+         {:ok, headers} <- fetch_headers(opts),
          {:ok, finch_module} <- ensure_finch_module(),
          {:ok, encoded_payload} <- Jason.encode(payload) do
       ctx = %{
@@ -60,6 +63,7 @@ defmodule X402.Facilitator.HTTP do
         finch_name: finch_name,
         url: join_url(base_url, path),
         payload: encoded_payload,
+        headers: headers,
         receive_timeout_ms: receive_timeout_ms,
         retry_backoff_ms: retry_backoff_ms
       }
@@ -118,11 +122,12 @@ defmodule X402.Facilitator.HTTP do
            finch_name: finch_name,
            url: url,
            payload: encoded_payload,
+           headers: headers,
            receive_timeout_ms: receive_timeout_ms
          },
          attempt
        ) do
-    request = finch_module.build(:post, url, @json_headers, encoded_payload)
+    request = finch_module.build(:post, url, @json_headers ++ headers, encoded_payload)
     finch_opts = [receive_timeout: receive_timeout_ms]
 
     response =
@@ -275,6 +280,23 @@ defmodule X402.Facilitator.HTTP do
       invalid -> {:error, invalid_option_error(key, invalid)}
     end
   end
+
+  defp fetch_headers(opts) do
+    case Keyword.get(opts, :headers, []) do
+      headers when is_list(headers) ->
+        if Enum.all?(headers, &valid_header?/1) do
+          {:ok, headers}
+        else
+          {:error, invalid_option_error(:headers, headers)}
+        end
+
+      invalid ->
+        {:error, invalid_option_error(:headers, invalid)}
+    end
+  end
+
+  defp valid_header?({name, value}) when is_binary(name) and is_binary(value), do: true
+  defp valid_header?(_header), do: false
 
   defp invalid_option_error(key, invalid) do
     %Error{

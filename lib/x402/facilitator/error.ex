@@ -7,7 +7,8 @@ defmodule X402.Facilitator.Error do
   Error type identifier.
   """
   @type error_type ::
-          :finch_unavailable
+          :auth_failed
+          | :finch_unavailable
           | :http_error
           | :insecure_scheme
           | :invalid_json
