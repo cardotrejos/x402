@@ -13,13 +13,13 @@ jobs:
         elixir: ["1.19"]
         otp: ["27"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             deps
@@ -50,13 +50,13 @@ jobs:
         elixir: ["1.19"]
         otp: ["27"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             deps
@@ -66,7 +66,7 @@ jobs:
             ${{ runner.os }}-mix-v2-${{ matrix.elixir }}-${{ matrix.otp }}-
             ${{ runner.os }}-mix-v2-
       - name: Cache PLTs
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: priv/plts
           key: ${{ runner.os }}-plt-v3-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
