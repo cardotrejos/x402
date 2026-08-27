@@ -11,9 +11,10 @@ defmodule X402.Client do
 
   Signing dispatches through `X402.Scheme.Registry`: out of the box this
   client signs the `exact` scheme on EVM (`eip155:*`) networks via EIP-3009
-  (`X402.Scheme.ExactEVM`); other scheme/network combinations return
-  `{:error, {:unsupported_kind, scheme, network}}` unless a matching
-  `X402.Scheme` module is passed with the `:schemes` option.
+  (`X402.Scheme.ExactEVM`) and the `upto` scheme on EVM networks via
+  Permit2 (`X402.Scheme.UptoEVM`); other scheme/network combinations
+  return `{:error, {:unsupported_kind, scheme, network}}` unless a
+  matching `X402.Scheme` module is passed with the `:schemes` option.
 
   ## Example
 
@@ -119,9 +120,11 @@ defmodule X402.Client do
   option filters **and** that this client can sign: structurally valid per
   `X402.PaymentRequirements.validate/1` and resolved by
   `X402.Scheme.Registry` to a scheme module with a sign callback — by
-  default `exact` on an `eip155:*` network via `X402.Scheme.ExactEVM`,
-  which additionally requires the EIP-712 domain fields (`extra.name` /
-  `extra.version`). Pass additional schemes with the `:schemes` option.
+  default `exact` on an `eip155:*` network via `X402.Scheme.ExactEVM`
+  (which additionally requires the EIP-712 domain fields `extra.name` /
+  `extra.version`) and `upto` on an `eip155:*` network via
+  `X402.Scheme.UptoEVM` (which requires `extra.facilitatorAddress`). Pass
+  additional schemes with the `:schemes` option.
 
   The selected entry is returned exactly as the server sent it, so it can be
   echoed verbatim as the payload's `accepted` value.
@@ -193,8 +196,9 @@ defmodule X402.Client do
   gas-sponsored Permit2 approvals.
 
   Signing dispatches on the scheme and network of the chosen requirements
-  through `X402.Scheme.Registry`; out of the box this supports `exact` on
-  `eip155:*` networks (EIP-3009). Other combinations return
+  through `X402.Scheme.Registry`; out of the box this supports `exact`
+  (EIP-3009) and `upto` (Permit2) on `eip155:*` networks. Other
+  combinations return
   `{:error, {:unsupported_kind, scheme, network}}` unless a matching
   module is passed with the `:schemes` option. Scheme modules receive the
   validated build options, so options like `:valid_after_buffer` reach
