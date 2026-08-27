@@ -1476,6 +1476,17 @@ defmodule X402.Plug.PaymentGateTest do
   # ---------------------------------------------------------------------------
 
   describe "init/1 validation" do
+    test "normalizes :global and :via names to the default ETSCache adapter" do
+      global = PaymentGate.init(routes: [@route], payment_identifier_cache: {:global, :my_cache})
+
+      assert global.payment_identifier_cache == {ETSCache, {:global, :my_cache}}
+
+      via_name = {:via, Registry, {MyRegistry, :cache}}
+      via = PaymentGate.init(routes: [@route], payment_identifier_cache: via_name)
+
+      assert via.payment_identifier_cache == {ETSCache, via_name}
+    end
+
     test "raises on missing routes and invalid values" do
       assert_raise NimbleOptions.ValidationError, fn ->
         PaymentGate.init(facilitator: self())

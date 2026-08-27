@@ -343,6 +343,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             {:ok, Cache.adapter() | nil} | {:error, String.t()}
     def validate_payment_identifier_cache(nil), do: {:ok, nil}
 
+    # {:global, name} and {:via, registry, term} are unambiguous GenServer
+    # names, never adapter tuples — route them to the default ETSCache adapter
+    # like a bare pid/name.
+    def validate_payment_identifier_cache({:global, _name} = server),
+      do: {:ok, {ETSCache, server}}
+
+    def validate_payment_identifier_cache({:via, registry, _term} = server)
+        when is_atom(registry),
+        do: {:ok, {ETSCache, server}}
+
     def validate_payment_identifier_cache({module, _cache} = adapter) when is_atom(module) do
       case Cache.validate_adapter(adapter) do
         :ok ->

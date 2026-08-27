@@ -118,18 +118,20 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
     assert {:hit, :verified} = ETSCache.get(cache, "payment-1")
   end
 
-  test "put_new/3 evicts the soonest-expiring entry when at max_size" do
+  test "put_new/3 refuses new entries at max_size without evicting live claims" do
     cache = start_cache(ttl_ms: 1_000, max_size: 2)
 
     assert :ok = ETSCache.put_new(cache, "payment-1", :verified)
     assert :ok = ETSCache.put_new(cache, "payment-2", :verified)
 
-    # Adding a third entry must succeed (evicts one of the existing entries).
-    assert :ok = ETSCache.put_new(cache, "payment-3", :verified)
+    # A live claim is another payment's replay lock — never evict it to admit
+    # a new claim; refuse instead (the gate fails closed on this error).
+    assert {:error, :cache_full} = ETSCache.put_new(cache, "payment-3", :verified)
 
     %{table: table} = :sys.get_state(cache)
     assert :ets.info(table, :size) == 2
-    assert {:hit, :verified} = ETSCache.get(cache, "payment-3")
+    assert {:hit, :verified} = ETSCache.get(cache, "payment-1")
+    assert {:hit, :verified} = ETSCache.get(cache, "payment-2")
   end
 
   defp start_cache(opts) do

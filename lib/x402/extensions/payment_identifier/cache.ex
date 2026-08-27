@@ -107,7 +107,8 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   @type write_result :: :ok | {:error, term()}
 
   @typedoc "Result returned by `put_new/3`."
-  @type put_new_result :: :ok | {:error, :already_exists} | {:error, term()}
+  @type put_new_result ::
+          :ok | {:error, :already_exists} | {:error, :cache_full} | {:error, term()}
 
   @doc """
   Reads the value stored for `key`, or `:miss` when absent or expired.
@@ -131,7 +132,10 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   a unique constraint, and so on).
 
   The entry must expire after the adapter's TTL; an expired entry must not
-  block a new claim for the same `key`. Return `{:error, :already_exists}`
+  block a new claim for the same `key`. An adapter with bounded capacity must
+  **never evict a live entry to admit a new claim** — a live claim is another
+  payment's replay lock; refuse with `{:error, :cache_full}` instead
+  (`X402.Plug.PaymentGate` fails closed on it). Return `{:error, :already_exists}`
   only for a live (non-expired) duplicate — any other `{:error, reason}` is
   treated as an adapter failure and fails the request closed.
   """

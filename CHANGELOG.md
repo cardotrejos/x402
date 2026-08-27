@@ -25,7 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour contract (TTL semantics and return values documented), so
   alternative adapters (Redis, Mnesia, database-backed) can be plugged into
   `X402.Plug.PaymentGate`; the cache moduledoc includes a Redis `SET NX PX`
-  adapter sketch
+  adapter sketch. The contract forbids evicting live entries to admit a new
+  claim: at capacity, `ETSCache.put_new/3` now purges expired entries and
+  otherwise refuses with `{:error, :cache_full}` (the gate fails closed) —
+  previously it evicted the soonest-expiring live claim, which let cheap junk
+  claims drop legitimate replay locks
+- `X402.Plug.PaymentGate` `payment_identifier_cache:` accepts `{:global, name}`
+  and `{:via, registry, term}` GenServer names, normalized to the bundled
+  `ETSCache` adapter like a bare pid/name
 - `X402.Plug.PaymentGate` `payment_identifier_cache:` now also accepts a
   `{module, cache}` adapter tuple implementing
   `X402.Extensions.PaymentIdentifier.Cache`; a bare pid/name keeps working and
