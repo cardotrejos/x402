@@ -154,6 +154,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget/consent hook and enforces `https://` for non-loopback resources
 - `[:x402, :client, :select | :sign | :build | :request]` telemetry events
 - `guides/client.md` — "Paying for x402 Resources from Elixir"
+- `X402.EIP712` — shared EIP-712 hashing primitives (requirements-derived
+  domain, domain separator, `hash_struct/2`, `digest/2`, and the ABI word
+  encoders), extracted from `X402.EIP3009` which now delegates to it
 
 ## [0.5.0] - 2026-08-26
 

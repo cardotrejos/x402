@@ -136,7 +136,8 @@ defmodule X402.MixProject do
           X402.Client.Finch,
           X402.Signer,
           X402.Signer.LocalKey,
-          X402.EIP3009
+          X402.EIP3009,
+          X402.EIP712
         ],
         "Facilitator Client": [
           X402.Facilitator,
