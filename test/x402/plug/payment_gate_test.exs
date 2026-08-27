@@ -324,6 +324,26 @@ defmodule X402.Plug.PaymentGateTest do
       refute_received {:verify_called, _, _, _}
     end
 
+    test "returns 400 for v2 payloads with an incomplete accepted object" do
+      facilitator = start_mock_facilitator()
+
+      header =
+        valid_payment_payload()
+        |> update_in(["accepted"], &Map.delete(&1, "asset"))
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      required = decode_payment_required!(conn)
+
+      assert conn.status == 400
+      assert required["error"] == "invalid_payload"
+      refute_received {:verify_called, _, _, _}
+    end
+
     test "rejects x402Version other than 2 with 400" do
       facilitator = start_mock_facilitator()
 

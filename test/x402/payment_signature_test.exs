@@ -15,6 +15,23 @@ defmodule X402.PaymentSignatureTest do
     "extra" => %{}
   }
 
+  @v1_payload %{
+    "x402Version" => 1,
+    "scheme" => "exact",
+    "network" => "base-sepolia",
+    "payload" => %{
+      "signature" => "0xsignature",
+      "authorization" => %{
+        "from" => "0x1111111111111111111111111111111111111111",
+        "to" => "0x2222222222222222222222222222222222222222",
+        "value" => "10000",
+        "validAfter" => "0",
+        "validBefore" => "9999999999",
+        "nonce" => "0xnonce"
+      }
+    }
+  }
+
   describe "header_name/0" do
     test "returns PAYMENT-SIGNATURE" do
       assert PaymentSignature.header_name() == "PAYMENT-SIGNATURE"
@@ -23,13 +40,7 @@ defmodule X402.PaymentSignatureTest do
 
   describe "decode/1" do
     test "decodes a valid base64 json payload" do
-      payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "exact",
-        "payerWallet" => "0x1111111111111111111111111111111111111111"
-      }
-
+      payload = v2_payload("9000")
       encoded = payload |> Jason.encode!() |> Base.encode64()
 
       assert PaymentSignature.decode(encoded) == {:ok, payload}
@@ -66,13 +77,8 @@ defmodule X402.PaymentSignatureTest do
   end
 
   describe "validate/1" do
-    test "returns ok for complete payload" do
-      payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "exact",
-        "payerWallet" => "0x1111111111111111111111111111111111111111"
-      }
+    test "validates v2 payloads through the public API" do
+      payload = v2_payload("9000")
 
       assert PaymentSignature.validate(payload) == {:ok, payload}
     end
@@ -81,42 +87,21 @@ defmodule X402.PaymentSignatureTest do
       assert PaymentSignature.validate(nil) == {:error, :invalid_payload}
     end
 
-    test "returns missing_fields for absent values" do
-      payload = %{"network" => "eip155:8453"}
+    test "rejects explicit v1 payloads as unsupported" do
+      assert PaymentSignature.validate(@v1_payload) ==
+               {:error, {:unsupported_x402_version, 1}}
+    end
+
+    test "rejects version-absent payloads as unsupported v1" do
+      payload = Map.delete(@v1_payload, "x402Version")
 
       assert PaymentSignature.validate(payload) ==
-               {:error, {:missing_fields, ["payerWallet", "scheme", "transactionHash"]}}
+               {:error, {:unsupported_x402_version, nil}}
     end
 
-    test "treats empty strings as missing" do
-      payload = %{
-        "transactionHash" => "",
-        "network" => "eip155:8453",
-        "scheme" => "",
-        "payerWallet" => "0x1111111111111111111111111111111111111111"
-      }
-
-      assert PaymentSignature.validate(payload) ==
-               {:error, {:missing_fields, ["scheme", "transactionHash"]}}
-    end
-
-    test "validates upto payments when value is within maxPrice from payload" do
-      payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "upto",
-        "payerWallet" => "0x1111111111111111111111111111111111111111",
-        "value" => "0.009",
-        "maxPrice" => "0.01"
-      }
-
-      assert PaymentSignature.validate(payload) == {:ok, payload}
-    end
-
-    test "validates v2 payloads through the public API" do
-      payload = v2_payload("9000")
-
-      assert PaymentSignature.validate(payload) == {:ok, payload}
+    test "rejects atom-keyed v1 versions as unsupported" do
+      assert PaymentSignature.validate(%{x402Version: 1}) ==
+               {:error, {:unsupported_x402_version, 1}}
     end
 
     test "rejects unsupported explicit protocol versions" do
@@ -131,62 +116,47 @@ defmodule X402.PaymentSignatureTest do
       assert PaymentSignature.validate(Map.put(v2_payload("9000"), "extensions", [])) ==
                {:error, :invalid_payload}
     end
+
+    test "returns missing_fields for incomplete v2 accepted objects" do
+      payload = update_in(v2_payload("9000"), ["accepted"], &Map.delete(&1, "asset"))
+
+      assert PaymentSignature.validate(payload) ==
+               {:error, {:missing_fields, ["asset"]}}
+    end
   end
 
   describe "validate/2" do
-    test "validates upto payments when value is within requirements maxPrice" do
-      payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "upto",
-        "payerWallet" => "0x1111111111111111111111111111111111111111",
-        "value" => "0.009"
-      }
+    test "validates upto payments when value is within the requirements amount" do
+      payload = v2_payload("9000")
 
-      requirements = %{"scheme" => "upto", "maxPrice" => "0.01"}
-
-      assert PaymentSignature.validate(payload, requirements) == {:ok, payload}
+      assert PaymentSignature.validate(payload, @v2_requirements) == {:ok, payload}
     end
 
-    test "rejects upto payments when value exceeds maxPrice" do
-      payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "upto",
-        "payerWallet" => "0x1111111111111111111111111111111111111111",
-        "value" => "0.02"
-      }
+    test "rejects upto payments when value exceeds the requirements amount" do
+      payload = v2_payload("10001")
 
-      requirements = %{"scheme" => "upto", "maxPrice" => "0.01"}
-
-      assert PaymentSignature.validate(payload, requirements) ==
+      assert PaymentSignature.validate(payload, @v2_requirements) ==
                {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
     end
 
     test "rejects upto payments when value is missing" do
-      payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "upto",
-        "payerWallet" => "0x1111111111111111111111111111111111111111"
-      }
+      payload =
+        v2_payload("ignored")
+        |> put_in(["payload"], %{"signature" => "0xsignature"})
 
-      requirements = %{"scheme" => "upto", "maxPrice" => "0.01"}
-
-      assert PaymentSignature.validate(payload, requirements) ==
+      assert PaymentSignature.validate(payload, @v2_requirements) ==
                {:error, {:invalid_upto_payment, :missing_payment_value}}
     end
 
-    test "returns invalid_payload for non-map requirements" do
-      payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "upto",
-        "payerWallet" => "0x1111111111111111111111111111111111111111",
-        "value" => "0.01"
-      }
+    test "rejects v1 payloads regardless of requirements" do
+      requirements = %{"scheme" => "exact", "amount" => "10000"}
 
-      assert PaymentSignature.validate(payload, :bad) == {:error, :invalid_payload}
+      assert PaymentSignature.validate(@v1_payload, requirements) ==
+               {:error, {:unsupported_x402_version, 1}}
+    end
+
+    test "returns invalid_payload for non-map requirements" do
+      assert PaymentSignature.validate(v2_payload("9000"), :bad) == {:error, :invalid_payload}
     end
 
     test "matches the complete v2 requirements object" do
@@ -229,14 +199,8 @@ defmodule X402.PaymentSignatureTest do
   end
 
   describe "decode_and_validate/1" do
-    test "returns ok for valid encoded payload" do
-      payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "exact",
-        "payerWallet" => "0x1111111111111111111111111111111111111111"
-      }
-
+    test "returns ok for valid encoded v2 payload" do
+      payload = v2_payload("9000")
       encoded = payload |> Jason.encode!() |> Base.encode64()
 
       assert PaymentSignature.decode_and_validate(encoded) == {:ok, payload}
@@ -246,29 +210,21 @@ defmodule X402.PaymentSignatureTest do
       assert PaymentSignature.decode_and_validate("%%%") == {:error, :invalid_base64}
     end
 
-    test "returns validation errors for missing fields" do
+    test "returns unsupported_x402_version for version-absent payloads" do
       payload = %{"network" => "eip155:8453"}
       encoded = payload |> Jason.encode!() |> Base.encode64()
 
       assert PaymentSignature.decode_and_validate(encoded) ==
-               {:error, {:missing_fields, ["payerWallet", "scheme", "transactionHash"]}}
+               {:error, {:unsupported_x402_version, nil}}
     end
   end
 
   describe "decode_and_validate/2" do
     test "validates upto scheme against requirements" do
-      payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "upto",
-        "payerWallet" => "0x1111111111111111111111111111111111111111",
-        "value" => "0.02"
-      }
-
-      requirements = %{"scheme" => "upto", "maxPrice" => "0.01"}
+      payload = v2_payload("10001")
       encoded = payload |> Jason.encode!() |> Base.encode64()
 
-      assert PaymentSignature.decode_and_validate(encoded, requirements) ==
+      assert PaymentSignature.decode_and_validate(encoded, @v2_requirements) ==
                {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
     end
 

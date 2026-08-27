@@ -1,35 +1,24 @@
 defmodule X402.PaymentSignature do
   @moduledoc """
-  Decodes and validates x402 `PAYMENT-SIGNATURE` header values.
+  Decodes and validates x402 v2 `PAYMENT-SIGNATURE` header values.
 
-  The header value is Base64-encoded JSON. This module supports both the legacy
-  v1 signature fields and the v2 `PaymentPayload` envelope.
+  The header value is Base64-encoded JSON carrying the v2 `PaymentPayload`
+  envelope (`x402Version: 2`). `accepted` must be a complete
+  `X402.PaymentRequirements` object and `payload` must contain the
+  scheme-specific signed data. When requirements are passed to `validate/2`,
+  every core field is matched and advertised `extra` values must be preserved.
 
-  For v2, `accepted` must be a complete `X402.PaymentRequirements` object and
-  `payload` must contain the scheme-specific signed data. When requirements are
-  passed to `validate/2`, every core field is matched and advertised `extra`
-  values must be preserved.
+  Payloads that declare `x402Version: 1` — or omit the version entirely, which
+  x402 v1 clients do — are rejected with
+  `{:error, {:unsupported_x402_version, version}}`. This SDK does not speak the
+  v1 wire format (v1 payments arrive in the `X-PAYMENT` header, which
+  `X402.Plug.PaymentGate` never reads); rejecting explicitly is safer than the
+  false interop of validating a shape no facilitator settles.
   """
 
   alias X402.PaymentRequirements
   alias X402.Telemetry
   alias X402.Utils
-
-  @required_fields ~w(transactionHash network scheme payerWallet)
-
-  # EIP-55 Ethereum address: 0x followed by exactly 40 hex characters (case-insensitive).
-  # We accept mixed-case (checksummed) and lower-case (normalised) addresses.
-  @eth_address_regex ~r/^0x[0-9a-fA-F]{40}$/
-
-  # Transaction hash: 0x followed by exactly 64 hex characters (256-bit hash).
-  # Solana tx IDs are base58, 87-88 chars — we detect them by absence of "0x" prefix.
-  @eth_tx_hash_regex ~r/^0x[0-9a-fA-F]{64}$/
-
-  # Solana base-58 transaction signature (87–88 characters of base58 alphabet).
-  @solana_tx_sig_regex ~r/^[1-9A-HJ-NP-Za-km-z]{87,88}$/
-
-  # Solana wallet address: base58, 32-44 characters.
-  @solana_address_regex ~r/^[1-9A-HJ-NP-Za-km-z]{43,44}$/
 
   # Single source of truth for the 8 KB decode guard — see X402.Header.
   @max_header_bytes X402.Header.max_header_bytes()
@@ -47,10 +36,10 @@ defmodule X402.PaymentSignature do
           | :invalid_payment_requirements
           | :invalid_x402_version
           | :no_matching_requirements
+          | {:unsupported_x402_version, 1 | nil}
           | {:missing_fields, [String.t()]}
           | {:invalid_fields, [String.t()]}
           | {:invalid_upto_payment, upto_validation_error()}
-          | {:invalid_format, [{field :: String.t(), reason :: atom()}]}
 
   @type decode_and_validate_error :: decode_error() | validate_error()
 
@@ -139,11 +128,13 @@ defmodule X402.PaymentSignature do
 
   @doc since: "0.1.0", group: :verification
   @doc """
-  Validates a decoded v1 or v2 `PAYMENT-SIGNATURE` payload.
+  Validates a decoded v2 `PAYMENT-SIGNATURE` payload.
 
   Payloads with `x402Version: 2` are validated against the v2
-  `PaymentPayload` structure. Payloads with version `1`, or without an explicit
-  version, retain the legacy field validation used by x402 v1.
+  `PaymentPayload` structure. Payloads declaring version `1` — or omitting the
+  version, as v1 clients do — return
+  `{:error, {:unsupported_x402_version, version}}`; any other version returns
+  `{:error, :invalid_x402_version}`.
 
   ## Examples
 
@@ -195,28 +186,8 @@ defmodule X402.PaymentSignature do
   defp do_validate(payload, requirements) do
     case Utils.map_value(payload, {"x402Version", :x402Version}) do
       2 -> validate_v2(payload, requirements)
-      version when version in [nil, 1] -> validate_v1(payload, requirements)
+      version when version in [nil, 1] -> validation_error({:unsupported_x402_version, version})
       _version -> validation_error(:invalid_x402_version)
-    end
-  end
-
-  @spec validate_v1(map(), map()) :: {:ok, map()} | {:error, validate_error()}
-  defp validate_v1(payload, requirements) do
-    with :ok <- check_missing_fields(payload),
-         :ok <- check_field_formats(payload) do
-      case validate_scheme(payload, requirements) do
-        :ok ->
-          Telemetry.emit(:payment_signature, :validate, :ok, %{required_fields: @required_fields})
-          {:ok, payload}
-
-        {:error, {:invalid_upto_payment, reason}} = error ->
-          Telemetry.emit(:payment_signature, :validate, :error, %{
-            reason: :invalid_upto_payment,
-            detail: reason
-          })
-
-          error
-      end
     end
   end
 
@@ -269,36 +240,6 @@ defmodule X402.PaymentSignature do
     {:error, reason}
   end
 
-  defp check_missing_fields(payload) do
-    case missing_fields(payload) do
-      [] ->
-        :ok
-
-      missing ->
-        Telemetry.emit(:payment_signature, :validate, :error, %{
-          reason: :missing_fields,
-          fields: missing
-        })
-
-        {:error, {:missing_fields, missing}}
-    end
-  end
-
-  defp check_field_formats(payload) do
-    case validate_field_formats(payload) do
-      [] ->
-        :ok
-
-      format_errors ->
-        Telemetry.emit(:payment_signature, :validate, :error, %{
-          reason: :invalid_format,
-          fields: Enum.map(format_errors, &elem(&1, 0))
-        })
-
-        {:error, {:invalid_format, format_errors}}
-    end
-  end
-
   @doc since: "0.1.0", group: :verification
   @doc """
   Decodes and validates a `PAYMENT-SIGNATURE` header in one step.
@@ -336,62 +277,6 @@ defmodule X402.PaymentSignature do
     Telemetry.emit(:payment_signature, :decode_and_validate, :error, %{reason: :invalid_payload})
     {:error, :invalid_payload}
   end
-
-  @spec missing_fields(map()) :: [String.t()]
-  defp missing_fields(payload) do
-    payload_keys = Map.keys(payload)
-
-    @required_fields
-    |> Enum.reject(fn field ->
-      value = Map.get(payload, field)
-      field in payload_keys and is_binary(value) and value != ""
-    end)
-    |> Enum.sort()
-  end
-
-  # Validates the format of fields that have known structural constraints:
-  #   - transactionHash: EVM 0x+64hex OR Solana base58 87-88 chars
-  #   - payerWallet: EVM 0x+40hex OR Solana base58 32-44 chars
-  #
-  # We intentionally do NOT validate `network` and `scheme` here — those fields
-  # are validated downstream by the facilitator / scheme validators which have
-  # the authoritative list of supported values.
-  #
-  # Returns a list of {field, reason} tuples for each invalid field; empty list = ok.
-  @spec validate_field_formats(map()) :: [{String.t(), atom()}]
-  defp validate_field_formats(payload) do
-    [
-      validate_transaction_hash(Map.get(payload, "transactionHash")),
-      validate_payer_wallet(Map.get(payload, "payerWallet"))
-    ]
-    |> Enum.reject(&is_nil/1)
-  end
-
-  @spec validate_transaction_hash(String.t() | nil) :: {String.t(), atom()} | nil
-  defp validate_transaction_hash(nil), do: nil
-
-  defp validate_transaction_hash(hash) when is_binary(hash) do
-    cond do
-      Regex.match?(@eth_tx_hash_regex, hash) -> nil
-      Regex.match?(@solana_tx_sig_regex, hash) -> nil
-      true -> {"transactionHash", :invalid_format}
-    end
-  end
-
-  defp validate_transaction_hash(_), do: {"transactionHash", :invalid_format}
-
-  @spec validate_payer_wallet(String.t() | nil) :: {String.t(), atom()} | nil
-  defp validate_payer_wallet(nil), do: nil
-
-  defp validate_payer_wallet(wallet) when is_binary(wallet) do
-    cond do
-      Regex.match?(@eth_address_regex, wallet) -> nil
-      Regex.match?(@solana_address_regex, wallet) -> nil
-      true -> {"payerWallet", :invalid_format}
-    end
-  end
-
-  defp validate_payer_wallet(_), do: {"payerWallet", :invalid_format}
 
   @spec validate_scheme(map(), map()) ::
           :ok | {:error, {:invalid_upto_payment, upto_validation_error()}}

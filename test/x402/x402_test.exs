@@ -21,10 +21,17 @@ defmodule X402Test do
 
     test "delegates payment-signature decode and validate" do
       payload = %{
-        "transactionHash" => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "network" => "eip155:8453",
-        "scheme" => "exact",
-        "payerWallet" => "0x1111111111111111111111111111111111111111"
+        "x402Version" => 2,
+        "accepted" => %{
+          "scheme" => "exact",
+          "network" => "eip155:8453",
+          "amount" => "10000",
+          "asset" => "0xasset",
+          "payTo" => "0xreceiver",
+          "maxTimeoutSeconds" => 60,
+          "extra" => %{}
+        },
+        "payload" => %{"signature" => "0xsignature"}
       }
 
       encoded = payload |> Jason.encode!() |> Base.encode64()
