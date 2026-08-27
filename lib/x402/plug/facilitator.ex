@@ -115,9 +115,23 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @impl Plug
     @spec init(keyword()) :: options()
     def init(opts) do
-      opts
-      |> NimbleOptions.validate!(@options_schema)
-      |> Map.new()
+      options =
+        opts
+        |> NimbleOptions.validate!(@options_schema)
+        |> Map.new()
+
+      if is_nil(options.auth_token) do
+        IO.warn(
+          "[X402.Plug.Facilitator] auth_token is not configured. The verify " <>
+            "and settle endpoints are UNAUTHENTICATED — anyone reaching this " <>
+            "facilitator can make its fee payer broadcast (gas-capped) " <>
+            "settlement transactions. Set auth_token: or put real " <>
+            "authentication in front before exposing it.",
+          __ENV__
+        )
+      end
+
+      options
     end
 
     @doc since: "0.6.0"

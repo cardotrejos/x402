@@ -221,14 +221,14 @@ defmodule X402.Facilitator.EngineTest do
       assert nonce_2 == nonce_1 + 1
     end
 
-    test "resets nonce tracking when the node rejects a broadcast", context do
+    test "a rejected broadcast rolls the tail nonce back for the next settle", context do
       manager = start_supervised!({X402.Facilitator.NonceManager, []})
 
       engine =
         engine(context,
           nonce_manager: manager,
           stub: %{
-            send_raw: {:error, %{"code" => -32_000, "message" => "nonce too low"}},
+            send_raw: {:error, %{"code" => -32_000, "message" => "rejected"}},
             receipts: [%{"status" => "0x1"}]
           }
         )
@@ -238,14 +238,44 @@ defmodule X402.Facilitator.EngineTest do
       assert {:ok, %{"success" => false, "errorReason" => "unexpected_settle_error"}} =
                Engine.settle(engine, signed_payload(requirements), requirements)
 
-      assert_received {:rpc, "eth_getTransactionCount", _params}
-
-      # The rejection may have been nonce-related: the next settlement must
-      # re-read the pending nonce instead of reusing the local counter.
       assert {:ok, %{"success" => false}} =
                Engine.settle(engine, signed_payload(requirements), requirements)
 
-      assert_received {:rpc, "eth_getTransactionCount", _params2}
+      # One node fetch; the rejected broadcast released its nonce, so the
+      # second settle reused it (no gap, no reissue race).
+      assert_received {:rpc, "eth_getTransactionCount", _params}
+      refute_received {:rpc, "eth_getTransactionCount", _params2}
+
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex_1]}
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex_2]}
+
+      [nonce_1, nonce_2] =
+        for raw_hex <- [raw_hex_1, raw_hex_2] do
+          raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+          [_chain_id, nonce | _rest] = TestRLPDecoder.decode_eip1559(raw)
+          :binary.decode_unsigned(nonce)
+        end
+
+      assert nonce_2 == nonce_1
+    end
+
+    test "gas estimates above the ceiling refuse to settle", context do
+      manager = start_supervised!({X402.Facilitator.NonceManager, []})
+
+      engine =
+        engine(context,
+          nonce_manager: manager,
+          max_gas_limit: 100_000,
+          stub: %{estimate_gas: {:ok, 3_000_000}}
+        )
+
+      requirements = requirements()
+
+      assert {:ok, %{"success" => false, "errorReason" => "settle_gas_limit_exceeded"}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      # The fee payer never broadcast against the gas-burning contract.
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
     end
   end
 

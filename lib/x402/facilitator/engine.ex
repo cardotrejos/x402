@@ -119,7 +119,8 @@ defmodule X402.Facilitator.Engine do
     gas_limit_margin_percent: 20,
     receipt_timeout_ms: 60_000,
     receipt_interval_ms: 1_000,
-    nonce_manager: nil
+    nonce_manager: nil,
+    max_gas_limit: 200_000
   ]
 
   @typedoc "A validated engine configuration built by `new/1`."
@@ -134,7 +135,8 @@ defmodule X402.Facilitator.Engine do
           gas_limit_margin_percent: non_neg_integer(),
           receipt_timeout_ms: pos_integer(),
           receipt_interval_ms: pos_integer(),
-          nonce_manager: GenServer.server() | nil
+          nonce_manager: GenServer.server() | nil,
+          max_gas_limit: pos_integer()
         }
 
   @typedoc "A facilitator wire response (`/verify` or `/settle` shape)."
@@ -213,6 +215,17 @@ defmodule X402.Facilitator.Engine do
       fee-payer nonces. Without it, each settlement reads the pending nonce
       from the node, which races under concurrent settles — configure the
       manager for any deployment that settles concurrently.
+      """
+    ],
+    max_gas_limit: [
+      type: :pos_integer,
+      default: 200_000,
+      doc: """
+      Absolute gas ceiling per settlement transaction (margin included). A
+      legitimate `transferWithAuthorization` costs well under 100k gas; an
+      estimate above this ceiling means the asset contract is burning the
+      fee payer's gas and the settlement is refused — the fee payer never
+      broadcasts unbounded-gas transactions against unvetted bytecode.
       """
     ]
   ]
@@ -488,14 +501,30 @@ defmodule X402.Facilitator.Engine do
          {:ok, from} <- Signer.address(engine.signer),
          {:ok, chain_id} <- chain_id(requirements),
          {:ok, params} <- transaction_params(engine, from, asset(requirements), calldata),
-         {:ok, raw} <- sign_transaction(engine, chain_id, params, asset(requirements), calldata) do
-      broadcast_and_await(engine, raw, network, payer, from)
+         {:ok, raw} <- sign_or_release(engine, chain_id, params, requirements, calldata, from) do
+      broadcast_and_await(engine, raw, network, payer, from, params.nonce)
     else
       {:settle_failed, reason_string} ->
         {:settled, failure_response(reason_string, "", network, payer)}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # Once a nonce is checked out, every failure before the node could have
+  # seen the transaction must return it — otherwise a gap forms and later
+  # settlements stall pending at the node.
+  @spec sign_or_release(t(), non_neg_integer(), map(), map(), binary(), String.t()) ::
+          {:ok, binary()} | {:settle_failed, String.t()} | {:error, term()}
+  defp sign_or_release(engine, chain_id, params, requirements, calldata, from) do
+    case sign_transaction(engine, chain_id, params, asset(requirements), calldata) do
+      {:ok, raw} ->
+        {:ok, raw}
+
+      failure ->
+        release_nonce(engine, from, params.nonce)
+        failure
     end
   end
 
@@ -554,8 +583,10 @@ defmodule X402.Facilitator.Engine do
   end
 
   # With a nonce manager, the nonce is assigned by the manager (fetched from
-  # the node only on first use or after a reset), so concurrent settlements
-  # get distinct consecutive nonces instead of racing on `pending`.
+  # the node only on first use or after a drain-triggered re-fetch), so
+  # concurrent settlements get distinct consecutive nonces instead of racing
+  # on `pending`. The checkout happens LAST: a fee/gas failure before it
+  # needs no release, and an assembly failure after it releases the nonce.
   defp transaction_params(engine, from, asset, calldata) do
     requests = [
       {"eth_estimateGas", [%{"from" => from, "to" => asset, "data" => hex(calldata)}]},
@@ -565,7 +596,36 @@ defmodule X402.Facilitator.Engine do
 
     with {:ok, [estimate, priority, fee_history]} <- rpc_batch(engine, requests),
          {:ok, nonce} <- checkout_nonce(engine, from) do
-      assemble_params(engine, estimate, priority, fee_history, {:ok, integer_hex(nonce)})
+      case assemble_params(engine, estimate, priority, fee_history, {:ok, integer_hex(nonce)}) do
+        {:ok, params} ->
+          {:ok, params}
+
+        failure ->
+          release_nonce(engine, from, nonce)
+          failure
+      end
+    end
+  end
+
+  # params.nonce is already the integer parsed by assemble_params.
+  @spec release_nonce(t(), String.t(), non_neg_integer()) :: :ok
+  defp release_nonce(%{nonce_manager: nil}, _from, _nonce), do: :ok
+
+  defp release_nonce(engine, from, nonce),
+    do: NonceManager.release(engine.nonce_manager, from, nonce)
+
+  @spec complete_nonce(t(), String.t(), non_neg_integer()) :: :ok
+  defp complete_nonce(%{nonce_manager: nil}, _from, _nonce), do: :ok
+
+  defp complete_nonce(engine, from, nonce),
+    do: NonceManager.complete(engine.nonce_manager, from, nonce)
+
+  @spec parse_fetched_nonce(String.t()) ::
+          {:ok, non_neg_integer()} | {:error, {:invalid_nonce, String.t()}}
+  defp parse_fetched_nonce(hex_nonce) do
+    case Integer.parse(hex_nonce, 16) do
+      {nonce, ""} -> {:ok, nonce}
+      _other -> {:error, {:invalid_nonce, "0x" <> hex_nonce}}
     end
   end
 
@@ -582,7 +642,7 @@ defmodule X402.Facilitator.Engine do
   defp checkout_nonce(engine, from) do
     fetch = fn ->
       case RPC.request(engine.rpc, "eth_getTransactionCount", [from, "pending"]) do
-        {:ok, "0x" <> hex_nonce} -> {:ok, String.to_integer(hex_nonce, 16)}
+        {:ok, "0x" <> hex_nonce} -> parse_fetched_nonce(hex_nonce)
         {:ok, other} -> {:error, {:invalid_nonce, other}}
         {:error, reason} -> {:error, reason}
       end
@@ -625,8 +685,19 @@ defmodule X402.Facilitator.Engine do
           {:ok, pos_integer()} | {:settle_failed, String.t()} | {:error, term()}
   defp gas_limit(engine, {:ok, hex}) do
     case parse_quantity(hex) do
-      {:ok, estimate} -> {:ok, div(estimate * (100 + engine.gas_limit_margin_percent), 100)}
-      :error -> {:error, {:rpc_error, {:invalid_response, hex}}}
+      {:ok, estimate} ->
+        margined = div(estimate * (100 + engine.gas_limit_margin_percent), 100)
+
+        # Absolute ceiling: a transferWithAuthorization on a real token costs
+        # well under 100k gas. An estimate beyond the ceiling means the
+        # "asset" is burning the fee payer's gas — refuse to settle.
+        case margined <= engine.max_gas_limit do
+          true -> {:ok, margined}
+          false -> {:settle_failed, "settle_gas_limit_exceeded"}
+        end
+
+      :error ->
+        {:error, {:rpc_error, {:invalid_response, hex}}}
     end
   end
 
@@ -687,20 +758,29 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec broadcast_and_await(t(), binary(), String.t(), String.t() | nil, String.t()) ::
-          settle_result()
-  defp broadcast_and_await(engine, raw, network, payer, from) do
+  @spec broadcast_and_await(
+          t(),
+          binary(),
+          String.t(),
+          String.t() | nil,
+          String.t(),
+          non_neg_integer()
+        ) :: settle_result()
+  defp broadcast_and_await(engine, raw, network, payer, from, nonce) do
     case RPC.request(engine.rpc, "eth_sendRawTransaction", [hex(raw)]) do
       {:ok, transaction_hash} when is_binary(transaction_hash) ->
+        complete_nonce(engine, from, nonce)
         await_receipt(engine, transaction_hash, network, payer)
 
       {:ok, other} ->
+        complete_nonce(engine, from, nonce)
         {:error, {:rpc_error, {:invalid_response, other}}}
 
       {:error, {:jsonrpc_error, _error}} ->
-        # The rejection may be nonce-related (reused/too low) — forget the
-        # tracked nonce so the next settlement re-reads it from the node.
-        reset_nonce(engine, from)
+        # The node rejected the transaction without seeing it land — return
+        # the nonce (tail rollback, or a drain-triggered re-fetch when later
+        # settlements are still in flight).
+        release_nonce(engine, from, nonce)
         {:settled, failure_response("unexpected_settle_error", "", network, payer)}
 
       {:error, reason} ->
@@ -711,10 +791,6 @@ defmodule X402.Facilitator.Engine do
         pending_after_transport_failure(raw, network, payer, reason)
     end
   end
-
-  @spec reset_nonce(t(), String.t()) :: :ok
-  defp reset_nonce(%{nonce_manager: nil}, _from), do: :ok
-  defp reset_nonce(engine, from), do: NonceManager.reset(engine.nonce_manager, from)
 
   @spec pending_after_transport_failure(binary(), String.t(), String.t() | nil, term()) ::
           settle_result()
