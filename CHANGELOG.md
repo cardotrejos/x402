@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **The legacy "v1" validation path in `X402.PaymentSignature`.** It required
+  `transactionHash`/`network`/`scheme`/`payerWallet` — a shape that matches no
+  published x402 wire format (real v1 payments carry
+  `{scheme, network, payload: {signature, authorization}}` in the `X-PAYMENT`
+  header, which this SDK never reads) — so it advertised v1 interop that was
+  exactly zero while accepting payloads no facilitator would settle. Payloads
+  declaring `x402Version: 1` or omitting the version now return
+  `{:error, {:unsupported_x402_version, 1 | nil}}` (mapped to HTTP 400 by
+  `X402.Plug.PaymentGate`). The `{:missing_fields, _}` and
+  `{:invalid_format, _}` error reasons no longer occur.
+  (Ecosystem report §8 P0.1.)
+
 ## [0.5.0] - 2026-08-26
 
 ### Added
