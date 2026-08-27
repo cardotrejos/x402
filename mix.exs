@@ -157,6 +157,7 @@ defmodule X402.MixProject do
         Extensions: [
           X402.Extensions.Bazaar,
           X402.Extensions.EIP2612GasSponsoring,
+          X402.Extensions.ERC20ApprovalGasSponsoring,
           X402.Extensions.SIWX,
           X402.Extensions.SIWX.Verifier,
           X402.Extensions.SIWX.Verifier.Default,

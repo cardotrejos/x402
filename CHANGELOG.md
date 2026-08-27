@@ -163,6 +163,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_info/1`), plus client-side EIP-2612 `Permit` signing
   (`sign_permit/3`, `put_info/2`, and `enricher/2` for
   `X402.Client.build_payment/3`)
+- `X402.Extensions.ERC20ApprovalGasSponsoring` — the
+  `erc20ApprovalGasSponsoring` gas-sponsoring extension (report §8 P2.4)
+  for tokens without EIP-2612: server-side declaration and echo
+  validation, plus client-side assembly of the extension data around a
+  pre-signed `approve(Permit2, amount)` transaction (`build_info/1`,
+  `put_info/2`, and `enricher/1` for `X402.Client.build_payment/3`)
 
 ## [0.5.0] - 2026-08-26
 
