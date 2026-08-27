@@ -520,6 +520,39 @@ defmodule X402.Facilitator.EngineTest do
       assert transaction_hash == "0x" <> Base.encode16(ExKeccak.hash_256(raw), case: :lower)
     end
 
+    test "a transport failure on broadcast consumes the nonce (may have landed)", context do
+      manager = start_supervised!({X402.Facilitator.NonceManager, []})
+
+      # Both broadcasts fail at the transport layer — ambiguous, the node may
+      # have accepted them, so each nonce must be consumed rather than left
+      # in flight (a stuck in-flight nonce could never drain to re-fetch).
+      engine = engine(context, nonce_manager: manager, stub: %{send_raw: :http_error})
+      requirements = requirements()
+
+      assert {:ok, %{"errorReason" => "settlement_pending"}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      assert {:ok, %{"errorReason" => "settlement_pending"}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      # One node fetch, and consecutive nonces: the first ambiguous broadcast
+      # consumed its nonce instead of stalling the counter behind a gap.
+      assert_received {:rpc, "eth_getTransactionCount", _params}
+      refute_received {:rpc, "eth_getTransactionCount", _params2}
+
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex_1]}
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex_2]}
+
+      [nonce_1, nonce_2] =
+        for raw_hex <- [raw_hex_1, raw_hex_2] do
+          raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+          [_chain_id, nonce | _rest] = TestRLPDecoder.decode_eip1559(raw)
+          :binary.decode_unsigned(nonce)
+        end
+
+      assert nonce_2 == nonce_1 + 1
+    end
+
     test "a non-binary broadcast result is an infrastructure error", context do
       engine = engine(context, stub: %{send_raw: {:ok, 42}})
       requirements = requirements()

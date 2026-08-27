@@ -785,9 +785,11 @@ defmodule X402.Facilitator.Engine do
 
       {:error, reason} ->
         # A transport failure mid-broadcast is ambiguous — the node may have
-        # accepted the transaction. Return the spec's non-terminal
-        # settlement_pending with the locally computed hash so the caller
-        # can reconcile on chain.
+        # accepted the transaction, so the nonce counts as consumed (never
+        # left in flight, or a later release could never drain to re-fetch).
+        # Return the spec's non-terminal settlement_pending with the locally
+        # computed hash so the caller can reconcile on chain.
+        complete_nonce(engine, from, nonce)
         pending_after_transport_failure(raw, network, payer, reason)
     end
   end
