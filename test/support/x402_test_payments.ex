@@ -20,12 +20,14 @@ defmodule X402.TestPayments do
   #
   # The burner key lives in the `Config` so the receiver is resolved once and
   # `payload/2` and `requirements/1` agree even when called separately.
+  #
+  # All EIP-712/EIP-3009 cryptography delegates to `X402.EIP3009` — the
+  # library's payer-client signing code — so the logic exists exactly once.
+  # This module keeps its original raising/bare-value API for test ergonomics.
 
-  alias ExKeccak
-  alias ExSecp256k1
+  alias X402.EIP3009
+  alias X402.Signer.LocalKey
 
-  @eip712_domain_type "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
-  @transfer_with_authorization_type "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
   @zero_address "0x0000000000000000000000000000000000000000"
 
   defmodule Config do
@@ -143,32 +145,14 @@ defmodule X402.TestPayments do
   """
   @spec payload(Config.t(), binary()) :: map()
   def payload(%Config{} = config, signer_key) when is_binary(signer_key) do
-    from = derive_address(signer_key)
-    now = System.os_time(:second)
-
-    authorization = %{
-      from: from,
-      to: receiver_for(config),
-      value: config.amount,
-      valid_after: Integer.to_string(now - 60),
-      valid_before: Integer.to_string(now + config.max_timeout),
-      nonce: random_nonce()
-    }
-
-    domain = %{
-      name: config.token_name,
-      version: config.token_version,
-      chain_id: chain_id_from_caip2(config.network),
-      verifying_contract: config.contract
-    }
+    {:ok, signer} = LocalKey.new(signer_key)
+    requirements = requirements(config)
+    {:ok, scheme_payload} = EIP3009.sign(requirements, signer, valid_after_buffer: 60)
 
     %{
       "x402Version" => 2,
-      "accepted" => requirements(config),
-      "payload" => %{
-        "signature" => sign_transfer_with_authorization(signer_key, domain, authorization),
-        "authorization" => authorization_map(authorization)
-      },
+      "accepted" => requirements,
+      "payload" => scheme_payload,
       "resource" => %{
         "url" => config.resource,
         "mimeType" => "application/json"
@@ -192,9 +176,9 @@ defmodule X402.TestPayments do
   """
   @spec sign_transfer_with_authorization(binary(), map(), map()) :: String.t()
   def sign_transfer_with_authorization(private_key, domain, authorization) do
-    digest = eip712_digest(domain, authorization)
-    {:ok, {signature, recovery_id}} = ExSecp256k1.sign_compact(digest, private_key)
-    "0x" <> Base.encode16(signature <> <<recovery_id + 27>>, case: :lower)
+    {:ok, signer} = LocalKey.new(private_key)
+    {:ok, signature} = EIP3009.sign_authorization(signer, domain, authorization)
+    signature
   end
 
   @doc """
@@ -202,7 +186,8 @@ defmodule X402.TestPayments do
   """
   @spec eip712_digest(map(), map()) :: binary()
   def eip712_digest(domain, authorization) do
-    ExKeccak.hash_256(<<0x19, 0x01>> <> domain_separator(domain) <> struct_hash(authorization))
+    {:ok, digest} = EIP3009.eip712_digest(domain, authorization)
+    digest
   end
 
   @doc """
@@ -210,8 +195,8 @@ defmodule X402.TestPayments do
   """
   @spec derive_address(binary()) :: String.t()
   def derive_address(private_key) do
-    {:ok, public_key} = ExSecp256k1.create_public_key(private_key)
-    public_key_to_address(public_key)
+    {:ok, address} = EIP3009.derive_address(private_key)
+    address
   end
 
   @doc """
@@ -219,37 +204,42 @@ defmodule X402.TestPayments do
   lowercase `0x`-prefixed EVM address.
   """
   @spec public_key_to_address(binary()) :: String.t()
-  def public_key_to_address(<<4, public_key::binary-size(64)>>), do: hash_to_address(public_key)
-  def public_key_to_address(<<public_key::binary-size(64)>>), do: hash_to_address(public_key)
+  def public_key_to_address(public_key) do
+    {:ok, address} = EIP3009.public_key_to_address(public_key)
+    address
+  end
 
   @doc """
   Returns a fresh random 32-byte nonce as a `0x`-prefixed hex string.
   """
   @spec random_nonce() :: String.t()
-  def random_nonce do
-    "0x" <> Base.encode16(:crypto.strong_rand_bytes(32), case: :lower)
-  end
+  defdelegate random_nonce, to: EIP3009
 
   @doc """
   Extracts the chain id from an `eip155:<chainId>` CAIP-2 network identifier.
   """
   @spec chain_id_from_caip2(String.t()) :: non_neg_integer()
-  def chain_id_from_caip2("eip155:" <> chain_id) when chain_id != "",
-    do: String.to_integer(chain_id)
+  def chain_id_from_caip2(network) do
+    case EIP3009.chain_id_from_caip2(network) do
+      {:ok, chain_id} ->
+        chain_id
 
-  def chain_id_from_caip2(other),
-    do: raise(ArgumentError, "expected an eip155: CAIP-2 network, got: #{inspect(other)}")
+      {:error, :unsupported_network} ->
+        raise(ArgumentError, "expected an eip155: CAIP-2 network, got: #{inspect(network)}")
+    end
+  end
 
   @doc """
   ABI-encodes an address into a 32-byte word.
   """
   @spec encode_address(String.t()) :: binary()
-  def encode_address("0x" <> hex) do
-    {:ok, address} = Base.decode16(String.upcase(hex), case: :mixed)
+  def encode_address(address) do
+    case EIP3009.encode_address(address) do
+      {:ok, word} ->
+        word
 
-    case byte_size(address) do
-      20 -> <<0::unsigned-big-integer-size(96), address::binary>>
-      _ -> raise(ArgumentError, "invalid EVM address: 0x#{hex}")
+      {:error, :invalid_address} ->
+        raise(ArgumentError, "invalid EVM address: #{inspect(address)}")
     end
   end
 
@@ -257,63 +247,27 @@ defmodule X402.TestPayments do
   ABI-encodes a non-negative integer (or decimal string) into a 32-byte word.
   """
   @spec encode_uint256(integer() | String.t()) :: binary()
-  def encode_uint256(integer) when is_integer(integer) and integer >= 0,
-    do: <<integer::unsigned-big-integer-size(256)>>
-
-  def encode_uint256(string) when is_binary(string),
-    do: encode_uint256(String.to_integer(string))
+  def encode_uint256(value) do
+    case EIP3009.encode_uint256(value) do
+      {:ok, word} -> word
+      {:error, :invalid_amount} -> raise(ArgumentError, "invalid uint256: #{inspect(value)}")
+    end
+  end
 
   @doc """
-  Decodes a `0x`-prefixed hex string into its raw bytes.
+  Decodes a `0x`-prefixed hex string into its raw 32 bytes.
   """
   @spec encode_bytes32(String.t()) :: binary()
-  def encode_bytes32("0x" <> hex) do
-    {:ok, bytes} = Base.decode16(String.upcase(hex), case: :mixed)
-    bytes
+  def encode_bytes32(value) do
+    case EIP3009.encode_bytes32(value) do
+      {:ok, bytes} -> bytes
+      {:error, :invalid_bytes32} -> raise(ArgumentError, "invalid bytes32: #{inspect(value)}")
+    end
   end
 
   defp receiver_for(%Config{receiver: receiver}) when is_binary(receiver), do: receiver
   defp receiver_for(%Config{receiver_key: key}) when is_binary(key), do: derive_address(key)
   defp receiver_for(%Config{}), do: @zero_address
-
-  defp domain_separator(domain) do
-    ExKeccak.hash_256(
-      ExKeccak.hash_256(@eip712_domain_type) <>
-        ExKeccak.hash_256(domain.name) <>
-        ExKeccak.hash_256(domain.version) <>
-        encode_uint256(domain.chain_id) <>
-        encode_address(domain.verifying_contract)
-    )
-  end
-
-  defp struct_hash(authorization) do
-    ExKeccak.hash_256(
-      ExKeccak.hash_256(@transfer_with_authorization_type) <>
-        encode_address(authorization.from) <>
-        encode_address(authorization.to) <>
-        encode_uint256(authorization.value) <>
-        encode_uint256(authorization.valid_after) <>
-        encode_uint256(authorization.valid_before) <>
-        encode_bytes32(authorization.nonce)
-    )
-  end
-
-  defp authorization_map(authorization) do
-    %{
-      "from" => authorization.from,
-      "to" => authorization.to,
-      "value" => authorization.value,
-      "validAfter" => authorization.valid_after,
-      "validBefore" => authorization.valid_before,
-      "nonce" => authorization.nonce
-    }
-  end
-
-  defp hash_to_address(public_key) do
-    hash = ExKeccak.hash_256(public_key)
-    address = binary_part(hash, byte_size(hash) - 20, 20)
-    "0x" <> Base.encode16(address, case: :lower)
-  end
 
   defp fetch(env, name) do
     case env.(name) do
