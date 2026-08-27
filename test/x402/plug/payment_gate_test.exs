@@ -1177,6 +1177,40 @@ defmodule X402.Plug.PaymentGateTest do
       assert_receive {:adapter_delete, _payment_id}
     end
 
+    test ":before_verify releases the claim when the facilitator call exits" do
+      # A dead facilitator pid makes Facilitator.verify exit with :noproc
+      # instead of returning an error tuple. The claim must still be released
+      # before the exit propagates, or the payer's retry is rejected as a
+      # duplicate until the cache TTL expires.
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
+
+      parent = self()
+
+      expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified -> :ok end)
+
+      expect(CacheMock, :delete, fn :mock_ref, payment_id ->
+        send(parent, {:adapter_delete, payment_id})
+        :ok
+      end)
+
+      opts =
+        PaymentGate.init(
+          routes: [@route],
+          facilitator: dead,
+          payment_identifier_cache: {CacheMock, :mock_ref},
+          claim_order: :before_verify
+        )
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+
+      assert catch_exit(PaymentGate.call(conn, opts))
+      assert_receive {:adapter_delete, _payment_id}
+    end
+
     test ":before_verify allows a retry after a failed verification" do
       reject =
         start_mock_facilitator(

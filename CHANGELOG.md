@@ -30,7 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replay-storm load from the facilitator, but a node crash during
   verification strands the claim until the cache TTL expires, while
   `:after_verify` never strands a claim on verification but pays one verify
-  call per replayed request
+  call per replayed request. Verify-time exits (facilitator call timeout or
+  `:noproc`) also release the claim before propagating, so a slow or down
+  facilitator cannot strand a payer's replay lock
 - `put_new/3` callback on `X402.Extensions.PaymentIdentifier.Cache` — the
   atomic first-writer-wins claim used for replay protection is now part of the
   behaviour contract (TTL semantics and return values documented), so

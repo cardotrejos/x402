@@ -859,15 +859,30 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
            requirements
          ) do
       with :ok <- claim_payment(opts.payment_identifier_cache, payment_id) do
-        case verify_payment(opts, payload, requirements) do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            release_claim(opts.payment_identifier_cache, payment_id)
-            {:error, reason}
-        end
+        verify_with_claim_release(opts, payment_id, payload, requirements)
       end
+    end
+
+    # A slow or unreachable facilitator EXITS the caller (GenServer.call
+    # timeout / :noproc) rather than returning an error tuple. Under
+    # :before_verify the claim is already taken at that point — release it
+    # before letting the exit propagate, or the payer's legitimate retry is
+    # rejected as a duplicate until the cache TTL expires.
+    @spec verify_with_claim_release(options(), String.t(), map(), map()) ::
+            :ok | {:error, term()}
+    defp verify_with_claim_release(opts, payment_id, payload, requirements) do
+      case verify_payment(opts, payload, requirements) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          release_claim(opts.payment_identifier_cache, payment_id)
+          {:error, reason}
+      end
+    catch
+      :exit, reason ->
+        release_claim(opts.payment_identifier_cache, payment_id)
+        exit(reason)
     end
 
     @spec verify_payment(options(), map(), map()) :: :ok | {:error, term()}
