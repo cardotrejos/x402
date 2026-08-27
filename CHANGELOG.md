@@ -92,6 +92,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are answered with HTTP 400 by the gate. Shared EVM authorization
   pre-checks are reusable via `X402.Scheme.EVM.authorization_precheck/3`.
   See the new Custom Payment Schemes guide
+- **Run your own facilitator** (ecosystem report §8 P2.1 — no official SDK
+  ships a runnable facilitator server; this SDK now does):
+  - `X402.Facilitator.Engine` — the facilitator role engine behind the
+    v2 facilitator API wire shapes: `verify/3` delegates to
+    `X402.Verify.EVM` at the `:full` level and returns the `/verify`
+    response with canonical `invalidReason` strings; `settle/3`
+    re-verifies independently (normative for exact-EVM), builds the
+    `transferWithAuthorization` EIP-1559 transaction (batched
+    `eth_estimateGas` with a safety margin, `eth_maxPriorityFeePerGas` +
+    `eth_feeHistory` fees with an `eth_gasPrice` fallback, `pending`
+    nonce), signs its digest through the `X402.Signer` behaviour
+    (27/28 recovery ids normalized to the EIP-1559 `yParity`), broadcasts
+    via `eth_sendRawTransaction`, and polls the receipt — returning the
+    spec's non-terminal `"settlement_pending"` with the transaction hash
+    when confirmation cannot be established; `supported/1` derives the
+    `GET /supported` response from the configured networks. Fee-payer
+    safety is structural: the engine only ever signs
+    `transferWithAuthorization` calldata built from verified
+    authorization fields with `to` = the requirements' `asset` and
+    `value` `0` — counterfactual ERC-6492 payments are rejected
+    fail-closed at verify and settle (deployed ERC-1271 wallets are fully
+    supported). `X402.Hooks` wraps both operations, and
+    `[:x402, :facilitator_engine, :verify | :settle]` telemetry is
+    emitted.
+  - `X402.Plug.Facilitator` — a compile-guarded Plug scaffold serving
+    `POST /verify`, `POST /settle`, and `GET /supported` over an engine:
+    strict v2 wire-object parsing (400 otherwise), an 8KB body cap
+    consistent with the SDK's header caps (413), an optional
+    constant-time bearer-token check (401), and opaque 500 bodies for
+    infrastructure errors. Protocol-level rejections are 200s per the
+    facilitator API convention; the optional `/discovery/resources`
+    answers 404.
+  - `X402.RLP` and `X402.Transaction` — minimal pure RLP and EIP-1559
+    typed-transaction encoders (no new dependencies), tested against the
+    published RLP specification vectors and a signed-transaction
+    sender-recovery proof.
+  - `X402.EIP3009.transfer_calldata/2` — the `transferWithAuthorization`
+    calldata builder (both the `(v, r, s)` and dynamic-`bytes` variants),
+    extracted from `X402.Verify.EVM` so verification's simulation and the
+    engine's settlement sign the exact same bytes; plus
+    `X402.EIP712.encode_dynamic_bytes/1`.
+  - `examples/facilitator/` — a runnable facilitator (env-driven
+    `PRIVATE_KEY` / `RPC_URL` / `NETWORK` / `PORT`, Bandit + Finch)
+    mirroring the upstream `examples/typescript/facilitator`, with a
+    self-contained boot check. Documented in the new "Run Your Own
+    Facilitator" guide.
 - **Full local payment verification for EVM `exact`/`eip3009` payments**
   (`X402.Verify.EVM`, ecosystem report §8 P1.2 and the verification half of
   P2.1): runs the reference facilitator verify checklist locally instead of
