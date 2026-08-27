@@ -162,9 +162,7 @@ defmodule X402.Permit2Test do
 
       domain_separator =
         ExKeccak.hash_256(
-          ExKeccak.hash_256(
-            "EIP712Domain(string name,uint256 chainId,address verifyingContract)"
-          ) <>
+          ExKeccak.hash_256("EIP712Domain(string name,uint256 chainId,address verifyingContract)") <>
             ExKeccak.hash_256("Permit2") <> <<84_532::256>> <> address_word(@permit2)
         )
 

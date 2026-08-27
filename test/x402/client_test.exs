@@ -236,7 +236,9 @@ defmodule X402.ClientTest do
                payload["payload"]
 
       assert authorization["permitted"]["amount"] == upto["amount"]
-      assert authorization["witness"]["facilitator"] == "0x2222222222222222222222222222222222222222"
+
+      assert authorization["witness"]["facilitator"] ==
+               "0x2222222222222222222222222222222222222222"
 
       # Without the facilitator address, the upto scheme cannot sign.
       assert Client.build_payment(Map.put(upto, "extra", %{}), signer()) ==
