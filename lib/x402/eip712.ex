@@ -56,6 +56,8 @@ defmodule X402.EIP712 do
           | :invalid_word
           | {:missing_field, String.t()}
 
+  @uint256_limit Integer.pow(2, 256)
+
   @doc since: "0.6.0"
   @doc """
   Derives the EIP-712 domain from v2 payment requirements.
@@ -234,8 +236,12 @@ defmodule X402.EIP712 do
       {:error, :invalid_amount}
   """
   @spec encode_uint256(term()) :: {:ok, <<_::256>>} | {:error, :invalid_amount}
-  def encode_uint256(integer) when is_integer(integer) and integer >= 0,
-    do: {:ok, <<integer::unsigned-big-integer-size(256)>>}
+  # Values at or above 2^256 cannot be represented: bit syntax would
+  # silently truncate them to the low 256 bits, making a different value
+  # hash as if it were signed. Reject instead.
+  def encode_uint256(integer)
+      when is_integer(integer) and integer >= 0 and integer < @uint256_limit,
+      do: {:ok, <<integer::unsigned-big-integer-size(256)>>}
 
   def encode_uint256(string) when is_binary(string) do
     case Integer.parse(string) do

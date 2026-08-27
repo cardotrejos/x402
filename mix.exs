@@ -190,6 +190,8 @@ defmodule X402.MixProject do
           X402.Extensions.PaymentIdentifier.ETSCache,
           X402.Extensions.PaymentIdentifier.RedisCache,
           X402.Extensions.PaymentIdentifier.RedisCache.Command,
+          X402.Extensions.OfferReceipt,
+          X402.Extensions.OfferReceipt.JWS,
           X402.Extensions.SIWX,
           X402.Extensions.SIWX.Verifier,
           X402.Extensions.SIWX.Verifier.Default,
@@ -201,7 +203,10 @@ defmodule X402.MixProject do
         "Header Encoding": &(&1[:group] == :headers),
         "Payment Verification": &(&1[:group] == :verification),
         "Payment Settlement": &(&1[:group] == :settlement),
-        "Facilitator Discovery": &(&1[:group] == :discovery)
+        "Facilitator Discovery": &(&1[:group] == :discovery),
+        "Signed Offers": &(&1[:group] == :offers),
+        "Signed Receipts": &(&1[:group] == :receipts),
+        "Extension Declaration": &(&1[:group] == :declaration)
       ]
     ]
   end

@@ -137,7 +137,9 @@ defmodule X402.TestPaymentsTest do
       valid_before = String.to_integer(authorization["validBefore"])
       now = System.os_time(:second)
       assert valid_after <= now
-      assert valid_before == now + config.max_timeout
+      # `now` is sampled after the payload was built, so a second may have
+      # ticked between the two readings — allow it (was a CI flake).
+      assert_in_delta valid_before, now + config.max_timeout, 1
 
       signature = payload["payload"]["signature"]
       assert String.starts_with?(signature, "0x")

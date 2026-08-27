@@ -253,6 +253,87 @@ response includes both
 `PAYMENT-REQUIRED` (so the client can retry) and `PAYMENT-RESPONSE` (with
 the error reason).
 
+## Signed Offers and Receipts
+
+The [offer-and-receipt extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/extension-offer-and-receipt.md)
+lets a resource server cryptographically commit to the terms it advertises
+(**signed offers**) and confirm delivery after payment (**signed
+receipts**) — evidence for disputes, audits, and reputation systems.
+`X402.Extensions.OfferReceipt` implements both artifact formats: EIP-712
+(signed through `X402.Signer`, verified by signer recovery) and compact JWS
+(`ES256K`/`EdDSA` via OTP `:crypto`).
+
+Issue offers for the terms a route advertises and attach them through the
+route's `extensions:` option (clients that ignore the extension are
+unaffected):
+
+```elixir
+alias X402.Extensions.OfferReceipt
+
+{:ok, signer} = X402.Signer.LocalKey.new(System.fetch_env!("OFFER_SIGNING_KEY"))
+
+{:ok, payload} =
+  OfferReceipt.offer_payload(
+    resource_url: "https://api.example.com/premium-data",
+    scheme: "exact",
+    network: "eip155:84532",
+    asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    pay_to: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+    amount: "10000"
+  )
+
+{:ok, offer} = OfferReceipt.sign_offer(payload, signer, accept_index: 0)
+
+plug X402.Plug.PaymentGate,
+  routes: [
+    {"/premium-data",
+     [
+       amount: "10000",
+       pay_to: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+       network: "eip155:84532",
+       extensions: %{"offer-receipt" => OfferReceipt.build_extension([offer])}
+     ]}
+  ]
+```
+
+Because route configuration is static, offers built this way should omit
+`valid_until` (or set it generously); build the payment-required response
+yourself with `X402.PaymentRequired.encode/1` when you want short-lived,
+per-request offers.
+
+After a successful settlement, issue a receipt from your handler (the payer
+is available in the payment payload assign) and return it to the client —
+for example in the response body, or from your settlement pipeline as
+`extensions["offer-receipt"]` of a settlement response you construct:
+
+```elixir
+{:ok, receipt_payload} =
+  OfferReceipt.receipt_payload(
+    resource_url: "https://api.example.com/premium-data",
+    network: "eip155:84532",
+    payer: payer_address
+  )
+
+{:ok, receipt} = OfferReceipt.sign_receipt(receipt_payload, signer)
+extension = OfferReceipt.build_receipt_extension(receipt)
+```
+
+Clients extract and verify the artifacts — and must apply an authorization
+policy for the signer (spec §4.5.1); the simplest is requiring the offer's
+`payTo` key:
+
+```elixir
+{:ok, [offer]} = OfferReceipt.fetch_offers(payment_required)
+{:ok, payload} = OfferReceipt.extract_payload(offer)
+
+{:ok, %{signer: signer}} =
+  OfferReceipt.verify_offer(offer, expected_signer: payload["payTo"])
+```
+
+JWS verification takes the resolved public key explicitly
+(`verify_offer(offer, public_key: key)`) — the library carries the `kid`
+DID URL but never resolves it over the network.
+
 ## HTTP Status Codes
 
 The plug follows the x402 v2 HTTP transport status mapping:
