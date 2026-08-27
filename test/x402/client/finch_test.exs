@@ -41,46 +41,6 @@ defmodule X402.Client.FinchTest do
     "payer" => "0x1111111111111111111111111111111111111111"
   }
 
-  defmodule StubFacilitator do
-    @moduledoc false
-    # Speaks the X402.Facilitator call protocol so X402.Plug.PaymentGate can be
-    # exercised end-to-end without HTTP round-trips to a facilitator.
-    use GenServer
-
-    def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
-
-    @impl true
-    def init(opts), do: {:ok, %{owner: Keyword.fetch!(opts, :owner)}}
-
-    @impl true
-    def handle_call({:verify, payload, requirements}, _from, state) do
-      send(state.owner, {:facilitator_verify, payload, requirements})
-
-      {:reply,
-       {:ok,
-        %{
-          status: 200,
-          body: %{"isValid" => true, "payer" => payload["payload"]["authorization"]["from"]}
-        }}, state}
-    end
-
-    def handle_call({:settle, payload, requirements}, _from, state) do
-      send(state.owner, {:facilitator_settle, payload, requirements})
-
-      {:reply,
-       {:ok,
-        %{
-          status: 200,
-          body: %{
-            "success" => true,
-            "transaction" => "0x" <> String.duplicate("cd", 32),
-            "network" => requirements["network"],
-            "payer" => payload["payload"]["authorization"]["from"]
-          }
-        }}, state}
-    end
-  end
-
   setup :setup_bypass
   setup :setup_finch
 
@@ -330,7 +290,7 @@ defmodule X402.Client.FinchTest do
       finch: finch,
       signer: signer
     } do
-      facilitator = start_supervised!({StubFacilitator, owner: self()})
+      facilitator = start_bypass_facilitator(self())
       cache = start_supervised!({ETSCache, []})
 
       gate_opts =
@@ -387,5 +347,65 @@ defmodule X402.Client.FinchTest do
 
       assert {:ok, _decoded} = PaymentSignature.decode_and_validate(header, @requirements)
     end
+  end
+
+  # A real caller-side X402.Facilitator over a Bypass HTTP stub, so the gate is
+  # exercised end-to-end exactly as in production (the facilitator client
+  # executes verify/settle in the calling process over HTTP).
+  defp start_bypass_facilitator(owner) do
+    bypass = Bypass.open()
+
+    Bypass.stub(bypass, "POST", "/verify", fn conn ->
+      {:ok, body, conn} = Conn.read_body(conn)
+      decoded = Jason.decode!(body)
+
+      send(
+        owner,
+        {:facilitator_verify, decoded["paymentPayload"], decoded["paymentRequirements"]}
+      )
+
+      response = %{
+        "isValid" => true,
+        "payer" => decoded["paymentPayload"]["payload"]["authorization"]["from"]
+      }
+
+      Conn.resp(conn, 200, Jason.encode!(response))
+    end)
+
+    Bypass.stub(bypass, "POST", "/settle", fn conn ->
+      {:ok, body, conn} = Conn.read_body(conn)
+      decoded = Jason.decode!(body)
+
+      send(
+        owner,
+        {:facilitator_settle, decoded["paymentPayload"], decoded["paymentRequirements"]}
+      )
+
+      response = %{
+        "success" => true,
+        "transaction" => "0x" <> String.duplicate("cd", 32),
+        "network" => decoded["paymentRequirements"]["network"],
+        "payer" => decoded["paymentPayload"]["payload"]["authorization"]["from"]
+      }
+
+      Conn.resp(conn, 200, Jason.encode!(response))
+    end)
+
+    suffix = System.unique_integer([:positive, :monotonic])
+    facilitator_finch = String.to_atom("finch_client_facilitator_finch_#{suffix}")
+    name = String.to_atom("finch_client_facilitator_#{suffix}")
+
+    start_supervised!(
+      Supervisor.child_spec({Finch, name: facilitator_finch}, id: facilitator_finch)
+    )
+
+    start_supervised!(
+      {X402.Facilitator,
+       name: name,
+       finch: facilitator_finch,
+       url: "http://localhost:#{bypass.port}",
+       max_retries: 0,
+       receive_timeout_ms: 2_000}
+    )
   end
 end

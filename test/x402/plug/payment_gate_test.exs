@@ -24,85 +24,62 @@ defmodule X402.Plug.PaymentGateTest do
   import Plug.Test
 
   alias X402.Extensions.PaymentIdentifier.ETSCache
-  alias X402.PaymentIdentifierCacheMock, as: CacheMock
-
-  setup :verify_on_exit!
   alias X402.Facilitator
-  alias X402.Facilitator.Error
+  alias X402.PaymentIdentifierCacheMock, as: CacheMock
   alias X402.PaymentRequired
   alias X402.PaymentResponse
   alias X402.Plug.PaymentGate
 
-  defmodule MockFacilitator do
+  setup :verify_on_exit!
+
+  # Facilitator operations execute in the calling process; the gate runs in
+  # the test process, so hook callbacks can message `self()` directly.
+  defmodule TrackingHooks do
     @moduledoc false
-    use GenServer
+    @behaviour X402.Hooks
 
-    @default_verify {:ok, %{status: 200, body: %{"isValid" => true, "payer" => "0xpayer"}}}
+    alias X402.Hooks.Context
 
-    @default_settle {
-      :ok,
-      %{
-        status: 200,
-        body: %{
-          "success" => true,
-          "transaction" => "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-          "network" => "eip155:84532",
-          "payer" => "0x1111111111111111111111111111111111111111"
-        }
-      }
-    }
+    def before_verify(%Context{} = context, _metadata), do: notify(:before_verify, context)
+    def after_verify(%Context{} = context, _metadata), do: notify(:after_verify, context)
 
-    def start_link(opts) when is_list(opts) do
-      GenServer.start_link(__MODULE__, opts)
-    end
+    def on_verify_failure(%Context{} = context, _metadata),
+      do: notify(:on_verify_failure, context)
 
-    @impl true
-    def init(opts) do
-      state = %{
-        owner: Keyword.fetch!(opts, :owner),
-        verify: Keyword.get(opts, :verify, @default_verify),
-        settle: Keyword.get(opts, :settle, @default_settle)
-      }
+    def before_settle(%Context{} = context, _metadata), do: notify(:before_settle, context)
+    def after_settle(%Context{} = context, _metadata), do: notify(:after_settle, context)
 
-      {:ok, state}
-    end
+    def on_settle_failure(%Context{} = context, _metadata),
+      do: notify(:on_settle_failure, context)
 
-    @impl true
-    def handle_call({:verify, payment_payload, requirements}, _from, state) do
-      handle_verify_call(payment_payload, requirements, nil, state)
-    end
-
-    def handle_call({:verify, payment_payload, requirements, hooks_module}, _from, state) do
-      handle_verify_call(payment_payload, requirements, hooks_module, state)
-    end
-
-    def handle_call({:settle, payment_payload, requirements}, _from, state) do
-      handle_settle_call(payment_payload, requirements, nil, state)
-    end
-
-    def handle_call({:settle, payment_payload, requirements, hooks_module}, _from, state) do
-      handle_settle_call(payment_payload, requirements, hooks_module, state)
-    end
-
-    defp resolve_result(result, _payment_payload, _requirements) when is_tuple(result), do: result
-
-    defp resolve_result(result_fun, payment_payload, requirements)
-         when is_function(result_fun, 2) do
-      result_fun.(payment_payload, requirements)
-    end
-
-    defp handle_verify_call(payment_payload, requirements, hooks_module, state) do
-      send(state.owner, {:verify_called, payment_payload, requirements, hooks_module})
-      {:reply, resolve_result(state.verify, payment_payload, requirements), state}
-    end
-
-    defp handle_settle_call(payment_payload, requirements, hooks_module, state) do
-      send(state.owner, {:settle_called, payment_payload, requirements, hooks_module})
-      {:reply, resolve_result(state.settle, payment_payload, requirements), state}
+    defp notify(callback, context) do
+      send(self(), {:hook_called, callback})
+      {:cont, context}
     end
   end
 
-  defmodule TrackingHooks do
+  # Replaces the facilitator error with the protocol error code, emulating a
+  # facilitator client that surfaces `:invalid_payload` directly.
+  defmodule InvalidPayloadHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+
+    def on_verify_failure(%Context{} = context, _metadata),
+      do: {:cont, %Context{context | error: :invalid_payload}}
+
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  # Injects a value that cannot be JSON-encoded into the settle result body so
+  # PAYMENT-RESPONSE encoding fails after a successful settlement.
+  defmodule UnencodableSettleHooks do
     @moduledoc false
     @behaviour X402.Hooks
 
@@ -112,7 +89,12 @@ defmodule X402.Plug.PaymentGateTest do
     def after_verify(%Context{} = context, _metadata), do: {:cont, context}
     def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
     def before_settle(%Context{} = context, _metadata), do: {:cont, context}
-    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+
+    def after_settle(%Context{} = context, _metadata) do
+      body = Map.put(context.result.body, "unencodable", self())
+      {:cont, %Context{context | result: %{context.result | body: body}}}
+    end
+
     def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
   end
 
@@ -120,6 +102,21 @@ defmodule X402.Plug.PaymentGateTest do
   @receiver "0x1111111111111111111111111111111111111111"
   @network "eip155:84532"
   @amount "10000"
+
+  @default_verify {:ok, %{status: 200, body: %{"isValid" => true, "payer" => "0xpayer"}}}
+
+  @default_settle {
+    :ok,
+    %{
+      status: 200,
+      body: %{
+        "success" => true,
+        "transaction" => "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        "network" => "eip155:84532",
+        "payer" => "0x1111111111111111111111111111111111111111"
+      }
+    }
+  }
 
   @route %{
     method: :get,
@@ -337,7 +334,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@route], facilitator: facilitator)
 
       assert conn.status == 402
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "accepts a payTo that differs only in hex casing" do
@@ -356,7 +353,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@route], facilitator: facilitator)
 
       assert conn.status == 200
-      assert_receive {:verify_called, _, _, _}
+      assert_receive {:verify_called, _, _}
     end
 
     test "rejects an exact-scheme amount mismatch without calling the facilitator" do
@@ -373,7 +370,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@route], facilitator: facilitator)
 
       assert conn.status == 402
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "rejects an authorization that is not yet valid" do
@@ -393,7 +390,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@route], facilitator: facilitator)
 
       assert conn.status == 402
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "rejects an authorization expiring inside the settlement buffer" do
@@ -413,7 +410,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@route], facilitator: facilitator)
 
       assert conn.status == 402
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "rejects non-numeric authorization timing" do
@@ -430,7 +427,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@route], facilitator: facilitator)
 
       assert conn.status == 402
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "skips payloads without an EIP-3009 authorization object" do
@@ -447,7 +444,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@route], facilitator: facilitator)
 
       assert conn.status == 200
-      assert_receive {:verify_called, _, _, _}
+      assert_receive {:verify_called, _, _}
     end
 
     test "local_prechecks: false defers everything to the facilitator" do
@@ -467,7 +464,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@route], facilitator: facilitator, local_prechecks: false)
 
       assert conn.status == 200
-      assert_receive {:verify_called, _, _, _}
+      assert_receive {:verify_called, _, _}
     end
   end
 
@@ -568,7 +565,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 400
       assert required["error"] == "invalid_x402_version"
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "returns 400 for v2 payloads with an incomplete accepted object" do
@@ -588,7 +585,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 400
       assert required["error"] == "invalid_payload"
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "rejects x402Version other than 2 with 400" do
@@ -606,7 +603,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 400
       assert decode_payment_required!(conn)["error"] == "invalid_x402_version"
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "rejects payload missing accepted or payload with 400" do
@@ -624,7 +621,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 400
       assert decode_payment_required!(conn)["error"] == "invalid_payload"
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "rejects invalid base64 and invalid JSON with 400" do
@@ -686,7 +683,7 @@ defmodule X402.Plug.PaymentGateTest do
 
         assert conn.status == 402
         assert decode_payment_required!(conn)["error"] == "No matching payment requirements"
-        refute_received {:verify_called, _, _, _}
+        refute_received {:verify_called, _, _}
       end
     end
 
@@ -709,7 +706,7 @@ defmodule X402.Plug.PaymentGateTest do
         assert decode_payment_required!(conn)["error"] == "No matching payment requirements"
       end
 
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "allows additive client metadata under accepted.extra" do
@@ -727,7 +724,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [route], facilitator: facilitator)
 
       assert conn.status == 200
-      assert_receive {:verify_called, _, _, _}
+      assert_receive {:verify_called, _, _}
     end
 
     test "rejects mutated extension echoes before facilitator verification" do
@@ -750,7 +747,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 400
       assert decode_payment_required!(conn)["error"] == "invalid_payload"
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
 
     test "uses matched requirements for verify and settle" do
@@ -763,14 +760,14 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 200
 
-      assert_receive {:verify_called, _payload, requirements, _}
+      assert_receive {:verify_called, _payload, requirements}
       assert requirements["scheme"] == "exact"
       assert requirements["network"] == @network
       assert requirements["amount"] == @amount
       assert requirements["asset"] == @asset
       assert requirements["payTo"] == @receiver
 
-      assert_receive {:settle_called, _payload, ^requirements, _}
+      assert_receive {:settle_called, _payload, ^requirements}
     end
   end
 
@@ -839,7 +836,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@multi_route], facilitator: facilitator)
 
       assert conn.status == 200
-      assert_receive {:verify_called, _payload, requirements, _}
+      assert_receive {:verify_called, _payload, requirements}
       assert requirements["network"] == @solana_accept.network
       assert requirements["amount"] == @solana_accept.price
       assert requirements["payTo"] == @solana_accept.pay_to
@@ -860,7 +857,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 402
       assert decode_payment_required!(conn)["error"] == "No matching payment requirements"
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
   end
 
@@ -877,13 +874,13 @@ defmodule X402.Plug.PaymentGateTest do
         |> put_req_header("payment-signature", valid_payment_header())
         |> gate_request(routes: [@route], facilitator: facilitator)
 
-      assert_receive {:verify_called, _, _, _}
-      refute_received {:settle_called, _, _, _}
+      assert_receive {:verify_called, _, _}
+      refute_received {:settle_called, _, _}
 
       response_conn = Plug.Conn.send_resp(gated_conn, 201, "created")
 
       assert response_conn.status == 201
-      assert_receive {:settle_called, _, _, _}
+      assert_receive {:settle_called, _, _}
       assert decode_payment_response!(response_conn)["success"] == true
     end
 
@@ -898,8 +895,8 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert response_conn.status == 500
       assert response_conn.resp_body == "handler failed"
-      assert_receive {:verify_called, _, _, _}
-      refute_received {:settle_called, _, _, _}
+      assert_receive {:verify_called, _, _}
+      refute_received {:settle_called, _, _}
       assert get_resp_header(response_conn, "payment-response") == []
     end
 
@@ -920,8 +917,8 @@ defmodule X402.Plug.PaymentGateTest do
         |> Plug.Conn.send_resp(500, "handler failed")
 
       assert first_response.status == 500
-      assert_receive {:verify_called, _, _, _}
-      refute_received {:settle_called, _, _, _}
+      assert_receive {:verify_called, _, _}
+      refute_received {:settle_called, _, _}
 
       retry_response =
         conn(:get, "/api/resource")
@@ -933,8 +930,8 @@ defmodule X402.Plug.PaymentGateTest do
         )
 
       assert retry_response.status == 200
-      assert_receive {:verify_called, _, _, _}
-      assert_receive {:settle_called, _, _, _}
+      assert_receive {:verify_called, _, _}
+      assert_receive {:settle_called, _, _}
     end
 
     test "verifies, settles, attaches PAYMENT-RESPONSE, and assigns payload" do
@@ -954,12 +951,12 @@ defmodule X402.Plug.PaymentGateTest do
       assert settle["network"] == @network
       assert settle["transaction"] != ""
 
-      assert_receive {:verify_called, payload, requirements, nil}
+      assert_receive {:verify_called, payload, requirements}
       assert payload["accepted"]["scheme"] == "exact"
       assert payload["payload"]["authorization"]["from"] == @receiver
       assert requirements["asset"] == @asset
 
-      assert_receive {:settle_called, ^payload, ^requirements, nil}
+      assert_receive {:settle_called, ^payload, ^requirements}
     end
 
     test "passes configured hooks module to facilitator calls" do
@@ -971,9 +968,15 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@route], facilitator: facilitator, hooks: TrackingHooks)
 
       assert conn.status == 200
-      assert_receive {:verify_called, _, requirements, TrackingHooks}
+      assert_receive {:verify_called, _, requirements}
       assert requirements["amount"] == @amount
-      assert_receive {:settle_called, _, ^requirements, TrackingHooks}
+      assert_receive {:settle_called, _, ^requirements}
+
+      # The configured hooks module ran around both facilitator operations.
+      assert_receive {:hook_called, :before_verify}
+      assert_receive {:hook_called, :after_verify}
+      assert_receive {:hook_called, :before_settle}
+      assert_receive {:hook_called, :after_settle}
     end
 
     test "verifies and settles an upto payment at the advertised maximum by default" do
@@ -985,12 +988,12 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@upto_route], facilitator: facilitator)
 
       assert conn.status == 200
-      assert_receive {:verify_called, payload, requirements, nil}
+      assert_receive {:verify_called, payload, requirements}
       assert payload["accepted"]["scheme"] == "upto"
       assert payload["payload"]["permit2Authorization"]["permitted"]["amount"] == @amount
       assert requirements["scheme"] == "upto"
       assert requirements["amount"] == @amount
-      assert_receive {:settle_called, _, ^requirements, nil}
+      assert_receive {:settle_called, _, ^requirements}
     end
 
     test "settles an upto payment using the handler's actual atomic amount" do
@@ -1005,8 +1008,8 @@ defmodule X402.Plug.PaymentGateTest do
       response_conn = Plug.Conn.send_resp(gated_conn, 200, "usage complete")
 
       assert response_conn.status == 200
-      assert_receive {:verify_called, _, %{"amount" => @amount}, _}
-      assert_receive {:settle_called, _, %{"amount" => "2500"}, _}
+      assert_receive {:verify_called, _, %{"amount" => @amount}}
+      assert_receive {:settle_called, _, %{"amount" => "2500"}}
     end
 
     test "fails closed when an upto settlement amount exceeds the authorized maximum" do
@@ -1022,7 +1025,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert response_conn.status == 500
       assert decode_payment_required!(response_conn)["error"] == "payment processing failed"
-      refute_received {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _}
     end
 
     test "rejects upto payments when authorization value exceeds route amount" do
@@ -1035,7 +1038,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 400
       assert decode_payment_required!(conn)["error"] == "invalid_payload"
-      refute_received {:verify_called, _, _, _}
+      refute_received {:verify_called, _, _}
     end
   end
 
@@ -1059,7 +1062,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified ->
         # The verify round-trip must already have completed when the claim runs.
-        assert_received {:verify_called, _, _, _}
+        assert_received {:verify_called, _, _}
         :ok
       end)
 
@@ -1101,7 +1104,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified ->
         # The claim must run before any facilitator verify round-trip.
-        refute_received {:verify_called, _, _, _}
+        refute_received {:verify_called, _, _}
         :ok
       end)
 
@@ -1116,8 +1119,8 @@ defmodule X402.Plug.PaymentGateTest do
         )
 
       assert conn.status == 200
-      assert_receive {:verify_called, _, _, _}
-      assert_receive {:settle_called, _, _, _}
+      assert_receive {:verify_called, _, _}
+      assert_receive {:settle_called, _, _}
     end
 
     test ":before_verify releases the claim when verification is rejected" do
@@ -1148,12 +1151,13 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 402
       assert_receive {:adapter_delete, _payment_id}
-      refute_received {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _}
     end
 
     test ":before_verify releases the claim on facilitator transport errors" do
-      error = %Error{type: :transport_error, reason: :closed, retryable: true}
-      facilitator = start_mock_facilitator(verify: {:error, error})
+      bypass = Bypass.open()
+      Bypass.down(bypass)
+      facilitator = start_facilitator(url: "http://localhost:#{bypass.port}")
       parent = self()
 
       expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified -> :ok end)
@@ -1178,8 +1182,11 @@ defmodule X402.Plug.PaymentGateTest do
     end
 
     test ":before_verify releases the claim when the facilitator call exits" do
-      # A dead facilitator pid makes Facilitator.verify exit with :noproc
-      # instead of returning an error tuple. The claim must still be released
+      # A dead facilitator pid makes Facilitator.verify exit with :noproc —
+      # the caller-side client still fetches its configuration through a
+      # GenServer.call to the facilitator process before running the HTTP
+      # request — instead of returning an error tuple. The claim must still be
+      # released
       # before the exit propagates, or the payer's retry is rejected as a
       # duplicate until the cache TTL expires.
       dead = spawn(fn -> :ok end)
@@ -1245,7 +1252,7 @@ defmodule X402.Plug.PaymentGateTest do
         )
 
       assert retry.status == 200
-      assert_receive {:settle_called, _, _, _}
+      assert_receive {:settle_called, _, _}
     end
 
     test ":before_verify rejects a duplicate without any facilitator call" do
@@ -1379,7 +1386,7 @@ defmodule X402.Plug.PaymentGateTest do
       assert response_conn.status == 500
       assert_receive {:adapter_put_new, payment_id}
       assert_receive {:adapter_delete, ^payment_id}
-      refute_received {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _}
     end
 
     test "releases the claim through the adapter when settlement fails" do
@@ -1431,7 +1438,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 402
       assert decode_payment_required!(conn)["error"] == "payment already processed"
-      refute_received {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _}
     end
 
     test "fails closed with 500 when the adapter claim errors" do
@@ -1451,7 +1458,7 @@ defmodule X402.Plug.PaymentGateTest do
         )
 
       assert conn.status == 500
-      refute_received {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _}
     end
 
     test "rejects duplicate payment proofs with the default ETS adapter" do
@@ -1469,7 +1476,7 @@ defmodule X402.Plug.PaymentGateTest do
         )
 
       assert first.status == 200
-      assert_receive {:settle_called, _, _, _}
+      assert_receive {:settle_called, _, _}
 
       duplicate =
         conn(:get, "/api/resource")
@@ -1482,7 +1489,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert duplicate.status == 402
       assert decode_payment_required!(duplicate)["error"] == "payment already processed"
-      refute_received {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _}
     end
 
     test "exactly one of two concurrent identical requests wins the claim" do
@@ -1510,8 +1517,8 @@ defmodule X402.Plug.PaymentGateTest do
         |> Task.await_many()
 
       assert Enum.sort(statuses) == [200, 402]
-      assert_receive {:settle_called, _, _, _}
-      refute_received {:settle_called, _, _, _}
+      assert_receive {:settle_called, _, _}
+      refute_received {:settle_called, _, _}
     end
   end
 
@@ -1585,8 +1592,9 @@ defmodule X402.Plug.PaymentGateTest do
 
   describe "facilitator failures" do
     test "returns 500 when verify has a transport failure" do
-      error = %Error{type: :transport_error, reason: :closed, retryable: true}
-      facilitator = start_mock_facilitator(verify: {:error, error})
+      bypass = Bypass.open()
+      Bypass.down(bypass)
+      facilitator = start_facilitator(url: "http://localhost:#{bypass.port}")
 
       conn =
         conn(:get, "/api/resource")
@@ -1595,7 +1603,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 500
       assert decode_payment_required!(conn)["error"] == "payment processing failed"
-      refute_received {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _}
     end
 
     test "fails closed when verify omits or mistypes isValid" do
@@ -1611,7 +1619,7 @@ defmodule X402.Plug.PaymentGateTest do
         assert decode_payment_required!(conn)["error"] == "payment processing failed"
       end
 
-      refute_received {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _}
     end
 
     test "returns 402 when verify body has isValid false" do
@@ -1632,12 +1640,25 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 402
       assert decode_payment_required!(conn)["error"] == "facilitator rejected payment"
-      refute_received {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _}
     end
 
-    test "returns 500 when settle has a transport failure" do
-      error = %Error{type: :timeout, reason: :timeout, retryable: true}
-      facilitator = start_mock_facilitator(settle: {:error, error})
+    test "returns 500 when settle times out" do
+      owner = self()
+      bypass = Bypass.open()
+      stub_facilitator_endpoint(bypass, owner, "/verify", :verify_called, @default_verify)
+
+      Bypass.stub(bypass, "POST", "/settle", fn conn ->
+        # The client hangs up at its receive timeout, which kills this handler
+        # mid-sleep; mark the expectation as passed so Bypass does not report
+        # the intentional timeout as a failure.
+        Bypass.pass(bypass)
+        Process.sleep(150)
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{}))
+      end)
+
+      facilitator =
+        start_facilitator(url: "http://localhost:#{bypass.port}", receive_timeout_ms: 50)
 
       conn =
         conn(:get, "/api/resource")
@@ -1675,17 +1696,19 @@ defmodule X402.Plug.PaymentGateTest do
       settle_body = %{
         "success" => true,
         "transaction" => "0xsettled",
-        "network" => @network,
-        "unencodable" => self()
+        "network" => @network
       }
 
       facilitator =
         start_mock_facilitator(settle: {:ok, %{status: 200, body: settle_body}})
 
+      # UnencodableSettleHooks injects a pid into the settle result body, so
+      # the settlement succeeds but the PAYMENT-RESPONSE header cannot be
+      # JSON-encoded.
       conn =
         conn(:get, "/api/resource")
         |> put_req_header("payment-signature", valid_payment_header())
-        |> run_request(routes: [@route], facilitator: facilitator)
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: UnencodableSettleHooks)
 
       assert conn.status == 500
       assert conn.resp_body == "{}"
@@ -1735,12 +1758,13 @@ defmodule X402.Plug.PaymentGateTest do
     end
 
     test "maps invalid_payload from facilitator using protocol error code" do
-      facilitator = start_mock_facilitator(verify: {:error, :invalid_payload})
+      facilitator =
+        start_mock_facilitator(verify: {:ok, %{status: 400, body: %{"error" => "invalid"}}})
 
       conn =
         conn(:get, "/api/resource")
         |> put_req_header("payment-signature", valid_payment_header())
-        |> run_request(routes: [@route], facilitator: facilitator)
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: InvalidPayloadHooks)
 
       # Local and facilitator invalid_payload both surface the protocol code;
       # HTTP transport maps invalid payment to 400.
@@ -1999,13 +2023,40 @@ defmodule X402.Plug.PaymentGateTest do
     payload |> Jason.encode!() |> Base.encode64()
   end
 
+  # Starts a real `X402.Facilitator` (operations execute in the calling
+  # process) backed by a Bypass HTTP stub that serves canned verify/settle
+  # results and notifies the test process of every facilitator call.
   defp start_mock_facilitator(opts \\ []) do
-    id = {:mock_facilitator, System.unique_integer([:positive, :monotonic])}
-    start_options = Keyword.put_new(opts, :owner, self())
+    owner = self()
+    verify = Keyword.get(opts, :verify, @default_verify)
+    settle = Keyword.get(opts, :settle, @default_settle)
 
-    start_supervised!(%{
-      id: id,
-      start: {MockFacilitator, :start_link, [start_options]}
-    })
+    bypass = Bypass.open()
+    stub_facilitator_endpoint(bypass, owner, "/verify", :verify_called, verify)
+    stub_facilitator_endpoint(bypass, owner, "/settle", :settle_called, settle)
+
+    start_facilitator(url: "http://localhost:#{bypass.port}")
+  end
+
+  defp stub_facilitator_endpoint(bypass, owner, path, tag, {:ok, %{status: status, body: body}}) do
+    Bypass.stub(bypass, "POST", path, fn conn ->
+      {:ok, request_body, conn} = Plug.Conn.read_body(conn)
+      decoded = Jason.decode!(request_body)
+      send(owner, {tag, decoded["paymentPayload"], decoded["paymentRequirements"]})
+      Plug.Conn.resp(conn, status, Jason.encode!(body))
+    end)
+  end
+
+  defp start_facilitator(opts) do
+    suffix = System.unique_integer([:positive, :monotonic])
+    finch = String.to_atom("payment_gate_finch_#{suffix}")
+    name = String.to_atom("payment_gate_facilitator_#{suffix}")
+
+    start_supervised!(Supervisor.child_spec({Finch, name: finch}, id: finch))
+
+    start_supervised!(
+      {Facilitator,
+       Keyword.merge([name: name, finch: finch, max_retries: 0, receive_timeout_ms: 1_000], opts)}
+    )
   end
 end

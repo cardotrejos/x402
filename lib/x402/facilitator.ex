@@ -1,6 +1,19 @@
 defmodule X402.Facilitator do
   @moduledoc """
-  Stateful client for x402 facilitator verify and settle operations.
+  Client for x402 facilitator verify and settle operations.
+
+  The facilitator process is a supervised configuration holder: it resolves
+  and stores connection settings (URL, Finch pool, hooks, retry policy, auth
+  state) once at startup. The HTTP work for `verify/2` and `settle/2` —
+  including retries with backoff, lifecycle hooks, telemetry spans, and
+  per-request auth header minting — executes in the **calling process**.
+  Concurrent payment operations therefore never serialize behind the
+  facilitator process; throughput is bounded only by the Finch pool.
+
+  Because operations run in the caller, `X402.Hooks` callbacks are invoked in
+  the calling process (not in the facilitator process), and the duration of an
+  operation is bounded by the configured `:receive_timeout_ms` and retry
+  policy rather than by a `GenServer.call/3` timeout.
   """
 
   use GenServer
@@ -180,27 +193,33 @@ defmodule X402.Facilitator do
 
   @doc """
   Verifies a payment using the given facilitator process.
+
+  The HTTP request (including retries, hooks, and telemetry) executes in the
+  calling process; the facilitator process is only consulted for its
+  configuration.
   """
   @doc group: :verification
   @doc since: "0.1.0"
   @spec verify(server(), map(), map()) :: response()
   def verify(server, payment_payload, requirements)
       when is_map(payment_payload) and is_map(requirements) do
-    GenServer.call(server, {:verify, payment_payload, requirements})
+    config = fetch_config(server)
+    request_with_telemetry(config, :verify, payment_payload, requirements, config.hooks)
   end
 
   @doc """
   Verifies a payment using the given facilitator process and hook module.
 
   This overrides the hook module configured when the facilitator process
-  started.
+  started. Hook callbacks run in the calling process.
   """
   @doc group: :verification
   @doc since: "0.1.0"
   @spec verify(server(), map(), map(), module()) :: response()
   def verify(server, payment_payload, requirements, hooks_module)
       when is_map(payment_payload) and is_map(requirements) and is_atom(hooks_module) do
-    GenServer.call(server, {:verify, payment_payload, requirements, hooks_module})
+    config = fetch_config(server)
+    request_with_telemetry(config, :verify, payment_payload, requirements, hooks_module)
   end
 
   @doc """
@@ -216,27 +235,33 @@ defmodule X402.Facilitator do
 
   @doc """
   Settles a payment using the given facilitator process.
+
+  The HTTP request (including retries, hooks, and telemetry) executes in the
+  calling process; the facilitator process is only consulted for its
+  configuration.
   """
   @doc group: :settlement
   @doc since: "0.1.0"
   @spec settle(server(), map(), map()) :: response()
   def settle(server, payment_payload, requirements)
       when is_map(payment_payload) and is_map(requirements) do
-    GenServer.call(server, {:settle, payment_payload, requirements})
+    config = fetch_config(server)
+    request_with_telemetry(config, :settle, payment_payload, requirements, config.hooks)
   end
 
   @doc """
   Settles a payment using the given facilitator process and hook module.
 
   This overrides the hook module configured when the facilitator process
-  started.
+  started. Hook callbacks run in the calling process.
   """
   @doc group: :settlement
   @doc since: "0.1.0"
   @spec settle(server(), map(), map(), module()) :: response()
   def settle(server, payment_payload, requirements, hooks_module)
       when is_map(payment_payload) and is_map(requirements) and is_atom(hooks_module) do
-    GenServer.call(server, {:settle, payment_payload, requirements, hooks_module})
+    config = fetch_config(server)
+    request_with_telemetry(config, :settle, payment_payload, requirements, hooks_module)
   end
 
   @doc false
@@ -288,26 +313,15 @@ defmodule X402.Facilitator do
   defp normalize_auth(other), do: Auth.new(other)
 
   @impl true
-  @spec handle_call(term(), GenServer.from(), state()) :: {:reply, response(), state()}
-  def handle_call({:verify, payment_payload, requirements}, _from, state) do
-    response = request_with_telemetry(state, :verify, payment_payload, requirements, state.hooks)
-    {:reply, response, state}
+  @spec handle_call(:config, GenServer.from(), state()) :: {:reply, state(), state()}
+  def handle_call(:config, _from, state) do
+    {:reply, state, state}
   end
 
-  def handle_call({:verify, payment_payload, requirements, hooks_module}, _from, state) do
-    response = request_with_telemetry(state, :verify, payment_payload, requirements, hooks_module)
-    {:reply, response, state}
-  end
-
-  def handle_call({:settle, payment_payload, requirements}, _from, state) do
-    response = request_with_telemetry(state, :settle, payment_payload, requirements, state.hooks)
-    {:reply, response, state}
-  end
-
-  def handle_call({:settle, payment_payload, requirements, hooks_module}, _from, state) do
-    response = request_with_telemetry(state, :settle, payment_payload, requirements, hooks_module)
-    {:reply, response, state}
-  end
+  # Fetching the configuration is the only work performed inside the
+  # facilitator process; everything else (HTTP, retries, hooks, telemetry)
+  # runs in the caller so operations never serialize behind this GenServer.
+  defp fetch_config(server), do: GenServer.call(server, :config)
 
   defp request_with_telemetry(state, operation, payment_payload, requirements, hooks_module) do
     endpoint = operation_endpoint(operation)
