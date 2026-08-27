@@ -194,6 +194,16 @@ defmodule X402.Extensions.OfferReceiptTest do
                receipt_payload() |> Map.delete("payer") |> OfferReceipt.receipt_digest()
     end
 
+    test "uint256-overflowing fields fail closed instead of truncating" do
+      huge = Integer.pow(2, 256)
+
+      assert {:error, {:invalid_field, "validUntil"}} =
+               offer_payload() |> Map.put("validUntil", huge) |> OfferReceipt.offer_digest()
+
+      assert {:error, {:invalid_field, "issuedAt"}} =
+               receipt_payload() |> Map.put("issuedAt", huge) |> OfferReceipt.receipt_digest()
+    end
+
     test "mistyped fields are structured errors" do
       assert {:error, {:invalid_field, "resourceUrl"}} =
                offer_payload() |> Map.put("resourceUrl", 42) |> OfferReceipt.offer_digest()
