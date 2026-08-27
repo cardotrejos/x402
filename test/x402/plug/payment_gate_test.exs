@@ -311,6 +311,163 @@ defmodule X402.Plug.PaymentGateTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Local pre-verification checks — cheap payTo/amount/timing validation on the
+  # EIP-3009 authorization object before the facilitator round-trip.
+  # ---------------------------------------------------------------------------
+
+  describe "local pre-verification checks" do
+    test "rejects a payTo mismatch without calling the facilitator" do
+      facilitator = start_mock_facilitator()
+
+      header =
+        valid_payment_payload()
+        |> put_in(
+          ["payload", "authorization", "to"],
+          "0x9999999999999999999999999999999999999999"
+        )
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 402
+      refute_received {:verify_called, _, _, _}
+    end
+
+    test "accepts a payTo that differs only in hex casing" do
+      facilitator = start_mock_facilitator()
+
+      "0x" <> hex = @receiver
+
+      header =
+        valid_payment_payload()
+        |> put_in(["payload", "authorization", "to"], "0x" <> String.upcase(hex))
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert_receive {:verify_called, _, _, _}
+    end
+
+    test "rejects an exact-scheme amount mismatch without calling the facilitator" do
+      facilitator = start_mock_facilitator()
+
+      header =
+        valid_payment_payload()
+        |> put_in(["payload", "authorization", "value"], "9999")
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 402
+      refute_received {:verify_called, _, _, _}
+    end
+
+    test "rejects an authorization that is not yet valid" do
+      facilitator = start_mock_facilitator()
+
+      header =
+        valid_payment_payload()
+        |> put_in(
+          ["payload", "authorization", "validAfter"],
+          Integer.to_string(System.system_time(:second) + 3_600)
+        )
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 402
+      refute_received {:verify_called, _, _, _}
+    end
+
+    test "rejects an authorization expiring inside the settlement buffer" do
+      facilitator = start_mock_facilitator()
+
+      header =
+        valid_payment_payload()
+        |> put_in(
+          ["payload", "authorization", "validBefore"],
+          Integer.to_string(System.system_time(:second) + 3)
+        )
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 402
+      refute_received {:verify_called, _, _, _}
+    end
+
+    test "rejects non-numeric authorization timing" do
+      facilitator = start_mock_facilitator()
+
+      header =
+        valid_payment_payload()
+        |> put_in(["payload", "authorization", "validAfter"], "not-a-timestamp")
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 402
+      refute_received {:verify_called, _, _, _}
+    end
+
+    test "skips payloads without an EIP-3009 authorization object" do
+      facilitator = start_mock_facilitator()
+
+      header =
+        valid_payment_payload()
+        |> put_in(["payload"], %{"signature" => "0xsignature"})
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert_receive {:verify_called, _, _, _}
+    end
+
+    test "local_prechecks: false defers everything to the facilitator" do
+      facilitator = start_mock_facilitator()
+
+      header =
+        valid_payment_payload()
+        |> put_in(
+          ["payload", "authorization", "to"],
+          "0x9999999999999999999999999999999999999999"
+        )
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator, local_prechecks: false)
+
+      assert conn.status == 200
+      assert_receive {:verify_called, _, _, _}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # PaymentRequired (402 signaling) — §5.1 + HTTP transport
   # ---------------------------------------------------------------------------
 
@@ -670,6 +827,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> put_in(["accepted", "amount"], @solana_accept.price)
         |> put_in(["accepted", "asset"], @solana_accept.asset)
         |> put_in(["accepted", "payTo"], @solana_accept.pay_to)
+        |> put_in(["payload"], %{"transaction" => "base64-encoded-solana-transaction"})
 
       conn =
         conn(:get, "/api/resource")
@@ -1311,8 +1469,8 @@ defmodule X402.Plug.PaymentGateTest do
           "from" => @receiver,
           "to" => @receiver,
           "value" => @amount,
-          "validAfter" => "1740672089",
-          "validBefore" => "1740672154",
+          "validAfter" => Integer.to_string(System.system_time(:second) - 60),
+          "validBefore" => Integer.to_string(System.system_time(:second) + 300),
           "nonce" => "0xf3746613c2d920b5fdabc0856f2aeb2d4f88ee6037b8cc5d04a71a4462f13480"
         }
       },

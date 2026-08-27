@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Local pre-verification checks in `X402.Plug.PaymentGate`** (option
+  `local_prechecks:`, default `true`): before the facilitator round-trip, the
+  gate now validates the EIP-3009-style `payload.authorization` object against
+  the matched requirements — `to` must equal `payTo` (case-insensitive for hex
+  addresses), `value` must equal the advertised amount on `"exact"` routes,
+  `validAfter` must not be in the future, and `validBefore` must cover now
+  plus a 6-second settlement buffer (mirroring the reference facilitators).
+  Failures answer 402 with reason `{:precheck_failed, detail}` and never reach
+  the facilitator; payloads without an authorization object (other schemes,
+  Permit2) and absent fields are skipped, so the facilitator remains the
+  authority. (Ecosystem report §6.6.4/§8 P1.2.)
+
 ### Security
 
 - **`X402.Plug.PaymentGate` route matching now runs on decoded
