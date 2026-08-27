@@ -1549,7 +1549,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # headers never match, so API clients keep the JSON body.
     @spec browser_request?(Plug.Conn.t()) :: boolean()
     defp browser_request?(conn) do
-      String.contains?(first_req_header(conn, "accept"), "text/html") and
+      # GET only: the paywall page's payment retry re-issues the request as a
+      # plain GET of the current URL, so serving it for a browser form POST
+      # would silently retry with the wrong method (and without the form
+      # body). Non-GET browser requests keep the JSON 402.
+      conn.method == "GET" and
+        String.contains?(first_req_header(conn, "accept"), "text/html") and
         String.contains?(first_req_header(conn, "user-agent"), "Mozilla")
     end
 

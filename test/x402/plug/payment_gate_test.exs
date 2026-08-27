@@ -2000,6 +2000,19 @@ defmodule X402.Plug.PaymentGateTest do
       assert get_resp_header(json, "content-security-policy") == []
     end
 
+    test "keeps JSON for non-GET browser requests (paywall retry is a GET)" do
+      route = Map.put(@route, :method, :post)
+
+      conn =
+        conn(:post, "/api/resource")
+        |> browser_conn()
+        |> run_request(routes: [route], facilitator: self(), paywall: X402.Paywall.Default)
+
+      assert conn.status == 402
+      assert get_resp_header(conn, "content-type") == ["application/json; charset=utf-8"]
+      refute conn.resp_body =~ "<!DOCTYPE html>"
+    end
+
     test "serves HTML for a bare text/html Accept with a Mozilla User-Agent" do
       conn =
         conn(:get, "/api/resource")
