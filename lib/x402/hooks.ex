@@ -13,6 +13,11 @@ defmodule X402.Hooks do
 
   `on_*_failure` callbacks can continue failure handling with `{:cont, context}`
   or recover the operation with `{:recover, result}`.
+
+  Hook callbacks are invoked in the process that calls
+  `X402.Facilitator.verify/2` or `X402.Facilitator.settle/2` (for example a
+  Plug request process), not in the facilitator process. Hooks that touch
+  process-bound state should account for running concurrently across callers.
   """
 
   alias X402.Hooks.Context

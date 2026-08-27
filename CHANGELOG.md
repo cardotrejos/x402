@@ -53,6 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `X402.Facilitator.verify/2..4` and `settle/2..4` now execute the HTTP
+  request — including retries with backoff, lifecycle hooks, telemetry spans,
+  and per-request auth header minting — in the calling process. The
+  facilitator GenServer is now a supervised configuration holder consulted
+  only for its settings, so concurrent payment operations no longer serialize
+  behind a single process (previously blocking HTTP plus retry sleeps ran
+  inside `handle_call`, with a worst case well beyond the default
+  `GenServer.call/3` timeout). The public API, option surface, return shapes,
+  telemetry event names, and hook semantics are unchanged; note that
+  `X402.Hooks` callbacks now run in the caller's process
 - `X402.Plug.PaymentGate` routes all replay claim/release calls through the
   `X402.Extensions.PaymentIdentifier.Cache` behaviour instead of calling
   `ETSCache` directly; adapter claim errors other than

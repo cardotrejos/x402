@@ -589,6 +589,43 @@ defmodule X402.FacilitatorTest do
              )
   end
 
+  test "concurrent verify calls do not serialize behind the facilitator process", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    delay_ms = 500
+
+    Bypass.expect(bypass, "POST", "/verify", fn conn ->
+      Process.sleep(delay_ms)
+      Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    {elapsed_us, results} =
+      :timer.tc(fn ->
+        1..2
+        |> Enum.map(fn _index ->
+          Task.async(fn -> Facilitator.verify(facilitator, %{}, %{}) end)
+        end)
+        |> Task.await_many(5_000)
+      end)
+
+    for result <- results do
+      assert {:ok, %{status: 200, body: %{"verified" => true}}} = result
+    end
+
+    elapsed_ms = div(elapsed_us, 1000)
+
+    assert elapsed_ms < 2 * delay_ms,
+           "expected concurrent verifies to overlap, but 2 calls took #{elapsed_ms}ms " <>
+             "(serialized execution would take >= #{2 * delay_ms}ms)"
+  end
+
   test "emits telemetry span events", %{
     bypass: bypass,
     finch: finch,
