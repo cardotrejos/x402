@@ -878,6 +878,364 @@ defmodule X402.FacilitatorTest do
              Facilitator.verify(facilitator, %{}, %{})
   end
 
+  describe "supported/1" do
+    test "fetches and validates the supported payment kinds", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "GET", "/supported", fn conn ->
+        Plug.Conn.resp(
+          conn,
+          200,
+          Jason.encode!(%{
+            "kinds" => [
+              %{"x402Version" => 2, "scheme" => "exact", "network" => "eip155:8453"},
+              %{
+                "x402Version" => 2,
+                "scheme" => "exact",
+                "network" => "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "extra" => %{"feePayer" => "CKPKJWNdJEqa81x7CkZ14BVPiY6y16Sxs7owznqtWYp5"}
+              }
+            ],
+            "extensions" => ["bazaar"],
+            "signers" => %{"eip155:*" => ["0x1234567890abcdef1234567890abcdef12345678"]}
+          })
+        )
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok, %{kinds: kinds, extensions: ["bazaar"], signers: signers}} =
+               Facilitator.supported(facilitator)
+
+      assert [
+               %{x402_version: 2, scheme: "exact", network: "eip155:8453", extra: nil},
+               %{scheme: "exact", extra: %{"feePayer" => fee_payer}}
+             ] = kinds
+
+      assert fee_payer == "CKPKJWNdJEqa81x7CkZ14BVPiY6y16Sxs7owznqtWYp5"
+      assert signers == %{"eip155:*" => ["0x1234567890abcdef1234567890abcdef12345678"]}
+    end
+
+    test "defaults missing extensions and signers", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "GET", "/supported", fn conn ->
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"kinds" => []}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok, %{kinds: [], extensions: [], signers: %{}}} =
+               Facilitator.supported(facilitator)
+    end
+
+    test "supported/0 and list_resources/1 use the default registered name", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "GET", "/supported", fn conn ->
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"kinds" => []}))
+      end)
+
+      Bypass.expect(bypass, "GET", "/discovery/resources", fn conn ->
+        conn = Plug.Conn.fetch_query_params(conn)
+        assert conn.query_params == %{"limit" => "5"}
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"items" => []}))
+      end)
+
+      start_supervised!({Facilitator, finch: finch, url: facilitator_url})
+
+      assert {:ok, %{kinds: []}} = Facilitator.supported()
+      assert {:ok, %{items: []}} = Facilitator.list_resources(limit: 5)
+    end
+
+    test "fails closed on malformed responses", %{finch: finch} do
+      malformed_bodies = [
+        %{},
+        %{"kinds" => "exact"},
+        %{"kinds" => [%{"x402Version" => "2", "scheme" => "exact", "network" => "eip155:1"}]},
+        %{"kinds" => [%{"scheme" => "exact", "network" => "eip155:1"}]},
+        %{"kinds" => [], "extensions" => "bazaar"},
+        %{"kinds" => [], "signers" => %{"eip155:*" => "0xabc"}},
+        %{"kinds" => [], "signers" => ["0xabc"]}
+      ]
+
+      for body <- malformed_bodies do
+        bypass = Bypass.open()
+
+        Bypass.expect(bypass, "GET", "/supported", fn conn ->
+          Plug.Conn.resp(conn, 200, Jason.encode!(body))
+        end)
+
+        facilitator =
+          start_supervised!(
+            {Facilitator,
+             name: unique_name("facilitator"),
+             finch: finch,
+             url: "http://localhost:#{bypass.port}"}
+          )
+
+        assert {:error, %Error{type: :malformed_facilitator_response, status: 200}} =
+                 Facilitator.supported(facilitator)
+      end
+    end
+
+    test "propagates HTTP errors", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "GET", "/supported", fn conn ->
+        Plug.Conn.resp(conn, 404, Jason.encode!(%{"error" => "not found"}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:error, %Error{type: :http_error, status: 404, retryable: false}} =
+               Facilitator.supported(facilitator)
+    end
+
+    test "sends a CDP JWT bound to the GET method and path", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      {secret, public_key} = X402.TestAuthKeys.ed25519()
+
+      Bypass.expect(bypass, "GET", "/supported", fn conn ->
+        [authorization] = Plug.Conn.get_req_header(conn, "authorization")
+        token = String.replace_prefix(authorization, "Bearer ", "")
+        assert verify_jwt(token, public_key)
+        assert jwt_payload(token)["uris"] == ["GET localhost:#{bypass.port}/supported"]
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"kinds" => []}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           auth: {X402.Facilitator.Auth.CDP, api_key_id: "key-123", api_key_secret: secret}}
+        )
+
+      assert {:ok, %{kinds: []}} = Facilitator.supported(facilitator)
+    end
+
+    test "emits telemetry span events", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      parent = self()
+      handler_id = "facilitator-supported-span-#{System.unique_integer([:positive, :monotonic])}"
+
+      :ok =
+        :telemetry.attach_many(
+          handler_id,
+          [[:x402, :facilitator, :supported, :start], [:x402, :facilitator, :supported, :stop]],
+          fn event, measurements, metadata, _config ->
+            send(parent, {:telemetry, event, measurements, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Bypass.expect(bypass, "GET", "/supported", fn conn ->
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"kinds" => []}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok, %{kinds: []}} = Facilitator.supported(facilitator)
+
+      assert_receive {:telemetry, [:x402, :facilitator, :supported, :start], _measurements,
+                      %{operation: :supported, endpoint: "/supported"}}
+
+      assert_receive {:telemetry, [:x402, :facilitator, :supported, :stop], _measurements,
+                      %{success: true}}
+    end
+  end
+
+  describe "list_resources/2" do
+    test "fetches discovery resources with encoded query parameters", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      item = %{
+        "resource" => "https://api.example.com/premium-data",
+        "type" => "http",
+        "x402Version" => 2,
+        "accepts" => [%{"scheme" => "exact", "network" => "eip155:8453"}],
+        "lastUpdated" => 1_703_123_456
+      }
+
+      Bypass.expect(bypass, "GET", "/discovery/resources", fn conn ->
+        conn = Plug.Conn.fetch_query_params(conn)
+
+        assert conn.query_params == %{
+                 "type" => "http",
+                 "payTo" => "0x1111111111111111111111111111111111111111",
+                 "scheme" => "exact",
+                 "network" => "eip155:8453",
+                 "limit" => "10",
+                 "offset" => "20"
+               }
+
+        Plug.Conn.resp(
+          conn,
+          200,
+          Jason.encode!(%{
+            "x402Version" => 2,
+            "items" => [item],
+            "pagination" => %{"limit" => 10, "offset" => 20, "total" => 1}
+          })
+        )
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok,
+              %{
+                x402_version: 2,
+                items: [returned_item],
+                pagination: %{limit: 10, offset: 20, total: 1}
+              }} =
+               Facilitator.list_resources(facilitator,
+                 type: "http",
+                 pay_to: "0x1111111111111111111111111111111111111111",
+                 scheme: "exact",
+                 network: "eip155:8453",
+                 limit: 10,
+                 offset: 20
+               )
+
+      assert returned_item == item
+    end
+
+    test "omits query string without parameters and defaults pagination to nil", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "GET", "/discovery/resources", fn conn ->
+        assert conn.query_string == ""
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"items" => []}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok, %{x402_version: nil, items: [], pagination: nil}} =
+               Facilitator.list_resources(facilitator)
+    end
+
+    test "rejects invalid parameters before any HTTP request", %{
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Facilitator.list_resources(facilitator, limit: 0)
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Facilitator.list_resources(facilitator, limit: 101)
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Facilitator.list_resources(facilitator, network: :base)
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Facilitator.list_resources(facilitator, unknown: "option")
+    end
+
+    test "fails closed on malformed responses", %{finch: finch} do
+      malformed_bodies = [
+        %{},
+        %{"items" => %{}},
+        %{"items" => ["not-a-map"]},
+        %{"items" => [], "pagination" => %{"limit" => "10"}},
+        %{"items" => [], "x402Version" => "2"}
+      ]
+
+      for body <- malformed_bodies do
+        bypass = Bypass.open()
+
+        Bypass.expect(bypass, "GET", "/discovery/resources", fn conn ->
+          Plug.Conn.resp(conn, 200, Jason.encode!(body))
+        end)
+
+        facilitator =
+          start_supervised!(
+            {Facilitator,
+             name: unique_name("facilitator"),
+             finch: finch,
+             url: "http://localhost:#{bypass.port}"}
+          )
+
+        assert {:error, %Error{type: :malformed_facilitator_response, status: 200}} =
+                 Facilitator.list_resources(facilitator)
+      end
+    end
+
+    test "sends a CDP JWT bound to the GET method and discovery path", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      {secret, public_key} = X402.TestAuthKeys.ed25519()
+
+      Bypass.expect(bypass, "GET", "/discovery/resources", fn conn ->
+        [authorization] = Plug.Conn.get_req_header(conn, "authorization")
+        token = String.replace_prefix(authorization, "Bearer ", "")
+        assert verify_jwt(token, public_key)
+
+        assert jwt_payload(token)["uris"] ==
+                 ["GET localhost:#{bypass.port}/discovery/resources"]
+
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"items" => []}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           auth: {X402.Facilitator.Auth.CDP, api_key_id: "key-123", api_key_secret: secret}}
+        )
+
+      assert {:ok, %{items: []}} = Facilitator.list_resources(facilitator, limit: 5)
+    end
+  end
+
   test "hook context struct includes payload and requirements" do
     assert %Context{payload: %{a: 1}, requirements: %{b: 2}, result: nil, error: nil} =
              Context.new(%{a: 1}, %{b: 2})

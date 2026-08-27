@@ -1,6 +1,6 @@
 defmodule X402.Facilitator.Error do
   @moduledoc """
-  Structured error returned by facilitator verify/settle operations.
+  Structured error returned by facilitator client operations.
   """
 
   @typedoc """
@@ -13,6 +13,7 @@ defmodule X402.Facilitator.Error do
           | :insecure_scheme
           | :invalid_json
           | :invalid_option
+          | :malformed_facilitator_response
           | :request_setup_failed
           | :timeout
           | :transport_error

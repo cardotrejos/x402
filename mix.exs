@@ -165,7 +165,8 @@ defmodule X402.MixProject do
       groups_for_docs: [
         "Header Encoding": &(&1[:group] == :headers),
         "Payment Verification": &(&1[:group] == :verification),
-        "Payment Settlement": &(&1[:group] == :settlement)
+        "Payment Settlement": &(&1[:group] == :settlement),
+        "Facilitator Discovery": &(&1[:group] == :discovery)
       ]
     ]
   end

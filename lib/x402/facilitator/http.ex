@@ -1,15 +1,22 @@
 defmodule X402.Facilitator.HTTP do
   @moduledoc """
-  HTTP transport for facilitator verify and settle requests.
+  HTTP transport for facilitator requests.
+
+  `request/5` performs the POST requests used by verify and settle; `get/4`
+  performs the GET requests used by `/supported` and `/discovery/resources`.
   """
 
   alias X402.Facilitator.Error
 
   @transient_statuses [408, 429, 500, 502, 503, 504]
   @json_headers [{"content-type", "application/json"}, {"accept", "application/json"}]
+  @accept_json_headers [{"accept", "application/json"}]
 
   @type finch_name :: atom() | pid() | {:via, module(), term()}
   @type response :: {:ok, %{status: non_neg_integer(), body: map()}} | {:error, Error.t()}
+
+  @typedoc "Query string parameters accepted by `get/4`."
+  @type query :: [{String.t(), String.t() | integer()}]
 
   @doc """
   Performs a facilitator HTTP POST request.
@@ -51,37 +58,74 @@ defmodule X402.Facilitator.HTTP do
   @spec request(finch_name(), String.t(), String.t(), map(), keyword()) :: response()
   def request(finch_name, base_url, path, payload, opts \\ [])
       when is_binary(base_url) and is_binary(path) and is_map(payload) and is_list(opts) do
-    with :ok <- validate_https_scheme(base_url),
+    with {:ok, ctx} <- build_context(finch_name, base_url, path, opts),
          {:ok, max_retries} <- fetch_non_negative_integer(opts, :max_retries, 2),
-         {:ok, retry_backoff_ms} <- fetch_non_negative_integer(opts, :retry_backoff_ms, 100),
-         {:ok, receive_timeout_ms} <- fetch_non_negative_integer(opts, :receive_timeout_ms, 5_000),
-         {:ok, headers} <- fetch_headers(opts),
-         {:ok, finch_module} <- ensure_finch_module(),
          {:ok, encoded_payload} <- Jason.encode(payload) do
-      ctx = %{
-        finch_module: finch_module,
-        finch_name: finch_name,
-        url: join_url(base_url, path),
-        payload: encoded_payload,
-        headers: headers,
-        receive_timeout_ms: receive_timeout_ms,
-        retry_backoff_ms: retry_backoff_ms
-      }
+      ctx = Map.merge(ctx, %{method: :post, payload: encoded_payload})
+      do_request(ctx, 1, max_retries + 1)
+    else
+      error -> setup_error(error)
+    end
+  end
+
+  @doc """
+  Performs a facilitator HTTP GET request.
+
+  Used for the read-only facilitator endpoints (`GET /supported` and
+  `GET /discovery/resources`). No request body is sent.
+
+  In addition to the options accepted by `request/5`, `opts` supports:
+
+  - `:query` (default: `[]`) — query string parameters as a list of
+    `{name, value}` tuples with string names and string or integer values,
+    encoded with `URI.encode_query/1`.
+
+  The same TLS requirements as `request/5` apply; see `secure_pool_opts/0`.
+  """
+  @doc since: "0.6.0"
+  @spec get(finch_name(), String.t(), String.t(), keyword()) :: response()
+  def get(finch_name, base_url, path, opts \\ [])
+      when is_binary(base_url) and is_binary(path) and is_list(opts) do
+    with {:ok, ctx} <- build_context(finch_name, base_url, path, opts),
+         {:ok, max_retries} <- fetch_non_negative_integer(opts, :max_retries, 2),
+         {:ok, query} <- fetch_query(opts) do
+      ctx =
+        Map.merge(ctx, %{method: :get, payload: nil, url: append_query(ctx.url, query)})
 
       do_request(ctx, 1, max_retries + 1)
     else
-      {:error, %Error{} = error} ->
-        {:error, error}
-
-      {:error, reason} ->
-        {:error,
-         %Error{
-           type: :request_setup_failed,
-           reason: reason,
-           retryable: false,
-           attempt: 1
-         }}
+      error -> setup_error(error)
     end
+  end
+
+  defp build_context(finch_name, base_url, path, opts) do
+    with :ok <- validate_https_scheme(base_url),
+         {:ok, retry_backoff_ms} <- fetch_non_negative_integer(opts, :retry_backoff_ms, 100),
+         {:ok, receive_timeout_ms} <- fetch_non_negative_integer(opts, :receive_timeout_ms, 5_000),
+         {:ok, headers} <- fetch_headers(opts),
+         {:ok, finch_module} <- ensure_finch_module() do
+      {:ok,
+       %{
+         finch_module: finch_module,
+         finch_name: finch_name,
+         url: join_url(base_url, path),
+         headers: headers,
+         receive_timeout_ms: receive_timeout_ms,
+         retry_backoff_ms: retry_backoff_ms
+       }}
+    end
+  end
+
+  defp setup_error({:error, %Error{} = error}), do: {:error, error}
+
+  defp setup_error({:error, reason}) do
+    {:error,
+     %Error{
+       type: :request_setup_failed,
+       reason: reason,
+       retryable: false,
+       attempt: 1
+     }}
   end
 
   @doc """
@@ -120,6 +164,7 @@ defmodule X402.Facilitator.HTTP do
          %{
            finch_module: finch_module,
            finch_name: finch_name,
+           method: method,
            url: url,
            payload: encoded_payload,
            headers: headers,
@@ -127,7 +172,7 @@ defmodule X402.Facilitator.HTTP do
          },
          attempt
        ) do
-    request = finch_module.build(:post, url, @json_headers ++ headers, encoded_payload)
+    request = finch_module.build(method, url, base_headers(method) ++ headers, encoded_payload)
     finch_opts = [receive_timeout: receive_timeout_ms]
 
     response =
@@ -297,6 +342,32 @@ defmodule X402.Facilitator.HTTP do
 
   defp valid_header?({name, value}) when is_binary(name) and is_binary(value), do: true
   defp valid_header?(_header), do: false
+
+  defp base_headers(:post), do: @json_headers
+  defp base_headers(:get), do: @accept_json_headers
+
+  defp fetch_query(opts) do
+    case Keyword.get(opts, :query, []) do
+      query when is_list(query) ->
+        if Enum.all?(query, &valid_query_param?/1) do
+          {:ok, query}
+        else
+          {:error, invalid_option_error(:query, query)}
+        end
+
+      invalid ->
+        {:error, invalid_option_error(:query, invalid)}
+    end
+  end
+
+  defp valid_query_param?({name, value})
+       when is_binary(name) and (is_binary(value) or is_integer(value)),
+       do: true
+
+  defp valid_query_param?(_param), do: false
+
+  defp append_query(url, []), do: url
+  defp append_query(url, query), do: url <> "?" <> URI.encode_query(query)
 
   defp invalid_option_error(key, invalid) do
     %Error{

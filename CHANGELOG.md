@@ -50,6 +50,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{module, cache}` adapter tuple implementing
   `X402.Extensions.PaymentIdentifier.Cache`; a bare pid/name keeps working and
   is normalized to the bundled `ETSCache` adapter
+- `X402.Facilitator.supported/0..1` — `GET /supported` returning the
+  facilitator's payment kinds, extensions, and signers as
+  `{:ok, %{kinds: [...], extensions: [...], signers: %{...}}}`, validated
+  fail-closed (`{:error, %Error{type: :malformed_facilitator_response}}` on a
+  malformed body). Unlocks startup route validation, SVM `feePayer` discovery,
+  and `upto` `facilitatorAddress` discovery
+- `X402.Facilitator.list_resources/0..2` — `GET /discovery/resources` with
+  NimbleOptions-validated filter and pagination parameters (`type`, `pay_to`,
+  `scheme`, `network`, `extensions`, `limit`, `offset`), returning fail-closed
+  parsed `{:ok, %{items: [...], pagination: ..., x402_version: ...}}`
+- `X402.Facilitator.HTTP.get/3..4` — GET transport with optional `:query`
+  parameters, sharing the retry/backoff/TLS pipeline with `request/5`
+- Telemetry spans `[:x402, :facilitator, :supported]` and
+  `[:x402, :facilitator, :list_resources]`, consistent with the existing
+  verify/settle spans
+- Facilitator auth implementations now receive the real request method
+  (`:get` for the new endpoints) in `request_info`, so CDP JWTs bind
+  `GET host path` in their `uris` claim
 
 ### Changed
 

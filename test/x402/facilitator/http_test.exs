@@ -352,6 +352,122 @@ defmodule X402.Facilitator.HTTPTest do
     )
   end
 
+  test "get/4 performs a GET request without a body" do
+    with_stubbed_finch(fn ->
+      parent = self()
+
+      Process.put(
+        :http_test_finch_response,
+        {:fun,
+         fn request, _finch_name, _opts ->
+           send(parent, {:request, request})
+           {:ok, %{status: 200, body: Jason.encode!(%{"kinds" => []})}}
+         end}
+      )
+
+      assert {:ok, %{status: 200, body: %{"kinds" => []}}} =
+               HTTP.get(:stub, "https://facilitator.test", "/supported")
+
+      assert_receive {:request, request}
+      assert request.method == :get
+      assert request.url == "https://facilitator.test/supported"
+      assert request.body == nil
+      assert {"accept", "application/json"} in request.headers
+      refute Enum.any?(request.headers, fn {name, _value} -> name == "content-type" end)
+    end)
+  end
+
+  test "get/4 encodes query parameters" do
+    with_stubbed_finch(fn ->
+      parent = self()
+
+      Process.put(
+        :http_test_finch_response,
+        {:fun,
+         fn request, _finch_name, _opts ->
+           send(parent, {:request_url, request.url})
+           {:ok, %{status: 200, body: Jason.encode!(%{"items" => []})}}
+         end}
+      )
+
+      query = [{"network", "eip155:8453"}, {"limit", 20}, {"offset", 0}]
+
+      assert {:ok, %{status: 200}} =
+               HTTP.get(:stub, "https://facilitator.test", "/discovery/resources", query: query)
+
+      assert_receive {:request_url, url}
+
+      assert url ==
+               "https://facilitator.test/discovery/resources?network=eip155%3A8453&limit=20&offset=0"
+    end)
+  end
+
+  test "get/4 sends custom headers after the accept header" do
+    with_stubbed_finch(fn ->
+      parent = self()
+
+      Process.put(
+        :http_test_finch_response,
+        {:fun,
+         fn request, _finch_name, _opts ->
+           send(parent, {:headers, request.headers})
+           {:ok, %{status: 200, body: "{}"}}
+         end}
+      )
+
+      assert {:ok, %{status: 200}} =
+               HTTP.get(:stub, "https://facilitator.test", "/supported",
+                 headers: [{"authorization", "Bearer token"}]
+               )
+
+      assert_receive {:headers, headers}
+      assert {"authorization", "Bearer token"} in headers
+    end)
+  end
+
+  test "get/4 retries transient statuses" do
+    with_stubbed_finch(fn ->
+      Process.put(
+        :http_test_finch_response,
+        {:fun,
+         fn _request, _finch_name, _opts ->
+           attempt = Process.get(:http_test_get_attempt, 1)
+           Process.put(:http_test_get_attempt, attempt + 1)
+
+           case attempt do
+             1 -> {:ok, %{status: 429, body: Jason.encode!(%{"error" => "rate limited"})}}
+             _later -> {:ok, %{status: 200, body: Jason.encode!(%{"kinds" => []})}}
+           end
+         end}
+      )
+
+      assert {:ok, %{status: 200, body: %{"kinds" => []}}} =
+               HTTP.get(:stub, "https://facilitator.test", "/supported",
+                 max_retries: 2,
+                 retry_backoff_ms: 1
+               )
+
+      Process.delete(:http_test_get_attempt)
+    end)
+  end
+
+  test "get/4 rejects invalid query options" do
+    with_stubbed_finch(fn ->
+      assert {:error, %Error{type: :invalid_option, reason: {:query, :nope}}} =
+               HTTP.get(:stub, "https://facilitator.test", "/supported", query: :nope)
+
+      assert {:error, %Error{type: :invalid_option, reason: {:query, [{:atom_name, "x"}]}}} =
+               HTTP.get(:stub, "https://facilitator.test", "/supported",
+                 query: [{:atom_name, "x"}]
+               )
+    end)
+  end
+
+  test "get/4 enforces https on the base url" do
+    assert {:error, %Error{type: :insecure_scheme}} =
+             HTTP.get(:stub, "http://facilitator.test", "/supported")
+  end
+
   test "secure_pool_opts/0 returns default TLS configuration" do
     assert [
              conn_opts: [
