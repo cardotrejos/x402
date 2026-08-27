@@ -172,6 +172,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `X402.Client.build_payment/3` and `X402.Client.Finch.request/3`
   `:extensions` option — client extension enrichers applied to the
   assembled payload (how gas-sponsoring data is attached opt-in)
+- `integration/e2e_server/` — resource-server component for the official x402 cross-language e2e interop harness (`X402.Plug.PaymentGate` + `X402.Facilitator` behind Bandit), including a ready-to-copy `e2e/servers/elixir/http/bandit/` tree for the foundation repo, the upstream patch list, and a local smoke suite (`verify.sh`)
 
 ## [0.5.0] - 2026-08-26
 
