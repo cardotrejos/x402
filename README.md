@@ -18,6 +18,7 @@ facilitator, chain, or web framework.
 - Complete v2 payment-requirement and extension-echo validation
 - Payer client with EIP-3009 signing and an automatic `402 → sign → retry` Finch flow
 - Facilitator `/verify` and `/settle` client with retries, hooks, and telemetry
+- Local payment verification (EIP-712 + ERC-1271/6492, balance and simulation checks) without trusting a facilitator
 - Plug/Phoenix payment gate that settles only after successful resource handling
 - `"exact"` and metered `"upto"` authorization flows
 - Optional payment-identifier idempotency cache and SIWX support
@@ -235,6 +236,7 @@ Facilitator requests use the v2 wire object:
 
 - [Getting Started](https://hexdocs.pm/x402/getting-started.html)
 - [Plug/Phoenix Integration](https://hexdocs.pm/x402/plug-integration.html)
+- [Local Payment Verification](https://hexdocs.pm/x402/local-verification.html)
 - [Live Smoke Tests](https://hexdocs.pm/x402/live-smoke-tests.html)
 - [API Reference](https://hexdocs.pm/x402/api-reference.html)
 - [Official x402 v2 specification](https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md)

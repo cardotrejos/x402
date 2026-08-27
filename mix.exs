@@ -125,6 +125,7 @@ defmodule X402.MixProject do
         "guides/custom-schemes.md": [title: "Custom Payment Schemes"],
         "guides/mcp.md": [title: "Paid MCP Tools"],
         "guides/paywall.md": [title: "Browser Paywall"],
+        "guides/local-verification.md": [title: "Local Payment Verification"],
         "guides/live-smoke-tests.md": [title: "Live Smoke Tests"]
       ],
       groups_for_extras: [
@@ -171,6 +172,11 @@ defmodule X402.MixProject do
           X402.MCP,
           X402.MCP.Server,
           X402.MCP.Client
+        ],
+        "Local Verification": [
+          X402.Verify.EVM,
+          X402.RPC,
+          X402.ERC6492
         ],
         Utilities: [
           X402.Wallet

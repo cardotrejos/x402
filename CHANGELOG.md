@@ -92,6 +92,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are answered with HTTP 400 by the gate. Shared EVM authorization
   pre-checks are reusable via `X402.Scheme.EVM.authorization_precheck/3`.
   See the new Custom Payment Schemes guide
+- **Full local payment verification for EVM `exact`/`eip3009` payments**
+  (`X402.Verify.EVM`, ecosystem report §8 P1.2 and the verification half of
+  P2.1): runs the reference facilitator verify checklist locally instead of
+  trusting a remote facilitator's verdict, at three explicit levels that
+  never silently downgrade — `:structural` (pure checks: scheme/network/
+  domain requirements, payload shape, `payTo` equality, exact amount, timing
+  with the 6-second settlement buffer), `:signature` (EIP-712 digest
+  recomputation + EOA recovery via the optional crypto deps, else
+  `{:error, :missing_dependency}`), and `:full` (on-chain: chain-id
+  cross-check, payer-bytecode signature routing — ECDSA with no code, strict
+  ERC-1271 `isValidSignature` with code and no ECDSA fallback — asset
+  bytecode presence, `balanceOf` funding, and `transferWithAuthorization`
+  `eth_call` simulation with failure diagnosis mirroring the reference
+  `invalidReason` set, else `{:error, :rpc_not_configured}`). ERC-6492
+  counterfactual signatures copy the reference Go fail-closed design: the
+  deployment factory must be explicitly allowlisted
+  (`eip6492_allowed_factories`, default `[]` rejects all) and validity is
+  proven only by an atomic Multicall3 deploy-and-transfer simulation.
+  `reason_string/1` maps local reason atoms onto the canonical cross-SDK
+  `invalidReason` strings. Documented in the new "Local Payment
+  Verification" guide, including the `before_verify` hook pattern for
+  gating `X402.Plug.PaymentGate` requests on local verification.
+- `X402.RPC` — a minimal Ethereum JSON-RPC client over the user's own Finch
+  pool (`eth_call`, `eth_getCode`, `eth_chainId`, and ordered batch requests
+  in one HTTP round-trip), with NimbleOptions-validated configuration,
+  structured errors, `[:x402, :rpc, :request]` telemetry, and the same
+  https-with-localhost-exemption enforcement as `X402.Facilitator.HTTP`.
+  Compiles and fails cleanly (`{:error, :missing_dependency}`) without the
+  optional Finch dependency.
+- `X402.ERC6492` — pure parsing and building of ERC-6492 counterfactual
+  signature wrappers (magic-suffix detection, bounds-checked ABI decoding of
+  the factory/calldata/inner-signature tuple); classification policy lives
+  in the verifier, which never treats a wrapper as proof by itself.
 - **Local pre-verification checks in `X402.Plug.PaymentGate`** (option
   `local_prechecks:`, default `true`): before the facilitator round-trip, the
   gate now validates the EIP-3009-style `payload.authorization` object against
