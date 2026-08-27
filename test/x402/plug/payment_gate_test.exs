@@ -232,6 +232,19 @@ defmodule X402.Plug.PaymentGateTest do
   # ---------------------------------------------------------------------------
 
   describe "route matching against encoded path aliases" do
+    test "gates routes mounted behind a forwarded prefix (script_name)" do
+      # Plug/Phoenix `forward "/api", ...` pops the matched prefix from
+      # path_info into script_name before inner plugs run. Routes configured
+      # as full paths must still match, or forwarded mounts fail open.
+      conn = %{
+        conn(:get, "/api/resource")
+        | script_name: ["api"],
+          path_info: ["resource"]
+      }
+
+      assert run_request(conn, routes: [@route], facilitator: self()).status == 402
+    end
+
     test "gates a leading-double-slash alias of a protected path" do
       # Cowboy builds path_info by dropping empty segments, so "//api/resource"
       # reaches the router as the protected resource while request_path keeps

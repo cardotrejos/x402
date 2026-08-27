@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **`X402.Plug.PaymentGate` route matching now runs on decoded
-  `conn.path_info` segments instead of the raw `conn.request_path`.**
+  `conn.script_name ++ conn.path_info` segments instead of the raw
+  `conn.request_path`.**
   Adapters drop empty path segments when building `path_info`, so
   `//api/resource` reached the router as the protected resource while the
   gate's raw string comparison passed it through unpaid — the same bug class
