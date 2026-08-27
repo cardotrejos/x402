@@ -189,6 +189,20 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             {:ok, map(), map(), Plug.Conn.t()}
             | {:reject, non_neg_integer(), map(), Plug.Conn.t()}
     defp read_wire_object(conn, options) do
+      # Behind Plug.Parsers (a Phoenix endpoint, `forward`), the raw body has
+      # already been consumed and lives in body_params — a second read_body
+      # would return empty and 400 every request. Use the parsed map when
+      # present; read the raw body only when it is still unfetched.
+      case conn.body_params do
+        %Plug.Conn.Unfetched{} -> read_raw_wire_object(conn, options)
+        %{} = params -> validate_wire_map(params, conn)
+      end
+    end
+
+    @spec read_raw_wire_object(Plug.Conn.t(), options()) ::
+            {:ok, map(), map(), Plug.Conn.t()}
+            | {:reject, non_neg_integer(), map(), Plug.Conn.t()}
+    defp read_raw_wire_object(conn, options) do
       case read_body(conn, length: options.max_body_bytes, read_length: options.max_body_bytes) do
         {:ok, body, conn} ->
           parse_wire_object(body, conn)
@@ -208,24 +222,36 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             | {:reject, non_neg_integer(), map(), Plug.Conn.t()}
     defp parse_wire_object(body, conn) do
       case Jason.decode(body) do
-        {:ok,
-         %{
-           "x402Version" => 2,
-           "paymentPayload" => %{} = payment_payload,
-           "paymentRequirements" => %{} = payment_requirements
-         } = wire}
-        when map_size(wire) == 3 ->
-          {:ok, payment_payload, payment_requirements, conn}
-
-        {:ok, %{"x402Version" => version}} when version != 2 ->
-          {:reject, 400, %{"error" => "invalid_request", "reason" => "invalid_x402_version"},
-           conn}
+        {:ok, %{} = wire} ->
+          validate_wire_map(wire, conn)
 
         {:ok, _other} ->
           {:reject, 400, %{"error" => "invalid_request", "reason" => "invalid_wire_object"}, conn}
 
         {:error, _reason} ->
           {:reject, 400, %{"error" => "invalid_request", "reason" => "invalid_json"}, conn}
+      end
+    end
+
+    @spec validate_wire_map(map(), Plug.Conn.t()) ::
+            {:ok, map(), map(), Plug.Conn.t()}
+            | {:reject, non_neg_integer(), map(), Plug.Conn.t()}
+    defp validate_wire_map(wire, conn) do
+      case wire do
+        %{
+          "x402Version" => 2,
+          "paymentPayload" => %{} = payment_payload,
+          "paymentRequirements" => %{} = payment_requirements
+        }
+        when map_size(wire) == 3 ->
+          {:ok, payment_payload, payment_requirements, conn}
+
+        %{"x402Version" => version} when version != 2 ->
+          {:reject, 400, %{"error" => "invalid_request", "reason" => "invalid_x402_version"},
+           conn}
+
+        _other ->
+          {:reject, 400, %{"error" => "invalid_request", "reason" => "invalid_wire_object"}, conn}
       end
     end
 

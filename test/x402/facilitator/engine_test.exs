@@ -185,6 +185,70 @@ defmodule X402.Facilitator.EngineTest do
 
   # -- settle/3 ---------------------------------------------------------------
 
+  describe "settle/3 with a nonce manager" do
+    test "assigns distinct consecutive nonces with a single node fetch", context do
+      manager = start_supervised!({X402.Facilitator.NonceManager, []})
+
+      engine =
+        engine(context,
+          nonce_manager: manager,
+          stub: %{receipts: [%{"status" => "0x1"}, %{"status" => "0x1"}]}
+        )
+
+      requirements = requirements()
+
+      assert {:ok, %{"success" => true}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      assert {:ok, %{"success" => true}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      # The pending nonce was read from the node exactly once …
+      assert_received {:rpc, "eth_getTransactionCount", _params}
+      refute_received {:rpc, "eth_getTransactionCount", _params2}
+
+      # … and the two broadcast transactions carry consecutive nonces.
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex_1]}
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex_2]}
+
+      [nonce_1, nonce_2] =
+        for raw_hex <- [raw_hex_1, raw_hex_2] do
+          raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+          [_chain_id, nonce | _rest] = X402.TestRLPDecoder.decode_eip1559(raw)
+          :binary.decode_unsigned(nonce)
+        end
+
+      assert nonce_2 == nonce_1 + 1
+    end
+
+    test "resets nonce tracking when the node rejects a broadcast", context do
+      manager = start_supervised!({X402.Facilitator.NonceManager, []})
+
+      engine =
+        engine(context,
+          nonce_manager: manager,
+          stub: %{
+            send_raw: {:error, %{"code" => -32_000, "message" => "nonce too low"}},
+            receipts: [%{"status" => "0x1"}]
+          }
+        )
+
+      requirements = requirements()
+
+      assert {:ok, %{"success" => false, "errorReason" => "unexpected_settle_error"}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      assert_received {:rpc, "eth_getTransactionCount", _params}
+
+      # The rejection may have been nonce-related: the next settlement must
+      # re-read the pending nonce instead of reusing the local counter.
+      assert {:ok, %{"success" => false}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      assert_received {:rpc, "eth_getTransactionCount", _params2}
+    end
+  end
+
   describe "settle/3" do
     test "broadcasts the exact signed EIP-1559 transaction and confirms it", context do
       engine = engine(context, stub: %{receipts: [nil, %{"status" => "0x1"}]})

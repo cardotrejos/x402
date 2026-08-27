@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `X402.Facilitator.NonceManager` — serializes fee-payer transaction nonces
+  for concurrent settlements (fetch-once-then-increment, reset on broadcast
+  rejection); pass to `X402.Facilitator.Engine.new/1` via `nonce_manager:`.
+  Without it, concurrent settles race on the pending nonce and a valid
+  payment can fail with an unused authorization
+
 - **Client-side `upto` payments via Permit2** (ecosystem report §8 P2.2):
   the new `X402.Permit2` module builds and signs the upto-EVM scheme's
   Permit2 `PermitWitnessTransferFrom` — `permitted.amount` is the

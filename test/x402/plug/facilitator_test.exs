@@ -133,6 +133,44 @@ defmodule X402.Plug.FacilitatorTest do
       assert json_response(conn) == %{"isValid" => true, "payer" => @payer}
     end
 
+    test "accepts a body already parsed by Plug.Parsers", context do
+      # Behind a Phoenix endpoint or `forward`, Plug.Parsers has consumed the
+      # raw body — the wire object arrives in body_params and a second
+      # read_body would be empty.
+      options = plug_options(context)
+      requirements = requirements()
+
+      wire = %{
+        "x402Version" => 2,
+        "paymentPayload" => signed_payload(requirements),
+        "paymentRequirements" => requirements
+      }
+
+      conn =
+        :post
+        |> conn("/verify", "")
+        |> Map.put(:body_params, wire)
+        |> put_req_header("content-type", "application/json")
+        |> FacilitatorPlug.call(options)
+
+      assert conn.status == 200
+      assert json_response(conn) == %{"isValid" => true, "payer" => @payer}
+    end
+
+    test "rejects a parsed body that is not the strict wire object", context do
+      options = plug_options(context)
+
+      conn =
+        :post
+        |> conn("/verify", "")
+        |> Map.put(:body_params, %{"x402Version" => 2, "extra" => true})
+        |> put_req_header("content-type", "application/json")
+        |> FacilitatorPlug.call(options)
+
+      assert conn.status == 400
+      assert json_response(conn)["reason"] == "invalid_wire_object"
+    end
+
     test "answers 200 with isValid false for a rejected payment", context do
       options = plug_options(context)
       requirements = requirements()

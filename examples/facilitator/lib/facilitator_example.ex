@@ -33,7 +33,9 @@ defmodule FacilitatorExample do
       X402.Facilitator.Engine.new(
         rpc: rpc,
         signer: signer,
-        networks: [System.get_env("NETWORK", "eip155:84532")]
+        networks: [System.get_env("NETWORK", "eip155:84532")],
+        # Serializes fee-payer nonces so concurrent settles never collide.
+        nonce_manager: FacilitatorExample.NonceManager
       )
 
     engine

@@ -94,6 +94,7 @@ defmodule X402.Facilitator.Engine do
   alias X402.EIP3009
   alias X402.EIP712
   alias X402.ERC6492
+  alias X402.Facilitator.NonceManager
   alias X402.Hooks
   alias X402.Hooks.Context
   alias X402.RPC
@@ -117,7 +118,8 @@ defmodule X402.Facilitator.Engine do
     verify_chain_id: true,
     gas_limit_margin_percent: 20,
     receipt_timeout_ms: 60_000,
-    receipt_interval_ms: 1_000
+    receipt_interval_ms: 1_000,
+    nonce_manager: nil
   ]
 
   @typedoc "A validated engine configuration built by `new/1`."
@@ -131,7 +133,8 @@ defmodule X402.Facilitator.Engine do
           verify_chain_id: boolean(),
           gas_limit_margin_percent: non_neg_integer(),
           receipt_timeout_ms: pos_integer(),
-          receipt_interval_ms: pos_integer()
+          receipt_interval_ms: pos_integer(),
+          nonce_manager: GenServer.server() | nil
         }
 
   @typedoc "A facilitator wire response (`/verify` or `/settle` shape)."
@@ -201,6 +204,16 @@ defmodule X402.Facilitator.Engine do
       type: :pos_integer,
       default: 1_000,
       doc: "Interval between `eth_getTransactionReceipt` polls."
+    ],
+    nonce_manager: [
+      type: {:or, [nil, :atom, :pid, :any]},
+      default: nil,
+      doc: """
+      Optional `X402.Facilitator.NonceManager` (pid/name) serializing
+      fee-payer nonces. Without it, each settlement reads the pending nonce
+      from the node, which races under concurrent settles — configure the
+      manager for any deployment that settles concurrently.
+      """
     ]
   ]
 
@@ -476,7 +489,7 @@ defmodule X402.Facilitator.Engine do
          {:ok, chain_id} <- chain_id(requirements),
          {:ok, params} <- transaction_params(engine, from, asset(requirements), calldata),
          {:ok, raw} <- sign_transaction(engine, chain_id, params, asset(requirements), calldata) do
-      broadcast_and_await(engine, raw, network, payer)
+      broadcast_and_await(engine, raw, network, payer, from)
     else
       {:settle_failed, reason_string} ->
         {:settled, failure_response(reason_string, "", network, payer)}
@@ -523,7 +536,7 @@ defmodule X402.Facilitator.Engine do
   # One batched round-trip: gas estimate, EIP-1559 fee data, pending nonce.
   @spec transaction_params(t(), String.t(), String.t(), binary()) ::
           {:ok, map()} | {:settle_failed, String.t()} | {:error, term()}
-  defp transaction_params(engine, from, asset, calldata) do
+  defp transaction_params(%{nonce_manager: nil} = engine, from, asset, calldata) do
     requests = [
       {"eth_estimateGas", [%{"from" => from, "to" => asset, "data" => hex(calldata)}]},
       {"eth_maxPriorityFeePerGas", []},
@@ -539,6 +552,50 @@ defmodule X402.Facilitator.Engine do
         {:error, {:rpc_error, reason}}
     end
   end
+
+  # With a nonce manager, the nonce is assigned by the manager (fetched from
+  # the node only on first use or after a reset), so concurrent settlements
+  # get distinct consecutive nonces instead of racing on `pending`.
+  defp transaction_params(engine, from, asset, calldata) do
+    requests = [
+      {"eth_estimateGas", [%{"from" => from, "to" => asset, "data" => hex(calldata)}]},
+      {"eth_maxPriorityFeePerGas", []},
+      {"eth_feeHistory", ["0x1", "latest", []]}
+    ]
+
+    with {:ok, [estimate, priority, fee_history]} <- rpc_batch(engine, requests),
+         {:ok, nonce} <- checkout_nonce(engine, from) do
+      assemble_params(engine, estimate, priority, fee_history, {:ok, integer_hex(nonce)})
+    end
+  end
+
+  @spec rpc_batch(t(), [{String.t(), list()}]) ::
+          {:ok, [RPC.batch_result()]} | {:error, term()}
+  defp rpc_batch(engine, requests) do
+    case RPC.batch(engine.rpc, requests) do
+      {:ok, results} -> {:ok, results}
+      {:error, reason} -> {:error, {:rpc_error, reason}}
+    end
+  end
+
+  @spec checkout_nonce(t(), String.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  defp checkout_nonce(engine, from) do
+    fetch = fn ->
+      case RPC.request(engine.rpc, "eth_getTransactionCount", [from, "pending"]) do
+        {:ok, "0x" <> hex_nonce} -> {:ok, String.to_integer(hex_nonce, 16)}
+        {:ok, other} -> {:error, {:invalid_nonce, other}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    case NonceManager.checkout(engine.nonce_manager, from, fetch) do
+      {:ok, nonce} -> {:ok, nonce}
+      {:error, reason} -> {:error, {:rpc_error, reason}}
+    end
+  end
+
+  @spec integer_hex(non_neg_integer()) :: String.t()
+  defp integer_hex(value), do: "0x" <> Integer.to_string(value, 16)
 
   @spec assemble_params(
           t(),
@@ -630,8 +687,9 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec broadcast_and_await(t(), binary(), String.t(), String.t() | nil) :: settle_result()
-  defp broadcast_and_await(engine, raw, network, payer) do
+  @spec broadcast_and_await(t(), binary(), String.t(), String.t() | nil, String.t()) ::
+          settle_result()
+  defp broadcast_and_await(engine, raw, network, payer, from) do
     case RPC.request(engine.rpc, "eth_sendRawTransaction", [hex(raw)]) do
       {:ok, transaction_hash} when is_binary(transaction_hash) ->
         await_receipt(engine, transaction_hash, network, payer)
@@ -640,6 +698,9 @@ defmodule X402.Facilitator.Engine do
         {:error, {:rpc_error, {:invalid_response, other}}}
 
       {:error, {:jsonrpc_error, _error}} ->
+        # The rejection may be nonce-related (reused/too low) — forget the
+        # tracked nonce so the next settlement re-reads it from the node.
+        reset_nonce(engine, from)
         {:settled, failure_response("unexpected_settle_error", "", network, payer)}
 
       {:error, reason} ->
@@ -650,6 +711,10 @@ defmodule X402.Facilitator.Engine do
         pending_after_transport_failure(raw, network, payer, reason)
     end
   end
+
+  @spec reset_nonce(t(), String.t()) :: :ok
+  defp reset_nonce(%{nonce_manager: nil}, _from), do: :ok
+  defp reset_nonce(engine, from), do: NonceManager.reset(engine.nonce_manager, from)
 
   @spec pending_after_transport_failure(binary(), String.t(), String.t() | nil, term()) ::
           settle_result()

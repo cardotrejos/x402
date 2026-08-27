@@ -14,6 +14,7 @@ defmodule FacilitatorExample.Application do
       {Finch,
        name: FacilitatorExample.finch_name(),
        pools: %{default: X402.Facilitator.HTTP.secure_pool_opts()}},
+      {X402.Facilitator.NonceManager, name: FacilitatorExample.NonceManager},
       {Bandit, plug: {X402.Plug.Facilitator, engine: engine}, port: port}
     ]
 
