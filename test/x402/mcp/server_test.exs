@@ -345,14 +345,27 @@ defmodule X402.MCP.ServerTest do
       assert result["structuredContent"]["error"] == "No matching payment requirements"
     end
 
-    test "rejects payments that cannot be encoded for the replay claim" do
-      config = config(start_facilitator())
-      unencodable = payment(%{"payload" => %{"bad" => {:not, :json}}})
+    test "keys the replay claim on the signed payload, not the envelope" do
+      # A mutated envelope (extra fields, reordered keys) around the SAME
+      # signed scheme payload must hash to the same claim key — otherwise a
+      # replay with a tweaked envelope claims a fresh slot and runs the paid
+      # handler again.
+      cache =
+        start_supervised!(
+          {ETSCache, name: :"mcp_canonical_#{System.unique_integer([:positive])}"}
+        )
 
-      result = Server.call(request(unencodable), config, refute_handler())
+      config = config(start_facilitator(), payment_identifier_cache: cache)
+      original = payment()
 
-      assert result["structuredContent"]["error"] == "invalid_payload"
-      refute_received {:verify_called, _payload, _requirements, _hooks}
+      first = Server.call(request(original), config, ok_handler())
+      refute first["isError"]
+
+      mutated = Map.put(original, "note", "attacker-added envelope field")
+      replay = Server.call(request(mutated), config, ok_handler())
+
+      assert replay["isError"] == true
+      assert replay["structuredContent"]["error"] == "payment already processed"
     end
 
     test "rejects extension echoes that drop advertised values" do

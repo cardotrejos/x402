@@ -51,6 +51,7 @@ defmodule X402.MCP.Server do
   so the client may retry with the same payment.
   """
 
+  alias X402.Extensions.PaymentIdentifier.Cache
   alias X402.Extensions.PaymentIdentifier.ETSCache
   alias X402.Facilitator
   alias X402.Facilitator.Error
@@ -129,13 +130,15 @@ defmodule X402.MCP.Server do
       doc: "Lifecycle hook module implementing `X402.Hooks`."
     ],
     payment_identifier_cache: [
-      type: {:or, [:atom, :pid, :any]},
+      type: {:custom, __MODULE__, :validate_payment_identifier_cache, []},
       default: nil,
       doc: """
-      Optional `ETSCache` server pid/name used for idempotency. When set, the
-      wrapper performs an atomic claim (via `put_new`) on the payment proof
-      hash before settling, preventing concurrent requests from double-settling
-      the same payment.
+      Optional idempotency cache: an `ETSCache` server pid/name (the default
+      adapter), or a `{module, cache}` adapter tuple implementing
+      `X402.Extensions.PaymentIdentifier.Cache`. When set, the wrapper
+      performs an atomic claim (via `put_new`) on a hash of the signed scheme
+      payload before settling, preventing concurrent requests from
+      double-settling the same payment.
       """
     ],
     resource_url: [
@@ -194,10 +197,12 @@ defmodule X402.MCP.Server do
   # re-advertising the payment requirements.
   defguardp is_infrastructure_reason(reason)
             when is_struct(reason, Error) or
+                   reason == :cache_full or
                    (is_tuple(reason) and
                       elem(reason, 0) in [
                         :unexpected_facilitator_status,
-                        :malformed_facilitator_response
+                        :malformed_facilitator_response,
+                        :claim_failed
                       ])
 
   @doc false
@@ -330,7 +335,7 @@ defmodule X402.MCP.Server do
          {:ok, payment_id} <- payment_id(payment_payload),
          {:ok, verify_response} <- facilitator_verify(config, payment_payload, requirements),
          :ok <- ensure_verify_success(verify_response),
-         :ok <- claim_payment(config.payment_identifier_cache, payment_id) do
+         :ok <- claim_or_fail(config.payment_identifier_cache, payment_id) do
       execute_and_settle(request, config, handler, payment_payload, requirements, payment_id)
     else
       {:error, reason} ->
@@ -380,13 +385,21 @@ defmodule X402.MCP.Server do
     end
   end
 
+  # The claim key must be derived from the SIGNED material only, encoded
+  # deterministically: hashing a plain Jason encoding of the whole envelope
+  # lets extra envelope fields or a different key order mint a fresh id for
+  # the same signed authorization, so a mutated replay would claim a new slot
+  # and run the paid handler again. The scheme payload (signature +
+  # authorization) cannot be altered without failing facilitator
+  # verification, which precedes the claim.
   @spec payment_id(map()) :: {:ok, String.t()} | {:error, :invalid_payload}
   defp payment_id(payment_payload) do
-    case Jason.encode(payment_payload) do
-      {:ok, json} ->
-        {:ok, :crypto.hash(:sha256, json) |> Base.encode16(case: :lower)}
+    case Utils.map_value(payment_payload, {"payload", :payload}) do
+      scheme_payload when is_map(scheme_payload) ->
+        canonical = :erlang.term_to_binary(scheme_payload, [:deterministic])
+        {:ok, :crypto.hash(:sha256, canonical) |> Base.encode16(case: :lower)}
 
-      {:error, _reason} ->
+      _other ->
         {:error, :invalid_payload}
     end
   end
@@ -587,13 +600,56 @@ defmodule X402.MCP.Server do
 
   # -- Replay claims ----------------------------------------------------------
 
-  @spec claim_payment(ETSCache.server() | nil, String.t()) :: :ok | {:error, :already_exists}
+  @spec claim_payment(Cache.adapter() | nil, String.t()) :: Cache.put_new_result()
   defp claim_payment(nil, _payment_id), do: :ok
-  defp claim_payment(cache, payment_id), do: ETSCache.put_new(cache, payment_id, :verified)
+  defp claim_payment(adapter, payment_id), do: Cache.put_new(adapter, payment_id, :verified)
 
-  @spec release_claim(ETSCache.server() | nil, String.t()) :: :ok | {:error, term()}
+  # Duplicates are payment rejections; any other claim failure is cache
+  # infrastructure trouble and must fail closed as an internal error rather
+  # than re-advertise PaymentRequired after a successful verify (mirrors the
+  # Plug gate's 500 mapping).
+  @spec claim_or_fail(Cache.adapter() | nil, String.t()) ::
+          :ok | {:error, :already_exists | {:claim_failed, term()}}
+  defp claim_or_fail(cache, payment_id) do
+    case claim_payment(cache, payment_id) do
+      :ok -> :ok
+      {:error, :already_exists} = duplicate -> duplicate
+      {:error, reason} -> {:error, {:claim_failed, reason}}
+    end
+  end
+
+  @spec release_claim(Cache.adapter() | nil, String.t()) :: Cache.write_result()
   defp release_claim(nil, _payment_id), do: :ok
-  defp release_claim(cache, payment_id), do: ETSCache.delete(cache, payment_id)
+  defp release_claim(adapter, payment_id), do: Cache.delete(adapter, payment_id)
+
+  @doc false
+  @spec validate_payment_identifier_cache(term()) ::
+          {:ok, Cache.adapter() | nil} | {:error, String.t()}
+  def validate_payment_identifier_cache(nil), do: {:ok, nil}
+
+  # {:global, name} and {:via, registry, term} are unambiguous GenServer
+  # names, never adapter tuples — route them to the default ETSCache adapter.
+  def validate_payment_identifier_cache({:global, _name} = server),
+    do: {:ok, {ETSCache, server}}
+
+  def validate_payment_identifier_cache({:via, registry, _term} = server)
+      when is_atom(registry),
+      do: {:ok, {ETSCache, server}}
+
+  def validate_payment_identifier_cache({module, _cache} = adapter) when is_atom(module) do
+    case Cache.validate_adapter(adapter) do
+      :ok ->
+        {:ok, adapter}
+
+      {:error, message} ->
+        {:error,
+         message <>
+           "; to address a remote ETSCache as {name, node}, wrap it explicitly: " <>
+           "{X402.Extensions.PaymentIdentifier.ETSCache, {name, node}}"}
+    end
+  end
+
+  def validate_payment_identifier_cache(server), do: {:ok, {ETSCache, server}}
 
   defp warn_no_idempotency_cache_once do
     key = {__MODULE__, :no_idempotency_cache_warned}

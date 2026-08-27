@@ -254,7 +254,21 @@ defmodule X402.MCP.Client do
     case attempt(call_fun, request) do
       {:ok, tool_result} -> {:ok, tool_result}
       {:error, :invalid_tool_result} = error -> error
-      {:error, reason} -> {:error, {:transport_error, reason}}
+      {:error, reason} -> classify_retry_error(reason)
+    end
+  end
+
+  # A rejected paid retry may come back as a JSON-RPC payment error instead of
+  # a payment-required tool result. Normalize it to the tool-result form so
+  # both shapes are returned as-is (the payment is never re-signed) rather
+  # than surfacing as a transport error.
+  @spec classify_retry_error(term()) :: {:ok, map()} | {:error, call_error()}
+  defp classify_retry_error(reason) do
+    with {:ok, payment_required} <- MCP.fetch_payment_required_from_error(reason),
+         {:ok, tool_result} <- MCP.payment_required_result(payment_required) do
+      {:ok, tool_result}
+    else
+      _other -> {:error, {:transport_error, reason}}
     end
   end
 
