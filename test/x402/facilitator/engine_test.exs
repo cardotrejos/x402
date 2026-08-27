@@ -238,7 +238,7 @@ defmodule X402.Facilitator.EngineTest do
       authorization = payload["payload"]["authorization"]
       "0x" <> signature_hex = payload["payload"]["signature"]
       signature_bytes = Base.decode16!(signature_hex, case: :mixed)
-      assert {:ok, data} == EIP3009.transfer_calldata(authorization, signature_bytes)
+      assert {:ok, data} == EIP3009.transfer_calldata(authorization, signature_bytes, :eoa)
 
       # Recovery proof: the broadcast transaction was signed by the
       # facilitator key.

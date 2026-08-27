@@ -391,9 +391,8 @@ defmodule X402.EIP3009 do
       iex> {:ok, calldata} = X402.EIP3009.transfer_calldata(authorization, <<1::520>>, :eoa)
       iex> {binary_part(calldata, 0, 4), byte_size(calldata)}
       {<<0xE3, 0xEE, 0x16, 0x0E>>, 4 + 9 * 32}
-
-      iex> {:ok, calldata} = X402.EIP3009.transfer_calldata(authorization, <<1::520>>, :erc1271)
-      iex> binary_part(calldata, 0, 4)
+      iex> {:ok, contract} = X402.EIP3009.transfer_calldata(authorization, <<1::520>>, :erc1271)
+      iex> binary_part(contract, 0, 4)
       <<0xCF, 0x09, 0x29, 0x95>>
 
       iex> X402.EIP3009.transfer_calldata(%{}, <<1::520>>, :eoa)
