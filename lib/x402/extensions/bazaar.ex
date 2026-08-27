@@ -1,6 +1,8 @@
 defmodule X402.Extensions.Bazaar do
   @moduledoc """
-  Builds the `bazaar` discovery extension for x402 v2.
+  Bazaar discovery extension for x402 v2: extension builder and discovery client.
+
+  ## Discovery extension builder
 
   Resource servers advertise their endpoint specification by placing the
   extension under `extensions.bazaar` in a `PAYMENT-REQUIRED` response. The
@@ -24,9 +26,33 @@ defmodule X402.Extensions.Bazaar do
 
       extensions = %{"bazaar" => X402.Extensions.Bazaar.build_extension(method: :get)}
 
+  ## Discovery client
+
+  `list_resources/2` queries a facilitator's `GET /discovery/resources`
+  through `X402.Facilitator.list_resources/2` and parses each discovered
+  entry into a well-typed map (see `t:resource/0`). Parsing is fail-closed:
+  a structurally invalid entry returns
+  `{:error, %X402.Facilitator.Error{type: :malformed_facilitator_response}}`
+  identifying the offending entry, rather than partial data. Use
+  `X402.Facilitator.list_resources/2` directly and `parse_resource/1`
+  per-entry to build a lenient listing instead.
+
+  The pure filter helpers `filter_by_network/2`, `filter_by_scheme/2`, and
+  `filter_by_max_price/2` narrow a parsed listing client-side:
+
+      {:ok, %{items: items}} = X402.Extensions.Bazaar.list_resources(MyFacilitator)
+
+      items
+      |> X402.Extensions.Bazaar.filter_by_network("eip155:8453")
+      |> X402.Extensions.Bazaar.filter_by_max_price("100000")
+
   See the
   [bazaar extension spec](https://github.com/x402-foundation/x402/blob/main/specs/extensions/bazaar.md).
   """
+
+  alias X402.Facilitator
+  alias X402.Facilitator.Error
+  alias X402.Utils
 
   @query_methods ["GET", "HEAD", "DELETE"]
   @body_methods ["POST", "PUT", "PATCH"]
@@ -66,6 +92,32 @@ defmodule X402.Extensions.Bazaar do
 
   @typedoc "A built `extensions.bazaar` discovery extension payload."
   @type t :: %{binary() => map()}
+
+  @typedoc """
+  A discovered x402 resource parsed from `GET /discovery/resources`.
+
+  `:accepts` entries are the raw, string-keyed `PaymentRequirements` maps
+  from the wire. `:last_updated` is either a Unix timestamp (per the v2
+  specification) or an ISO 8601 string (as emitted by some facilitators).
+  """
+  @type resource :: %{
+          resource: String.t(),
+          type: String.t(),
+          x402_version: integer(),
+          accepts: [map()],
+          last_updated: integer() | String.t(),
+          description: String.t() | nil,
+          mime_type: String.t() | nil,
+          metadata: map() | nil,
+          extensions: map() | nil
+        }
+
+  @typedoc "Parsed response of `list_resources/2`."
+  @type discovery_response :: %{
+          x402_version: integer() | nil,
+          items: [resource()],
+          pagination: Facilitator.discovery_pagination() | nil
+        }
 
   @doc since: "0.5.0"
   @doc """
@@ -169,6 +221,314 @@ defmodule X402.Extensions.Bazaar do
 
   def validate_map(value),
     do: {:error, "expected a map with string or atom keys, got: #{inspect(value)}"}
+
+  # --- discovery client ---
+
+  @doc """
+  Lists discoverable x402 resources from a facilitator's bazaar as typed maps.
+
+  Queries `GET /discovery/resources` through
+  `X402.Facilitator.list_resources/2` (accepting the same filter and
+  pagination parameters) and parses every discovered entry with
+  `parse_resource/1`. Parsing is fail-closed: a structurally invalid entry
+  returns `{:error, %X402.Facilitator.Error{type:
+  :malformed_facilitator_response, reason: {:invalid_resource, index,
+  reason}}}` instead of partial data.
+
+  When called with just a keyword list — `list_resources(limit: 20)` — the
+  parameters apply to the default `X402.Facilitator` process name.
+
+  ## Examples
+
+      {:ok, %{items: items, pagination: pagination}} =
+        X402.Extensions.Bazaar.list_resources(MyFacilitator,
+          network: "eip155:8453",
+          limit: 20
+        )
+
+      Enum.map(items, & &1.resource)
+  """
+  @doc group: :discovery
+  @doc since: "0.6.0"
+  @spec list_resources(Facilitator.server() | keyword(), keyword()) ::
+          {:ok, discovery_response()}
+          | {:error, Error.t() | NimbleOptions.ValidationError.t() | term()}
+  def list_resources(server_or_params \\ Facilitator, params \\ [])
+
+  def list_resources(params, []) when is_list(params) do
+    list_resources(Facilitator, params)
+  end
+
+  def list_resources(server, params) when is_list(params) do
+    with {:ok, response} <- Facilitator.list_resources(server, params),
+         {:ok, items} <- parse_resources(response.items) do
+      {:ok, %{response | items: items}}
+    end
+  end
+
+  @doc """
+  Parses one raw discovered-resource map into a typed map.
+
+  Validates the required fields from the v2 specification (§8.3): `resource`,
+  `type`, `x402Version`, `accepts` (a list of `PaymentRequirements` maps),
+  and `lastUpdated` (Unix timestamp or ISO 8601 string). Optional
+  `description`, `mimeType`, `metadata`, and `extensions` fields default to
+  `nil` when absent and are rejected when mistyped.
+
+  ## Examples
+
+      iex> {:ok, parsed} = X402.Extensions.Bazaar.parse_resource(%{
+      ...>   "resource" => "https://api.example.com/premium-data",
+      ...>   "type" => "http",
+      ...>   "x402Version" => 2,
+      ...>   "accepts" => [%{"scheme" => "exact", "network" => "eip155:8453", "amount" => "10000"}],
+      ...>   "lastUpdated" => 1_703_123_456
+      ...> })
+      iex> {parsed.resource, parsed.x402_version, parsed.last_updated}
+      {"https://api.example.com/premium-data", 2, 1703123456}
+
+      iex> X402.Extensions.Bazaar.parse_resource(%{"type" => "http"})
+      {:error, {:missing_field, "resource"}}
+
+      iex> X402.Extensions.Bazaar.parse_resource(%{
+      ...>   "resource" => "https://api.example.com",
+      ...>   "type" => "http",
+      ...>   "x402Version" => 2,
+      ...>   "accepts" => "exact",
+      ...>   "lastUpdated" => 1
+      ...> })
+      {:error, {:invalid_field, "accepts"}}
+  """
+  @doc group: :discovery
+  @doc since: "0.6.0"
+  @spec parse_resource(term()) :: {:ok, resource()} | {:error, term()}
+  def parse_resource(item) when is_map(item) do
+    with {:ok, resource} <- fetch_string(item, "resource"),
+         {:ok, type} <- fetch_string(item, "type"),
+         {:ok, x402_version} <- fetch_integer(item, "x402Version"),
+         {:ok, accepts} <- fetch_accepts(item),
+         {:ok, last_updated} <- fetch_last_updated(item),
+         {:ok, description} <- fetch_optional_string(item, "description"),
+         {:ok, mime_type} <- fetch_optional_string(item, "mimeType"),
+         {:ok, metadata} <- fetch_optional_map(item, "metadata"),
+         {:ok, extensions} <- fetch_optional_map(item, "extensions") do
+      {:ok,
+       %{
+         resource: resource,
+         type: type,
+         x402_version: x402_version,
+         accepts: accepts,
+         last_updated: last_updated,
+         description: description,
+         mime_type: mime_type,
+         metadata: metadata,
+         extensions: extensions
+       }}
+    end
+  end
+
+  def parse_resource(item), do: {:error, {:invalid_resource_entry, item}}
+
+  @doc """
+  Keeps the resources that accept payment on the given CAIP-2 network.
+
+  ## Examples
+
+      iex> resources = [
+      ...>   %{resource: "https://a.example", accepts: [%{"scheme" => "exact", "network" => "eip155:8453"}]},
+      ...>   %{resource: "https://b.example", accepts: [%{"scheme" => "exact", "network" => "solana:mainnet"}]}
+      ...> ]
+      iex> resources
+      ...> |> X402.Extensions.Bazaar.filter_by_network("eip155:8453")
+      ...> |> Enum.map(& &1.resource)
+      ["https://a.example"]
+  """
+  @doc group: :discovery
+  @doc since: "0.6.0"
+  @spec filter_by_network([resource()], String.t()) :: [resource()]
+  def filter_by_network(resources, network) when is_list(resources) and is_binary(network) do
+    filter_by_requirement(resources, {"network", :network}, network)
+  end
+
+  @doc """
+  Keeps the resources that accept payment with the given scheme.
+
+  ## Examples
+
+      iex> resources = [
+      ...>   %{resource: "https://a.example", accepts: [%{"scheme" => "exact", "network" => "eip155:8453"}]},
+      ...>   %{resource: "https://b.example", accepts: [%{"scheme" => "upto", "network" => "eip155:8453"}]}
+      ...> ]
+      iex> resources
+      ...> |> X402.Extensions.Bazaar.filter_by_scheme("upto")
+      ...> |> Enum.map(& &1.resource)
+      ["https://b.example"]
+  """
+  @doc group: :discovery
+  @doc since: "0.6.0"
+  @spec filter_by_scheme([resource()], String.t()) :: [resource()]
+  def filter_by_scheme(resources, scheme) when is_list(resources) and is_binary(scheme) do
+    filter_by_requirement(resources, {"scheme", :scheme}, scheme)
+  end
+
+  @doc """
+  Keeps the resources with at least one payment option at or below a price.
+
+  The price is compared in atomic token units against each accepted
+  `PaymentRequirements` entry's `amount` (falling back to the legacy
+  `maxAmountRequired`). Entries without a parsable amount never match.
+  Raises `ArgumentError` when `max_price` itself is not a non-negative
+  integer or decimal string, since that is a programmer error.
+
+  ## Examples
+
+      iex> resources = [
+      ...>   %{resource: "https://a.example", accepts: [%{"scheme" => "exact", "amount" => "10000"}]},
+      ...>   %{resource: "https://b.example", accepts: [%{"scheme" => "exact", "amount" => "250000"}]}
+      ...> ]
+      iex> resources
+      ...> |> X402.Extensions.Bazaar.filter_by_max_price("100000")
+      ...> |> Enum.map(& &1.resource)
+      ["https://a.example"]
+  """
+  @doc group: :discovery
+  @doc since: "0.6.0"
+  @spec filter_by_max_price([resource()], String.t() | non_neg_integer()) :: [resource()]
+  def filter_by_max_price(resources, max_price) when is_list(resources) do
+    case Utils.parse_decimal(max_price) do
+      {:ok, max} ->
+        Enum.filter(resources, &affordable?(&1, max))
+
+      :error ->
+        raise ArgumentError,
+              "expected max_price to be a non-negative integer or decimal string, " <>
+                "got: #{inspect(max_price)}"
+    end
+  end
+
+  @spec parse_resources([map()]) :: {:ok, [resource()]} | {:error, Error.t()}
+  defp parse_resources(items) do
+    items
+    |> Enum.with_index()
+    |> Enum.reduce_while([], fn {item, index}, acc ->
+      case parse_resource(item) do
+        {:ok, parsed} -> {:cont, [parsed | acc]}
+        {:error, reason} -> {:halt, {:error, invalid_resource_error(index, reason)}}
+      end
+    end)
+    |> case do
+      {:error, error} -> {:error, error}
+      parsed -> {:ok, Enum.reverse(parsed)}
+    end
+  end
+
+  @spec invalid_resource_error(non_neg_integer(), term()) :: Error.t()
+  defp invalid_resource_error(index, reason) do
+    %Error{
+      type: :malformed_facilitator_response,
+      reason: {:invalid_resource, index, reason},
+      retryable: false,
+      attempt: nil
+    }
+  end
+
+  @spec filter_by_requirement([resource()], {String.t(), atom()}, String.t()) :: [resource()]
+  defp filter_by_requirement(resources, key, value) do
+    Enum.filter(resources, fn %{accepts: accepts} ->
+      Enum.any?(accepts, &(is_map(&1) and Utils.map_value(&1, key) == value))
+    end)
+  end
+
+  @spec affordable?(resource(), {non_neg_integer(), non_neg_integer()}) :: boolean()
+  defp affordable?(%{accepts: accepts}, max) do
+    Enum.any?(accepts, fn requirements ->
+      case requirements_amount(requirements) do
+        {:ok, amount} -> Utils.compare_decimal(amount, max) != :gt
+        :error -> false
+      end
+    end)
+  end
+
+  @spec requirements_amount(term()) :: {:ok, {non_neg_integer(), non_neg_integer()}} | :error
+  defp requirements_amount(requirements) when is_map(requirements) do
+    value =
+      Utils.first_present([
+        Utils.map_value(requirements, {"amount", :amount}),
+        Utils.map_value(requirements, {"maxAmountRequired", :maxAmountRequired})
+      ])
+
+    case value do
+      nil -> :error
+      amount -> Utils.parse_decimal(amount)
+    end
+  end
+
+  defp requirements_amount(_requirements), do: :error
+
+  @spec fetch_string(map(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  defp fetch_string(item, field) do
+    case Map.fetch(item, field) do
+      {:ok, value} when is_binary(value) -> {:ok, value}
+      {:ok, _invalid} -> {:error, {:invalid_field, field}}
+      :error -> {:error, {:missing_field, field}}
+    end
+  end
+
+  @spec fetch_integer(map(), String.t()) :: {:ok, integer()} | {:error, term()}
+  defp fetch_integer(item, field) do
+    case Map.fetch(item, field) do
+      {:ok, value} when is_integer(value) -> {:ok, value}
+      {:ok, _invalid} -> {:error, {:invalid_field, field}}
+      :error -> {:error, {:missing_field, field}}
+    end
+  end
+
+  @spec fetch_accepts(map()) :: {:ok, [map()]} | {:error, term()}
+  defp fetch_accepts(item) do
+    case Map.fetch(item, "accepts") do
+      {:ok, accepts} when is_list(accepts) ->
+        if Enum.all?(accepts, &is_map/1) do
+          {:ok, accepts}
+        else
+          {:error, {:invalid_field, "accepts"}}
+        end
+
+      {:ok, _invalid} ->
+        {:error, {:invalid_field, "accepts"}}
+
+      :error ->
+        {:error, {:missing_field, "accepts"}}
+    end
+  end
+
+  @spec fetch_last_updated(map()) :: {:ok, integer() | String.t()} | {:error, term()}
+  defp fetch_last_updated(item) do
+    case Map.fetch(item, "lastUpdated") do
+      {:ok, value} when is_integer(value) or is_binary(value) -> {:ok, value}
+      {:ok, _invalid} -> {:error, {:invalid_field, "lastUpdated"}}
+      :error -> {:error, {:missing_field, "lastUpdated"}}
+    end
+  end
+
+  @spec fetch_optional_string(map(), String.t()) :: {:ok, String.t() | nil} | {:error, term()}
+  defp fetch_optional_string(item, field) do
+    case Map.fetch(item, field) do
+      {:ok, value} when is_binary(value) -> {:ok, value}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, _invalid} -> {:error, {:invalid_field, field}}
+      :error -> {:ok, nil}
+    end
+  end
+
+  @spec fetch_optional_map(map(), String.t()) :: {:ok, map() | nil} | {:error, term()}
+  defp fetch_optional_map(item, field) do
+    case Map.fetch(item, field) do
+      {:ok, value} when is_map(value) -> {:ok, value}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, _invalid} -> {:error, {:invalid_field, field}}
+      :error -> {:ok, nil}
+    end
+  end
 
   # --- HTTP ---
 
