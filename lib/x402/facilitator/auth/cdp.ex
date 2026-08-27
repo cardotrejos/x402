@@ -105,7 +105,9 @@ defmodule X402.Facilitator.Auth.CDP do
   Builds the `Authorization` (and `Correlation-Context`) headers for a request.
 
   The JWT binds the request method, host, and path in its `uris` claim and is
-  signed fresh for every call.
+  signed fresh each time headers are built; transport retries within one
+  facilitator operation reuse the same token inside its 120-second validity
+  window.
   """
   @doc since: "0.5.0"
   @spec headers(t(), Auth.request_info()) :: {:ok, [{String.t(), String.t()}]}
