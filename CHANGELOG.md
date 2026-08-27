@@ -125,6 +125,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature wrappers (magic-suffix detection, bounds-checked ABI decoding of
   the factory/calldata/inner-signature tuple); classification policy lives
   in the verifier, which never treats a wrapper as proof by itself.
+- `X402.Extensions.OfferReceipt` — the
+  [offer-and-receipt extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/extension-offer-and-receipt.md):
+  servers sign the payment terms they advertise (offers under
+  `extensions["offer-receipt"].info.offers[]`) and confirm delivery after
+  settlement (a receipt under `info.receipt`); clients verify both. Supports
+  the spec's two artifact formats — EIP-712 (fixed chain-agnostic domain
+  `{name, version: "1", chainId: 1}`, canonical `Offer`/`Receipt` types,
+  signing through `X402.Signer`, verification by signer recovery) and compact
+  JWS (`ES256K`/`EdDSA` via OTP `:crypto` in
+  `X402.Extensions.OfferReceipt.JWS`, with RFC 8785 JCS payload
+  canonicalization and mandatory `alg`/`kid` headers). Includes the
+  `info`/`schema` declaration builders mirroring the spec's §6 schemas,
+  fail-closed `fetch_offers/1` / `fetch_receipt/1` extraction, structural
+  `validate_offer/1` / `validate_receipt/1`, the v1-name → CAIP-2 network
+  conversion (`to_caip2/1`), and payload builders. Boundaries: JWS
+  verification takes an explicit public key (`kid` DID URLs are never
+  resolved — no network access), and signer *authorization* (§4.5.1) remains
+  caller policy, supported via `:expected_signer`
 - **Local pre-verification checks in `X402.Plug.PaymentGate`** (option
   `local_prechecks:`, default `true`): before the facilitator round-trip, the
   gate now validates the EIP-3009-style `payload.authorization` object against
