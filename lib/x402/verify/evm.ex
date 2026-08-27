@@ -99,6 +99,7 @@ defmodule X402.Verify.EVM do
   """
 
   alias X402.EIP3009
+  alias X402.EIP712
   alias X402.ERC6492
   alias X402.RPC
   alias X402.Telemetry
@@ -990,13 +991,13 @@ defmodule X402.Verify.EVM do
 
   @spec authorization_state_args(map()) :: binary()
   defp authorization_state_args(ctx) do
-    {:ok, nonce_word} = EIP3009.encode_bytes32(ctx.nonce)
+    {:ok, nonce_word} = EIP712.encode_bytes32(ctx.nonce)
     address_word(ctx.payer) <> nonce_word
   end
 
   @spec address_word(String.t()) :: binary()
   defp address_word(address) do
-    {:ok, word} = EIP3009.encode_address(address)
+    {:ok, word} = EIP712.encode_address(address)
     word
   end
 
@@ -1025,17 +1026,17 @@ defmodule X402.Verify.EVM do
   @spec authorization_words(map()) :: binary()
   defp authorization_words(ctx) do
     authorization = ctx.authorization
-    {:ok, from} = EIP3009.encode_address(Utils.map_value(authorization, {"from", :from}))
-    {:ok, to} = EIP3009.encode_address(Utils.map_value(authorization, {"to", :to}))
-    {:ok, value} = EIP3009.encode_uint256(ctx.value)
+    {:ok, from} = EIP712.encode_address(Utils.map_value(authorization, {"from", :from}))
+    {:ok, to} = EIP712.encode_address(Utils.map_value(authorization, {"to", :to}))
+    {:ok, value} = EIP712.encode_uint256(ctx.value)
 
     {:ok, valid_after} =
-      EIP3009.encode_uint256(Utils.map_value(authorization, {"validAfter", :valid_after}))
+      EIP712.encode_uint256(Utils.map_value(authorization, {"validAfter", :valid_after}))
 
     {:ok, valid_before} =
-      EIP3009.encode_uint256(Utils.map_value(authorization, {"validBefore", :valid_before}))
+      EIP712.encode_uint256(Utils.map_value(authorization, {"validBefore", :valid_before}))
 
-    {:ok, nonce} = EIP3009.encode_bytes32(ctx.nonce)
+    {:ok, nonce} = EIP712.encode_bytes32(ctx.nonce)
 
     from <> to <> value <> valid_after <> valid_before <> nonce
   end

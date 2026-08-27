@@ -147,7 +147,7 @@ defmodule X402.ERC6492 do
   @spec wrap(String.t(), binary(), binary()) :: {:ok, binary()} | {:error, :invalid_address}
   def wrap(factory, factory_calldata, inner_signature)
       when is_binary(factory) and is_binary(factory_calldata) and is_binary(inner_signature) do
-    with {:ok, factory_word} <- X402.EIP3009.encode_address(factory) do
+    with {:ok, factory_word} <- X402.EIP712.encode_address(factory) do
       calldata_offset = 3 * 32
       signature_offset = calldata_offset + 32 + padded_size(factory_calldata)
 

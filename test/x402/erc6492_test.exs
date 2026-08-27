@@ -77,7 +77,7 @@ defmodule X402.ERC6492Test do
     end
 
     test "rejects out-of-bounds calldata offsets" do
-      {:ok, factory_word} = X402.EIP3009.encode_address(@factory)
+      {:ok, factory_word} = X402.EIP712.encode_address(@factory)
 
       malformed =
         factory_word <>
@@ -89,7 +89,7 @@ defmodule X402.ERC6492Test do
     end
 
     test "rejects a declared bytes length past the end of the buffer" do
-      {:ok, factory_word} = X402.EIP3009.encode_address(@factory)
+      {:ok, factory_word} = X402.EIP712.encode_address(@factory)
 
       malformed =
         factory_word <>
