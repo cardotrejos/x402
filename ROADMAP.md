@@ -1,143 +1,71 @@
 # x402 Elixir SDK — Roadmap
 
 > Internal roadmap. Living document — update as priorities shift.
+> Priorities and effort estimates come from the ecosystem gap analysis in
+> [docs/ecosystem-comparison.md](docs/ecosystem-comparison.md) (§8); item tags
+> (P0.1, P1.4, …) reference its numbering.
 
-## Current State (v0.1.0)
+## Current State (v0.5.x)
 
-✅ Protocol primitives (PaymentRequired, PaymentSignature, PaymentResponse)
-✅ Facilitator client (verify/settle via GenServer + Finch)
-✅ Plug middleware (PaymentGate)
-✅ Wallet validation (EVM + Solana)
-✅ Telemetry events
-✅ 99% test coverage, Dialyzer-clean
-✅ Published on Hex.pm
+✅ x402 v2 protocol primitives (PaymentRequired / PaymentSignature / PaymentResponse, 8KB header caps)
+✅ Plug middleware (PaymentGate): verify-before-handler, settle-after-response, replay claim, extension echo
+✅ Facilitator client (verify/settle) with CDP JWT auth and Ecto-style runtime config
+✅ Extensions: payment_identifier (ETS cache), SIWX (local EIP-191 recovery), bazaar builder
+✅ Lifecycle hooks, telemetry spans, wallet validation (EVM + Solana)
+✅ >90% coverage, dialyzer-clean, live CDP smoke tests, published on Hex.pm
 
----
+## In flight (stack #55: PRs #50–#54, #56)
 
-## v0.2 — Protocol Extensions
+- [x] **P0.1** Remove the fake v1 validation path — explicit `{:unsupported_x402_version, v}` rejection (#50)
+- [x] **P1.4** Route matching on decoded `path_info` segments + GHSA-3j63-5h8p-gf7c regression tests (#51)
+- [x] **P1.2a** Local pre-verification checks (payTo / exact amount / validity window) before the facilitator call (#52)
+- [x] **P1.3** `put_new/3` in the `Cache` behaviour; gate routed through pluggable adapters (#53)
+- [x] **§6.6.2** `claim_order: :before_verify` replay-storm shedding (#54)
+- [x] **§6.6** `SECURITY.md` + CDP token-reuse doc correction (#56)
 
-**Goal:** Parity with the latest x402 spec extensions.
+## P0 — correctness and table stakes
 
-### Payment-Identifier (Idempotency)
-- [x] `X402.Extensions.PaymentIdentifier` — encode/decode payment ID in payloads
-- [x] Cache behaviour (`X402.Extensions.PaymentIdentifier.Cache`)
-- [x] Default ETS adapter (no deps)
-- [ ] Optional Redis adapter (via Redix)
-- [ ] Plug integration — auto-deduplicate in PaymentGate
-- [ ] Configurable TTL per route
+- [ ] **P0.2** GET `/supported` (+ `/discovery/resources`) in the facilitator client; startup route
+      validation; `feePayer` / `facilitatorAddress` discovery
+- [ ] **P0.3** De-serialize the facilitator client: GenServer becomes a config holder, HTTP + retries
+      run in the caller's process via the stateless `X402.Facilitator.HTTP`
+- [ ] **P0.4** Payer client (EVM `exact`): promote the EIP-3009/EIP-712 signing out of `test/support`
+      into `lib/x402/client/` behind an `X402.Signer` behaviour; Req/Finch 402 → sign → retry flow
 
-### Lifecycle Hooks
-- [x] `before_verify/2` — inspect/transform payment before facilitator call
-- [x] `after_settle/2` — post-settlement logic (logging, webhooks, analytics)
-- [x] `on_reject/2` — custom handling for failed/invalid payments
-- [x] Hook behaviour + default no-op implementation
-- [x] Plug option: `hooks: MyApp.PaymentHooks`
+## P1 — ecosystem parity
 
-### "upto" Scheme
-- [x] Encode/decode "upto" scheme in PaymentRequired
-- [ ] Max-price bidding validation in PaymentSignature
-- [ ] Facilitator client support for upto verification
-- [ ] Tests + docs
+- [ ] **P1.1** `X402.Scheme` behaviour — per-(scheme, network) verify/sign registration keyed off
+      `/supported`; refactor `PaymentSignature.validate` and PaymentGate's hardcoded flow onto it
+- [ ] **P1.2b** Optional full local EIP-712 verification (EOA / ERC-1271 / ERC-6492) behind the
+      optional crypto deps
+- [ ] **P1.3b** Redis adapter for the replay cache (behaviour landed in #53)
+- [ ] **P1.5** Upstream e2e harness entry (`x402-foundation/x402`) + third-party SDK docs listing
+- [ ] **P1.6** MCP transport: client + server payment wrapper on `_meta` `x402/payment` keys
 
----
+## P2 — differentiation
 
-## v0.3 — SIWX (Sign-In-With-X)
+- [ ] **P2.1** Facilitator engine (EVM exact verify/settle) + the ecosystem's first facilitator HTTP
+      scaffold — promoted from the old moonshot list; only community Rust ships one today
+- [ ] **P2.2** `upto` with Permit2 + `facilitatorAddress` discovery
+- [ ] **P2.3** SVM `exact` (client first)
+- [ ] **P2.4** Remaining extensions: EIP-2612 + ERC-20-approval gas sponsoring, offer-receipt,
+      bazaar *discovery client*
+- [ ] **P2.5** Lean Phoenix-friendly paywall for browser-facing routes
 
-**Goal:** Repeat access without repayment. "Sessions for crypto."
+## v1.0 — production polish
 
-- [ ] `X402.Extensions.SIWX` — CAIP-122 message construction
-- [ ] EVM signature verification (EIP-4361 / SIWE)
-- [ ] Solana signature verification
-- [ ] Storage behaviour (`X402.Extensions.SIWX.Storage`)
-  - [ ] ETS adapter (default)
-  - [ ] Mnesia adapter (distributed)
-  - [ ] Ecto adapter (bring your DB)
-- [ ] Plug integration — challenge/response flow in PaymentGate
-- [ ] `SIGN-IN-WITH-X` header encode/decode
-- [ ] Configurable access TTL (how long a wallet stays "signed in")
-
----
-
-## v0.4 — Bazaar Client (Discovery)
-
-**Goal:** Elixir clients and AI agents can discover x402 services programmatically.
-
-- [ ] `X402.Bazaar` — query facilitator `/list` endpoints
-- [ ] Filtering by network, price range, category
-- [ ] Response parsing into typed structs
-- [ ] Caching layer (avoid hammering discovery endpoints)
-- [ ] `X402.Bazaar.Agent` — GenServer that maintains a local service catalog
-- [ ] Optional: LiveView component for browsing available services
-
----
-
-## v0.5 — Client SDK (Buyer Side)
-
-**Goal:** Make Elixir a first-class x402 buyer, not just seller.
-
-- [ ] `X402.Client` — wraps HTTP clients (Req, Finch)
-- [ ] Auto-detect 402 responses → parse requirements → prepare payment
-- [ ] Pluggable wallet/signer behaviour (`X402.Client.Signer`)
-- [ ] Auto-retry with payment after 402
-- [ ] Support for all schemes (exact, upto)
-- [ ] Transparent to caller — `X402.Client.get(url)` just works
-- [ ] Telemetry events for client-side payments
-
----
-
-## v1.0 — Production Ready
-
-**Goal:** Battle-tested, fully documented, community-ready.
-
-- [ ] LiveDashboard integration (payment metrics, settlement rates, latency)
-- [ ] Rate limiting per wallet address
-- [ ] Multi-facilitator support (failover + load balancing)
-- [ ] Comprehensive guides:
-  - [ ] "Build a paid API in 5 minutes"
-  - [ ] "x402 for AI agents"
-  - [ ] "Deploying x402 on Fly.io"
-- [ ] Example Phoenix app (full reference implementation)
-- [ ] `mix x402.gen.paywall` generator
+- [ ] LiveDashboard integration, rate limiting per wallet, multi-facilitator failover
+- [ ] Guides: "Build a paid API in 5 minutes", "x402 for AI agents", "Deploying on Fly.io"
+- [ ] Example Phoenix app, `mix x402.gen.paywall` generator
 - [ ] Security audit of crypto verification paths
 - [ ] Hex v1.0 publish
 
----
+## Sequencing
 
-## Moonshots
-
-Things we might build if the ecosystem demand is there.
-
-### Self-Hosted Facilitator → **PROMOTED: Now building as `x402_facilitator`**
-- Separate private repo
-- Full facilitator implementation in Elixir (Phoenix)
-- Uses this library (`x402`) for all protocol types
-- GenServer per payment flow (BEAM's sweet spot)
-
-### LiveView Paywall Component
-- Drop-in `<.paywall>` component for Phoenix LiveView
-- WalletConnect integration
-- Shows price, accepts payment, reveals content
-- Zero JS framework dependencies (just LiveView)
-
-### x402 + Oban (Background Settlements)
-- Oban job for async settlement (don't block request)
-- Retry logic with exponential backoff
-- Dead letter queue for failed settlements
-- Dashboard in Oban Web
+**P0.2 → P1.1 → (P0.4, P1.2b)** is the critical path: the `/supported` endpoint feeds the scheme
+registry, which the payer client and any new mechanism plug into. P1.5's server entry can land before
+the client exists (the harness tests roles separately). MCP (P1.6) depends on P0.4 for its client half.
 
 ---
 
-## Priorities
-
-Rough order based on impact and ecosystem gaps:
-
-1. **v0.2** — Extensions are table stakes, every other SDK has them
-2. **v0.5** — Buyer-side client is the biggest gap vs TS/Python/Go
-3. **v0.3** — SIWX unlocks real-world usage patterns
-4. **v0.4** — Bazaar is forward-looking, depends on ecosystem growth
-5. **v1.0** — Polish pass once core features land
-6. **Moonshots** — Facilitator is the big bet if we go deep
-
----
-
-*Last updated: 2026-02-16*
+*Last updated: 2026-08-26*
