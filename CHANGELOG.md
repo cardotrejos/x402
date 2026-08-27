@@ -169,6 +169,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation, plus client-side assembly of the extension data around a
   pre-signed `approve(Permit2, amount)` transaction (`build_info/1`,
   `put_info/2`, and `enricher/1` for `X402.Client.build_payment/3`)
+- `X402.Client.build_payment/3` and `X402.Client.Finch.request/3`
+  `:extensions` option — client extension enrichers applied to the
+  assembled payload (how gas-sponsoring data is attached opt-in)
 
 ## [0.5.0] - 2026-08-26
 

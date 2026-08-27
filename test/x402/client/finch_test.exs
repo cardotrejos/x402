@@ -96,6 +96,52 @@ defmodule X402.Client.FinchTest do
       assert payload["payload"]["authorization"]["to"] == @receiver
     end
 
+    test "forwards :extensions enrichers to build_payment", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      alias X402.Extensions.EIP2612GasSponsoring
+
+      test_pid = self()
+
+      payment_required =
+        Map.put(@payment_required, "extensions", %{
+          "eip2612GasSponsoring" => EIP2612GasSponsoring.build_extension()
+        })
+
+      Bypass.expect(bypass, "GET", "/sponsored", fn conn ->
+        case Conn.get_req_header(conn, "payment-signature") do
+          [] ->
+            {:ok, header} = PaymentRequired.encode(payment_required)
+
+            conn
+            |> Conn.put_resp_header("payment-required", header)
+            |> Conn.resp(402, "{}")
+
+          [header] ->
+            send(test_pid, {:payment_header, header})
+            {:ok, response_header} = PaymentResponse.encode(@settlement)
+
+            conn
+            |> Conn.put_resp_header("payment-response", response_header)
+            |> Conn.resp(200, "{}")
+        end
+      end)
+
+      assert {:ok, %{status: 200}} =
+               FinchClient.request(finch, url(bypass, "/sponsored"),
+                 signer: signer,
+                 extensions: [EIP2612GasSponsoring.enricher(signer, nonce: "0")]
+               )
+
+      assert_received {:payment_header, header}
+      assert {:ok, payload} = PaymentSignature.decode(header)
+      assert {:ok, info} = EIP2612GasSponsoring.extract_info(payload)
+      assert EIP2612GasSponsoring.validate_info(info) == :ok
+      assert info["from"] == signer.address
+    end
+
     test "returns non-402 responses untouched, without paying", %{
       bypass: bypass,
       finch: finch,
