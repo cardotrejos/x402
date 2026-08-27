@@ -64,6 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Documented the clustered-BEAM double-execution hazard of the per-node ETS
   replay cache in the `PaymentGate`, `Cache`, and `ETSCache` moduledocs
+- Added `SECURITY.md` — private vulnerability reporting, supported versions,
+  and the SDK's trust model (facilitator-delegated verification, transport
+  hardening, per-node replay cache caveat)
+- Corrected the `X402.Facilitator.Auth.CDP.headers/2` doc: the JWT is signed
+  fresh per facilitator operation, and transport retries within one operation
+  reuse it inside its 120-second validity window
 
 ### Security
 
