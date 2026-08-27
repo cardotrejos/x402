@@ -10,8 +10,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     2. Requests with `PAYMENT-SIGNATURE` are decoded as `PaymentPayload` v2.
     3. `PaymentPayload.accepted` and echoed extensions are matched against the
        complete requirements advertised by the route.
-    4. Matched requirements are verified before the protected handler runs.
-    5. Successful handler responses are settled immediately before they are
+    4. Cheap local pre-checks run on the EIP-3009-style authorization object
+       (payTo binding, exact amount equality, validity window) so certain
+       mismatches answer 402 without a facilitator round-trip — see the
+       `:local_prechecks` option.
+    5. Matched requirements are verified before the protected handler runs.
+    6. Successful handler responses are settled immediately before they are
        sent. Successful settlements attach a `PAYMENT-RESPONSE` header and assign
        `:x402_payment_payload` / `:x402_payment_requirements` on the conn.
 
@@ -61,6 +65,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @supported_payment_flow "authorization"
     @settlement_amount_private :x402_settlement_amount
     @default_max_timeout_seconds 60
+    # Mirrors the 6-second buffer the reference facilitators apply to
+    # validBefore so a payment does not expire mid-settlement.
+    @precheck_time_buffer_seconds 6
     @default_description "Payment required"
     @default_mime_type "application/json"
 
@@ -224,6 +231,20 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         type: {:list, {:custom, __MODULE__, :validate_route, []}},
         required: true,
         doc: "Route gate definitions (see route options below)."
+      ],
+      local_prechecks: [
+        type: :boolean,
+        default: true,
+        doc: """
+        Run cheap local checks on the EIP-3009-style `payload.authorization`
+        object before calling the facilitator: `to` must equal the route's
+        `pay_to`, `value` must equal the advertised amount for `"exact"`
+        routes, and the `validAfter`/`validBefore` window must cover now (with
+        a #{@precheck_time_buffer_seconds}s settlement buffer). Fields absent
+        from the payload are skipped, so schemes with other payload shapes
+        pass through untouched. Failures answer 402 without a facilitator
+        round-trip.
+        """
       ]
     ]
 
@@ -232,7 +253,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             facilitator: Facilitator.server(),
             hooks: module(),
             payment_identifier_cache: ETSCache.server() | nil,
-            routes: [compiled_route()]
+            routes: [compiled_route()],
+            local_prechecks: boolean()
           }
 
     @typedoc false
@@ -343,7 +365,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         routes:
           validated_opts
           |> Keyword.fetch!(:routes)
-          |> Enum.map(&compile_route/1)
+          |> Enum.map(&compile_route/1),
+        local_prechecks: Keyword.fetch!(validated_opts, :local_prechecks)
       }
     end
 
@@ -381,13 +404,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     Gates matching requests behind x402 v2 payment verification.
     """
     @spec call(Plug.Conn.t(), options()) :: Plug.Conn.t()
-    def call(%Plug.Conn{} = conn, %{
-          facilitator: facilitator,
-          hooks: hooks,
-          payment_identifier_cache: payment_identifier_cache,
-          routes: routes
-        }) do
-      if is_nil(payment_identifier_cache), do: warn_no_idempotency_cache_once()
+    def call(%Plug.Conn{} = conn, %{routes: routes} = options) do
+      if is_nil(options.payment_identifier_cache), do: warn_no_idempotency_cache_once()
 
       request_path = decoded_request_path(conn)
       request_method = normalize_method(conn.method)
@@ -398,36 +416,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           conn
 
         route ->
-          handle_payment_gate(
-            conn,
-            facilitator,
-            hooks,
-            payment_identifier_cache,
-            route,
-            request_method,
-            request_path
-          )
+          handle_payment_gate(conn, options, route, request_method, request_path)
       end
     end
 
-    @spec handle_payment_gate(
-            Plug.Conn.t(),
-            Facilitator.server(),
-            module(),
-            ETSCache.server() | nil,
-            compiled_route(),
-            atom(),
-            String.t()
-          ) :: Plug.Conn.t()
-    defp handle_payment_gate(
-           conn,
-           facilitator,
-           hooks,
-           payment_identifier_cache,
-           route,
-           request_method,
-           request_path
-         ) do
+    @spec handle_payment_gate(Plug.Conn.t(), options(), compiled_route(), atom(), String.t()) ::
+            Plug.Conn.t()
+    defp handle_payment_gate(conn, options, route, request_method, request_path) do
       case payment_header(conn) do
         :missing ->
           emit(:payment_required, %{method: request_method, path: request_path, route: route.path})
@@ -443,9 +438,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         {:ok, header} ->
           verify_and_prepare_settlement(
             conn,
-            facilitator,
-            hooks,
-            payment_identifier_cache,
+            options,
             route,
             request_method,
             request_path,
@@ -473,29 +466,25 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec verify_and_prepare_settlement(
             Plug.Conn.t(),
-            Facilitator.server(),
-            module(),
-            ETSCache.server() | nil,
+            options(),
             compiled_route(),
             atom(),
             String.t(),
             String.t()
           ) :: Plug.Conn.t()
-    defp verify_and_prepare_settlement(
-           conn,
-           facilitator,
-           hooks,
-           payment_identifier_cache,
-           route,
-           request_method,
-           request_path,
-           header
-         ) do
+    defp verify_and_prepare_settlement(conn, options, route, request_method, request_path, header) do
+      %{
+        facilitator: facilitator,
+        hooks: hooks,
+        payment_identifier_cache: payment_identifier_cache
+      } = options
+
       accepts = route_accepts(route)
       payment_id = :crypto.hash(:sha256, header) |> Base.encode16(case: :lower)
 
       with {:ok, payment_payload, requirements} <-
              decode_and_validate_payment(header, accepts, route.extensions),
+           :ok <- run_local_prechecks(options.local_prechecks, payment_payload, requirements),
            {:ok, verify_response} <-
              facilitator_verify(facilitator, payment_payload, requirements, hooks),
            :ok <- ensure_verify_success(verify_response),
@@ -1001,6 +990,158 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    # Cheap local checks on the EIP-3009-style authorization object, run before
+    # the facilitator round-trip. They mirror the first checks every reference
+    # facilitator performs (payTo equality, exact amount equality, time
+    # window), so junk traffic is rejected without paying a verify call.
+    # Payloads without a `payload.authorization` map — other schemes, Permit2 —
+    # are skipped entirely, as is any individual absent field: the facilitator
+    # remains the authority, these checks only fail fast on certain mismatch.
+    @type precheck_failure ::
+            :pay_to_mismatch
+            | :amount_mismatch
+            | :invalid_authorization_value
+            | :authorization_not_yet_valid
+            | :authorization_expired
+            | :invalid_authorization_timing
+
+    @spec run_local_prechecks(boolean(), map(), map()) ::
+            :ok | {:error, {:precheck_failed, precheck_failure()}}
+    defp run_local_prechecks(false, _payload, _requirements), do: :ok
+
+    defp run_local_prechecks(true, payload, requirements) do
+      case eip3009_authorization(payload) do
+        nil ->
+          :ok
+
+        authorization ->
+          with :ok <- precheck_pay_to(authorization, requirements),
+               :ok <- precheck_exact_amount(authorization, requirements) do
+            precheck_timing(authorization)
+          end
+      end
+    end
+
+    @spec eip3009_authorization(map()) :: map() | nil
+    defp eip3009_authorization(payload) do
+      case Utils.nested_map_value(payload, [
+             {"payload", :payload},
+             {"authorization", :authorization}
+           ]) do
+        authorization when is_map(authorization) -> authorization
+        _other -> nil
+      end
+    end
+
+    @spec precheck_pay_to(map(), map()) ::
+            :ok | {:error, {:precheck_failed, :pay_to_mismatch}}
+    defp precheck_pay_to(authorization, requirements) do
+      to = Utils.map_value(authorization, {"to", :to})
+      pay_to = Utils.map_value(requirements, {"payTo", :payTo})
+
+      case is_binary(to) and is_binary(pay_to) do
+        true ->
+          case same_address?(to, pay_to) do
+            true -> :ok
+            false -> {:error, {:precheck_failed, :pay_to_mismatch}}
+          end
+
+        false ->
+          :ok
+      end
+    end
+
+    @spec same_address?(String.t(), String.t()) :: boolean()
+    defp same_address?(left, right) do
+      case hex_address?(left) and hex_address?(right) do
+        true -> String.downcase(left) == String.downcase(right)
+        false -> left == right
+      end
+    end
+
+    @spec hex_address?(String.t()) :: boolean()
+    defp hex_address?(<<"0x", rest::binary>>) when rest != "",
+      do: Regex.match?(~r/^[0-9a-fA-F]+$/, rest)
+
+    defp hex_address?(_address), do: false
+
+    @spec precheck_exact_amount(map(), map()) ::
+            :ok | {:error, {:precheck_failed, :amount_mismatch | :invalid_authorization_value}}
+    defp precheck_exact_amount(authorization, requirements) do
+      scheme = Utils.map_value(requirements, {"scheme", :scheme})
+      value = Utils.map_value(authorization, {"value", :value})
+      amount = Utils.map_value(requirements, {"amount", :amount})
+
+      case scheme == "exact" and not is_nil(value) and not is_nil(amount) do
+        true -> compare_exact_amount(value, amount)
+        false -> :ok
+      end
+    end
+
+    @spec compare_exact_amount(term(), term()) ::
+            :ok | {:error, {:precheck_failed, :amount_mismatch | :invalid_authorization_value}}
+    defp compare_exact_amount(value, amount) do
+      with {:ok, parsed_value} <- parse_precheck_amount(value),
+           {:ok, parsed_amount} <- parse_precheck_amount(amount) do
+        case Utils.compare_decimal(parsed_value, parsed_amount) do
+          :eq -> :ok
+          _other -> {:error, {:precheck_failed, :amount_mismatch}}
+        end
+      end
+    end
+
+    @spec parse_precheck_amount(term()) ::
+            {:ok, {non_neg_integer(), non_neg_integer()}}
+            | {:error, {:precheck_failed, :invalid_authorization_value}}
+    defp parse_precheck_amount(value) do
+      case Utils.parse_decimal(value) do
+        {:ok, parsed} -> {:ok, parsed}
+        :error -> {:error, {:precheck_failed, :invalid_authorization_value}}
+      end
+    end
+
+    @spec precheck_timing(map()) ::
+            :ok
+            | {:error,
+               {:precheck_failed,
+                :authorization_not_yet_valid
+                | :authorization_expired
+                | :invalid_authorization_timing}}
+    defp precheck_timing(authorization) do
+      now = System.system_time(:second)
+
+      with {:ok, valid_after} <-
+             optional_unix_time(Utils.map_value(authorization, {"validAfter", :validAfter})),
+           {:ok, valid_before} <-
+             optional_unix_time(Utils.map_value(authorization, {"validBefore", :validBefore})) do
+        cond do
+          is_integer(valid_after) and valid_after > now ->
+            {:error, {:precheck_failed, :authorization_not_yet_valid}}
+
+          is_integer(valid_before) and valid_before < now + @precheck_time_buffer_seconds ->
+            {:error, {:precheck_failed, :authorization_expired}}
+
+          true ->
+            :ok
+        end
+      end
+    end
+
+    @spec optional_unix_time(term()) ::
+            {:ok, integer() | nil} | {:error, {:precheck_failed, :invalid_authorization_timing}}
+    defp optional_unix_time(nil), do: {:ok, nil}
+    defp optional_unix_time(value) when is_integer(value), do: {:ok, value}
+
+    defp optional_unix_time(value) when is_binary(value) do
+      case Integer.parse(value) do
+        {parsed, ""} -> {:ok, parsed}
+        _other -> {:error, {:precheck_failed, :invalid_authorization_timing}}
+      end
+    end
+
+    defp optional_unix_time(_value),
+      do: {:error, {:precheck_failed, :invalid_authorization_timing}}
+
     @spec ensure_verify_success(map()) ::
             :ok
             | {:error,
@@ -1249,6 +1390,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp status_for_reason(reason) when reason in @invalid_request_reasons, do: 400
     defp status_for_reason({:unsupported_x402_version, _version}), do: 400
     defp status_for_reason({:missing_fields, _fields}), do: 400
+    defp status_for_reason({:precheck_failed, _reason}), do: 402
     defp status_for_reason({:invalid_upto_payment, _reason}), do: 400
     defp status_for_reason({:invalid_fields, _fields}), do: 400
     defp status_for_reason(:invalid_payment_requirements), do: 400
@@ -1341,6 +1483,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error(:already_exists), do: "payment already processed"
     defp rejection_error({:unsupported_x402_version, _version}), do: "unsupported x402 version"
     defp rejection_error({:missing_fields, _fields}), do: "invalid_payload"
+
+    defp rejection_error({:precheck_failed, _reason}),
+      do: "payment authorization does not satisfy the payment requirements"
+
     defp rejection_error({:invalid_upto_payment, _reason}), do: "invalid_payload"
     defp rejection_error({:invalid_fields, _fields}), do: "invalid_payload"
     defp rejection_error(:invalid_payment_requirements), do: "invalid_payload"
