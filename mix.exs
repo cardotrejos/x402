@@ -123,6 +123,7 @@ defmodule X402.MixProject do
         "guides/client.md": [title: "Paying for Resources"],
         "guides/plug-integration.md": [title: "Plug/Phoenix Integration"],
         "guides/mcp.md": [title: "Paid MCP Tools"],
+        "guides/paywall.md": [title: "Browser Paywall"],
         "guides/live-smoke-tests.md": [title: "Live Smoke Tests"]
       ],
       groups_for_extras: [
@@ -154,7 +155,9 @@ defmodule X402.MixProject do
           X402.Hooks.Default
         ],
         "Plug Integration": [
-          X402.Plug.PaymentGate
+          X402.Plug.PaymentGate,
+          X402.Paywall,
+          X402.Paywall.Default
         ],
         "MCP Transport": [
           X402.MCP,

@@ -1934,6 +1934,217 @@ defmodule X402.Plug.PaymentGateTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Browser paywall (:paywall option)
+  # ---------------------------------------------------------------------------
+
+  defmodule CustomPaywall do
+    @moduledoc false
+    @behaviour X402.Paywall
+
+    @impl X402.Paywall
+    def render(payment_required, conn_info) do
+      {:ok,
+       "custom-paywall:#{conn_info.method}:#{conn_info.request_path}:" <>
+         "#{conn_info.status}:#{payment_required["error"]}"}
+    end
+  end
+
+  defmodule FailingPaywall do
+    @moduledoc false
+    @behaviour X402.Paywall
+
+    @impl X402.Paywall
+    def render(_payment_required, _conn_info), do: {:error, :boom}
+  end
+
+  @browser_accept "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+  @browser_user_agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  defp browser_conn(conn) do
+    conn
+    |> put_req_header("accept", @browser_accept)
+    |> put_req_header("user-agent", @browser_user_agent)
+  end
+
+  defp maybe_put_req_header(conn, _name, nil), do: conn
+  defp maybe_put_req_header(conn, name, value), do: put_req_header(conn, name, value)
+
+  describe "browser paywall" do
+    test "serves HTML to browser page loads when :paywall is set" do
+      conn =
+        conn(:get, "/api/resource")
+        |> browser_conn()
+        |> run_request(routes: [@route], facilitator: self(), paywall: X402.Paywall.Default)
+
+      assert conn.status == 402
+      assert conn.halted
+      assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+      assert conn.resp_body =~ "<!DOCTYPE html>"
+      assert conn.resp_body =~ @amount
+      assert conn.resp_body =~ @network
+      assert conn.resp_body =~ @asset
+    end
+
+    test "serves HTML for a bare text/html Accept with a Mozilla User-Agent" do
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("accept", "text/html")
+        |> put_req_header("user-agent", @browser_user_agent)
+        |> run_request(routes: [@route], facilitator: self(), paywall: X402.Paywall.Default)
+
+      assert conn.status == 402
+      assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+    end
+
+    test "keeps JSON across the API-client Accept/User-Agent matrix" do
+      matrix = [
+        {nil, nil},
+        {@browser_accept, nil},
+        {"text/html", nil},
+        {nil, @browser_user_agent},
+        {"application/json", @browser_user_agent},
+        {"*/*", @browser_user_agent},
+        {"application/json, text/plain", @browser_user_agent}
+      ]
+
+      for {accept, user_agent} <- matrix do
+        conn =
+          conn(:get, "/api/resource")
+          |> maybe_put_req_header("accept", accept)
+          |> maybe_put_req_header("user-agent", user_agent)
+          |> run_request(routes: [@route], facilitator: self(), paywall: X402.Paywall.Default)
+
+        assert conn.status == 402
+        assert conn.resp_body == "{}"
+        assert get_resp_header(conn, "content-type") == ["application/json; charset=utf-8"]
+        assert get_resp_header(conn, "payment-required") != []
+      end
+    end
+
+    test "sends the identical PAYMENT-REQUIRED header on HTML and JSON forms" do
+      opts = [routes: [@route], facilitator: self(), paywall: X402.Paywall.Default]
+
+      html_conn = conn(:get, "/api/resource") |> browser_conn() |> run_request(opts)
+      json_conn = run_request(conn(:get, "/api/resource"), opts)
+
+      bare_conn =
+        run_request(conn(:get, "/api/resource"), routes: [@route], facilitator: self())
+
+      [header] = get_resp_header(html_conn, "payment-required")
+      assert get_resp_header(json_conn, "payment-required") == [header]
+      assert get_resp_header(bare_conn, "payment-required") == [header]
+
+      # The page embeds the exact header value for tooling.
+      assert html_conn.resp_body =~ header
+    end
+
+    test "the :paywall default leaves browser 402 responses byte-identical" do
+      default_conn =
+        conn(:get, "/api/resource")
+        |> browser_conn()
+        |> run_request(routes: [@route], facilitator: self())
+
+      explicit_nil_conn =
+        conn(:get, "/api/resource")
+        |> browser_conn()
+        |> run_request(routes: [@route], facilitator: self(), paywall: nil)
+
+      assert default_conn.status == 402
+      assert default_conn.resp_body == "{}"
+      assert get_resp_header(default_conn, "content-type") == ["application/json; charset=utf-8"]
+
+      assert explicit_nil_conn.status == default_conn.status
+      assert explicit_nil_conn.resp_body == default_conn.resp_body
+      assert Enum.sort(explicit_nil_conn.resp_headers) == Enum.sort(default_conn.resp_headers)
+    end
+
+    test "escapes hostile route descriptions and service names" do
+      route =
+        @route
+        |> Map.put(:description, "<script>alert('pwn')</script>")
+        |> Map.put(:service_name, "\"><img src=x onerror=alert(1)>")
+
+      conn =
+        conn(:get, "/api/resource")
+        |> browser_conn()
+        |> run_request(routes: [route], facilitator: self(), paywall: X402.Paywall.Default)
+
+      assert conn.status == 402
+      refute conn.resp_body =~ "<script>alert"
+      refute conn.resp_body =~ "<img src=x"
+      assert conn.resp_body =~ "&lt;script&gt;alert(&#39;pwn&#39;)&lt;/script&gt;"
+      assert conn.resp_body =~ "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"
+    end
+
+    test "dispatches to a custom X402.Paywall module" do
+      conn =
+        conn(:get, "/api/resource")
+        |> browser_conn()
+        |> run_request(routes: [@route], facilitator: self(), paywall: CustomPaywall)
+
+      assert conn.status == 402
+      assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+
+      assert conn.resp_body ==
+               "custom-paywall:GET:/api/resource:402:PAYMENT-SIGNATURE header is required"
+    end
+
+    test "falls back to JSON when the paywall renderer fails" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          conn =
+            conn(:get, "/api/resource")
+            |> browser_conn()
+            |> run_request(routes: [@route], facilitator: self(), paywall: FailingPaywall)
+
+          assert conn.status == 402
+          assert conn.resp_body == "{}"
+          assert get_resp_header(conn, "content-type") == ["application/json; charset=utf-8"]
+          assert get_resp_header(conn, "payment-required") != []
+        end)
+
+      assert log =~ "paywall renderer"
+      assert log =~ ":boom"
+    end
+
+    test "keeps 400 invalid-payload responses JSON even for browsers" do
+      conn =
+        conn(:get, "/api/resource")
+        |> browser_conn()
+        |> put_req_header("payment-signature", "%%% not base64 %%%")
+        |> run_request(routes: [@route], facilitator: self(), paywall: X402.Paywall.Default)
+
+      assert conn.status == 400
+      assert conn.resp_body == "{}"
+      assert get_resp_header(conn, "content-type") == ["application/json; charset=utf-8"]
+    end
+
+    test "serves the paywall on browser 402s for rejected payments" do
+      reject =
+        start_mock_facilitator(
+          verify:
+            {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "declined"}}}
+        )
+
+      conn =
+        conn(:get, "/api/resource")
+        |> browser_conn()
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: reject, paywall: X402.Paywall.Default)
+
+      assert conn.status == 402
+      assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+      assert conn.resp_body =~ "<!DOCTYPE html>"
+    end
+
+    test "init rejects modules that do not implement X402.Paywall" do
+      assert_raise NimbleOptions.ValidationError, ~r/X402\.Paywall/, fn ->
+        PaymentGate.init(routes: [@route], paywall: __MODULE__)
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
 
