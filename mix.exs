@@ -116,6 +116,7 @@ defmodule X402.MixProject do
         "CHANGELOG.md": [title: "Changelog"],
         LICENSE: [title: "License"],
         "guides/getting-started.md": [title: "Getting Started"],
+        "guides/client.md": [title: "Paying for Resources"],
         "guides/plug-integration.md": [title: "Plug/Phoenix Integration"],
         "guides/live-smoke-tests.md": [title: "Live Smoke Tests"]
       ],
@@ -129,6 +130,13 @@ defmodule X402.MixProject do
           X402.PaymentRequired,
           X402.PaymentSignature,
           X402.PaymentResponse
+        ],
+        "Payer Client": [
+          X402.Client,
+          X402.Client.Finch,
+          X402.Signer,
+          X402.Signer.LocalKey,
+          X402.EIP3009
         ],
         "Facilitator Client": [
           X402.Facilitator,

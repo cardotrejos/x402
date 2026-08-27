@@ -101,6 +101,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer occurs; `{:missing_fields, _}` remains for v2 `accepted` objects
   missing required PaymentRequirements fields.
   (Ecosystem report §8 P0.1.)
+- Payer client (report §8 P0.4): `X402.Client` — transport-agnostic core with
+  `select_requirements/2` (filterable payment-option selection with a
+  `max_amount` budget guard), `build_payment/3` (v2 `PaymentPayload` assembly
+  with full requirements and extension echo), and `encode_payment/1`
+- `X402.Signer` behaviour — the client-side signing seam (`address/1` +
+  `sign_eip712/3` over the precomputed EIP-712 digest and full typed data),
+  with `X402.Signer.LocalKey` as the built-in raw-private-key implementation
+  (optional `ex_secp256k1`/`ex_keccak`; the key is redacted from `inspect/1`)
+- `X402.EIP3009` — EIP-3009 `TransferWithAuthorization` building, EIP-712
+  domain derivation from payment requirements, digest computation, signing,
+  and signer recovery, promoted from `test/support/x402_test_payments.ex`
+  (which now delegates to it)
+- `X402.Client.Finch` — HTTP convenience client: on `402` with a
+  `PAYMENT-REQUIRED` header it decodes, signs, and retries once with
+  `PAYMENT-SIGNATURE` (never pays twice), returning the decoded
+  `PAYMENT-RESPONSE` settlement receipt; includes an `on_payment_required`
+  budget/consent hook and enforces `https://` for non-loopback resources
+- `[:x402, :client, :select | :sign | :build | :request]` telemetry events
+- `guides/client.md` — "Paying for x402 Resources from Elixir"
 
 ## [0.5.0] - 2026-08-26
 
