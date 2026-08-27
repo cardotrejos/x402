@@ -16,6 +16,7 @@ facilitator, chain, or web framework.
 
 - x402 v2 `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, and `PAYMENT-RESPONSE` headers
 - Complete v2 payment-requirement and extension-echo validation
+- Payer client with EIP-3009 signing and an automatic `402 → sign → retry` Finch flow
 - Facilitator `/verify` and `/settle` client with retries, hooks, and telemetry
 - Plug/Phoenix payment gate that settles only after successful resource handling
 - `"exact"` and metered `"upto"` authorization flows
