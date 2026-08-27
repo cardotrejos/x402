@@ -389,7 +389,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         }) do
       if is_nil(payment_identifier_cache), do: warn_no_idempotency_cache_once()
 
-      request_path = normalize_path(conn.request_path)
+      request_path = decoded_request_path(conn)
       request_method = normalize_method(conn.method)
 
       case match_route(routes, request_method, request_path) do
@@ -1278,6 +1278,28 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec normalize_path(String.t()) :: String.t()
     defp normalize_path("/"), do: "/"
     defp normalize_path(path), do: String.trim_trailing(path, "/")
+
+    # Matching MUST use conn.path_info, not the raw conn.request_path: adapters
+    # drop empty segments when building path_info, so "//premium" reaches the
+    # router as ["premium"] while its request_path stays "//premium" — a raw
+    # string comparison passes the alias through unguarded even though the
+    # router serves the protected resource (the GHSA-3j63-5h8p-gf7c bug class).
+    # Segments are additionally percent-decoded so the gate also covers routers
+    # that decode; when the router does not, a decoded match merely 402s a
+    # request the router would 404 — over-matching is the fail-safe direction
+    # for a paywall. Malformed percent sequences are matched verbatim.
+    @spec decoded_request_path(Plug.Conn.t()) :: String.t()
+    defp decoded_request_path(%Plug.Conn{path_info: []}), do: "/"
+
+    defp decoded_request_path(%Plug.Conn{path_info: segments}),
+      do: "/" <> Enum.map_join(segments, "/", &decode_segment/1)
+
+    @spec decode_segment(String.t()) :: String.t()
+    defp decode_segment(segment) do
+      URI.decode(segment)
+    rescue
+      ArgumentError -> segment
+    end
 
     @spec map_to_keyword(map()) :: {:ok, keyword()} | {:error, String.t()}
     defp map_to_keyword(map) do

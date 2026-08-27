@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`X402.Plug.PaymentGate` route matching now runs on decoded
+  `conn.path_info` segments instead of the raw `conn.request_path`.**
+  Adapters drop empty path segments when building `path_info`, so
+  `//api/resource` reached the router as the protected resource while the
+  gate's raw string comparison passed it through unpaid — the same bug class
+  as GHSA-3j63-5h8p-gf7c in the legacy TypeScript middleware. Segments are
+  additionally percent-decoded (malformed sequences match verbatim), so the
+  gate also covers routers that decode; a decoded match a router would 404
+  merely answers 402 first, which is the fail-safe direction for a paywall.
+  Regression tests cover double-slash, percent-encoded, encoded-slash, glob,
+  and malformed-percent aliases. Telemetry `path` metadata now reports the
+  decoded path. (Ecosystem report §6.5/§8 P1.4.)
+
 ### Removed
 
 - **The legacy "v1" validation path in `X402.PaymentSignature`.** It required
