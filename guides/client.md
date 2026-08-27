@@ -17,7 +17,8 @@ letting the SDK handle the `402 → sign → retry` dance.
    responds with the resource, plus a `PAYMENT-RESPONSE` header containing the
    settlement receipt.
 
-The SDK signs the `exact` scheme on EVM (`eip155:*`) networks.
+The SDK signs the `exact` scheme (EIP-3009) and the `upto` scheme
+(Permit2) on EVM (`eip155:*`) networks.
 
 ## Quick start with Finch
 
@@ -106,6 +107,43 @@ alias X402.{Client, PaymentRequired}
 
 `Client.select_requirements/2` is also public if you want to inspect or
 choose the payment option yourself before signing.
+
+## Metered `upto` payments
+
+For variable-cost resources (LLM tokens, bandwidth, compute), servers
+advertise the `upto` scheme: the client authorizes a **maximum** amount
+and the server settles for the actual usage, up to that ceiling. The
+SDK signs `upto` requirements out of the box — `build_payment/3` (and
+`X402.Client.Finch.request/3`) picks them up like any other entry, with
+`:max_amount` guarding the ceiling you are willing to authorize:
+
+```elixir
+{:ok, payload} =
+  X402.Client.build_payment(payment_required, signer,
+    scheme: "upto",
+    max_amount: "5000000"
+  )
+```
+
+Under the hood the client signs a Permit2 `PermitWitnessTransferFrom`
+(`X402.Permit2`) against the canonical Permit2 contract, with the
+requirements' `amount` as `permitted.amount` (the ceiling) and a witness
+binding the server's `payTo` and the facilitator's address, so only that
+facilitator can settle it. Two things to know:
+
+- **`extra.facilitatorAddress` is required.** Facilitators announce
+  their address via `GET /supported` (`X402.Facilitator.supported/1`)
+  and resource servers forward it in each upto entry's `extra`. Entries
+  without it are never selected, and signing one directly returns
+  `{:error, {:missing_extra, "facilitatorAddress"}}`.
+- **Permit2 needs a one-time on-chain approval.** The payer's wallet
+  must have approved the canonical Permit2 contract for the token once
+  (`approve(Permit2, ...)`); see the gas-sponsoring extensions below for
+  facilitator-funded alternatives.
+
+The signed maximum is not what you pay — the server meters actual usage
+and settles for less (or nothing). See the
+[Plug Integration](plug-integration.md) guide for the server half.
 
 ## Gas-sponsoring extensions
 
