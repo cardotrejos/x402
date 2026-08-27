@@ -3,10 +3,12 @@ defmodule X402.EIP712 do
   Generic [EIP-712](https://eips.ethereum.org/EIPS/eip-712) hashing primitives.
 
   Shared by the x402 signing modules: `X402.EIP3009` hashes
-  `TransferWithAuthorization` structs with these primitives, and
+  `TransferWithAuthorization` structs with these primitives,
+  `X402.Permit2` hashes Permit2 `PermitWitnessTransferFrom` structs, and
   `X402.Extensions.EIP2612GasSponsoring` hashes EIP-2612 `Permit` structs.
   The module covers the common x402 domain shape
-  (`name`/`version`/`chainId`/`verifyingContract`) and the generic
+  (`name`/`version`/`chainId`/`verifyingContract`, the version optional
+  for version-less domains such as Permit2's) and the generic
   `hash_struct/2` / `digest/2` combination
 
       digest = keccak256(0x19 0x01 || domainSeparator || structHash)
@@ -22,17 +24,21 @@ defmodule X402.EIP712 do
   alias X402.Wallet
 
   @domain_type "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+  @domain_type_no_version "EIP712Domain(string name,uint256 chainId,address verifyingContract)"
 
   @typedoc """
   An EIP-712 domain map with `:name`, `:version`, `:chain_id`, and
   `:verifying_contract` keys.
 
   Functions accepting a domain also take the wire-style keys
-  (`"name"`, `"version"`, `"chainId"`, `"verifyingContract"`).
+  (`"name"`, `"version"`, `"chainId"`, `"verifyingContract"`). Domains
+  whose contracts declare no version (for example the canonical Permit2
+  contract) omit the version key entirely; `domain_separator/1` then hashes
+  the three-field `EIP712Domain` type.
   """
   @type domain :: %{
+          optional(:version) => String.t(),
           name: String.t(),
-          version: String.t(),
           chain_id: non_neg_integer(),
           verifying_contract: String.t()
         }
@@ -100,22 +106,31 @@ defmodule X402.EIP712 do
   Computes the EIP-712 domain separator for a domain map.
 
   Returns `keccak256(typeHash || keccak256(name) || keccak256(version) ||
-  chainId || verifyingContract)` as a 32-byte binary.
+  chainId || verifyingContract)` as a 32-byte binary. When the domain has
+  no version (absent or `nil` — for example the canonical Permit2
+  contract), the version-less three-field `EIP712Domain` type is hashed
+  instead, per EIP-712's rule that absent fields are dropped from the
+  domain type.
   """
   @spec domain_separator(map()) :: {:ok, <<_::256>>} | {:error, encode_error()}
   def domain_separator(domain) when is_map(domain) do
     with {:ok, keccak_module} <- keccak_module(),
          {:ok, name} <- fetch_field(domain, {"name", :name}),
-         {:ok, version} <- fetch_field(domain, {"version", :version}),
          {:ok, chain_id} <- fetch_field(domain, {"chainId", :chain_id}),
          {:ok, contract} <- fetch_field(domain, {"verifyingContract", :verifying_contract}),
          {:ok, chain_id_word} <- encode_uint256(chain_id),
          {:ok, contract_word} <- encode_address(contract) do
+      {type_hash, version_word} =
+        case Utils.map_value(domain, {"version", :version}) do
+          nil -> {keccak_module.hash_256(@domain_type_no_version), ""}
+          version -> {keccak_module.hash_256(@domain_type), keccak_module.hash_256(version)}
+        end
+
       {:ok,
        keccak_module.hash_256(
-         keccak_module.hash_256(@domain_type) <>
+         type_hash <>
            keccak_module.hash_256(name) <>
-           keccak_module.hash_256(version) <>
+           version_word <>
            chain_id_word <>
            contract_word
        )}
