@@ -100,6 +100,14 @@ defmodule X402.Client.Finch do
       `X402.Client.build_payment/3` — see its `:extensions` option.
       """
     ],
+    schemes: [
+      type: {:list, {:custom, X402.Scheme, :validate_module, []}},
+      default: [],
+      doc: """
+      Additional `X402.Scheme` modules forwarded to
+      `X402.Client.build_payment/3` — see its `:schemes` option.
+      """
+    ],
     on_payment_required: [
       type: {:or, [{:fun, 1}, nil]},
       default: nil,
@@ -302,7 +310,8 @@ defmodule X402.Client.Finch do
         :asset,
         :max_amount,
         :valid_after_buffer,
-        :extensions
+        :extensions,
+        :schemes
       ])
 
   @spec finalize(map()) :: response()

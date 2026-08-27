@@ -14,22 +14,37 @@ defmodule X402.PaymentSignature do
   v1 wire format (v1 payments arrive in the `X-PAYMENT` header, which
   `X402.Plug.PaymentGate` never reads); rejecting explicitly is safer than the
   false interop of validating a shape no facilitator settles.
+
+  Scheme-specific structural validation (for example the `upto` ceiling
+  check) dispatches through `X402.Scheme.Registry`; pass additional
+  `X402.Scheme` modules with the `:schemes` option of `validate/3` or
+  `decode_and_validate/3`. Kinds with no registered scheme module pass
+  through with `:ok` — the facilitator remains the authority.
   """
 
   alias X402.PaymentRequirements
+  alias X402.Scheme
   alias X402.Telemetry
   alias X402.Utils
 
   # Single source of truth for the 8 KB decode guard — see X402.Header.
   @max_header_bytes X402.Header.max_header_bytes()
 
+  @validate_opts_schema [
+    schemes: [
+      type: {:list, {:custom, Scheme, :validate_module, []}},
+      default: [],
+      doc: """
+      Additional `X402.Scheme` modules consulted (before the built-ins) for
+      scheme-specific payload validation — see `X402.Scheme.Registry`.
+      """
+    ]
+  ]
+
   @type decode_error :: :invalid_base64 | :invalid_json | :payload_too_large
-  @type upto_validation_error ::
-          :missing_max_price
-          | :missing_payment_value
-          | :invalid_max_price
-          | :invalid_payment_value
-          | :payment_value_exceeds_max_price
+
+  @typedoc "See `t:X402.Scheme.UptoEVM.validation_error/0`."
+  @type upto_validation_error :: X402.Scheme.UptoEVM.validation_error()
 
   @type validate_error ::
           :invalid_payload
@@ -158,7 +173,7 @@ defmodule X402.PaymentSignature do
       {:error, :invalid_payload}
   """
   @spec validate(map()) :: {:ok, map()} | {:error, validate_error()}
-  def validate(payload) when is_map(payload), do: do_validate(payload, %{})
+  def validate(payload) when is_map(payload), do: do_validate(payload, %{}, [])
 
   def validate(_payload) do
     Telemetry.emit(:payment_signature, :validate, :error, %{reason: :invalid_payload})
@@ -174,7 +189,7 @@ defmodule X402.PaymentSignature do
   """
   @spec validate(map(), map()) :: {:ok, map()} | {:error, validate_error()}
   def validate(payload, requirements) when is_map(payload) and is_map(requirements) do
-    do_validate(payload, requirements)
+    do_validate(payload, requirements, [])
   end
 
   def validate(_payload, _requirements) do
@@ -182,17 +197,44 @@ defmodule X402.PaymentSignature do
     {:error, :invalid_payload}
   end
 
-  @spec do_validate(map(), map()) :: {:ok, map()} | {:error, validate_error()}
-  defp do_validate(payload, requirements) do
+  @doc since: "0.6.0", group: :verification
+  @doc """
+  Validates a decoded `PAYMENT-SIGNATURE` payload with custom schemes.
+
+  Behaves like `validate/2`, additionally consulting the given
+  `X402.Scheme` modules (before the built-ins) for scheme-specific payload
+  validation — see `X402.Scheme.Registry` for the resolution rules.
+
+  ## Options
+
+  #{NimbleOptions.docs(@validate_opts_schema)}
+  """
+  @spec validate(map(), map(), keyword()) ::
+          {:ok, map()} | {:error, validate_error() | term()}
+  def validate(payload, requirements, opts)
+      when is_map(payload) and is_map(requirements) and is_list(opts) do
+    opts = NimbleOptions.validate!(opts, @validate_opts_schema)
+    do_validate(payload, requirements, Keyword.fetch!(opts, :schemes))
+  end
+
+  def validate(_payload, _requirements, _opts) do
+    Telemetry.emit(:payment_signature, :validate, :error, %{reason: :invalid_payload})
+    {:error, :invalid_payload}
+  end
+
+  @spec do_validate(map(), map(), [module()]) ::
+          {:ok, map()} | {:error, validate_error() | term()}
+  defp do_validate(payload, requirements, schemes) do
     case Utils.map_value(payload, {"x402Version", :x402Version}) do
-      2 -> validate_v2(payload, requirements)
+      2 -> validate_v2(payload, requirements, schemes)
       version when version in [nil, 1] -> validation_error({:unsupported_x402_version, version})
       _version -> validation_error(:invalid_x402_version)
     end
   end
 
-  @spec validate_v2(map(), map()) :: {:ok, map()} | {:error, validate_error()}
-  defp validate_v2(payload, requirements) do
+  @spec validate_v2(map(), map(), [module()]) ::
+          {:ok, map()} | {:error, validate_error() | term()}
+  defp validate_v2(payload, requirements, schemes) do
     accepted = Utils.map_value(payload, {"accepted", :accepted})
     scheme_payload = Utils.map_value(payload, {"payload", :payload})
     resource = Utils.map_value(payload, {"resource", :resource})
@@ -204,7 +246,8 @@ defmodule X402.PaymentSignature do
          true <- is_nil(extensions) or is_map(extensions),
          :ok <- PaymentRequirements.validate(accepted),
          :ok <- match_v2_requirements(requirements, accepted),
-         :ok <- validate_scheme(payload, effective_requirements(requirements, accepted)) do
+         :ok <-
+           validate_scheme(payload, effective_requirements(requirements, accepted), schemes) do
       validation_success(payload)
     else
       false -> validation_error(:invalid_payload)
@@ -234,7 +277,7 @@ defmodule X402.PaymentSignature do
     {:ok, payload}
   end
 
-  @spec validation_error(validate_error()) :: {:error, validate_error()}
+  @spec validation_error(validate_error() | term()) :: {:error, validate_error() | term()}
   defp validation_error(reason) do
     Telemetry.emit(:payment_signature, :validate, :error, %{reason: reason})
     {:error, reason}
@@ -261,8 +304,26 @@ defmodule X402.PaymentSignature do
   @spec decode_and_validate(String.t(), map()) ::
           {:ok, map()} | {:error, decode_and_validate_error()}
   def decode_and_validate(value, requirements) when is_map(requirements) do
+    decode_and_validate(value, requirements, [])
+  end
+
+  def decode_and_validate(_value, _requirements) do
+    Telemetry.emit(:payment_signature, :decode_and_validate, :error, %{reason: :invalid_payload})
+    {:error, :invalid_payload}
+  end
+
+  @doc since: "0.6.0", group: :verification
+  @doc """
+  Decodes and validates a `PAYMENT-SIGNATURE` header with custom schemes.
+
+  Behaves like `decode_and_validate/2`; `opts` are passed to `validate/3`.
+  """
+  @spec decode_and_validate(String.t(), map(), keyword()) ::
+          {:ok, map()} | {:error, decode_and_validate_error() | term()}
+  def decode_and_validate(value, requirements, opts)
+      when is_map(requirements) and is_list(opts) do
     with {:ok, decoded} <- decode(value),
-         {:ok, validated} <- validate(decoded, requirements) do
+         {:ok, validated} <- validate(decoded, requirements, opts) do
       result = {:ok, validated}
       Telemetry.emit(:payment_signature, :decode_and_validate, :ok, %{})
       result
@@ -273,23 +334,22 @@ defmodule X402.PaymentSignature do
     end
   end
 
-  def decode_and_validate(_value, _requirements) do
+  def decode_and_validate(_value, _requirements, _opts) do
     Telemetry.emit(:payment_signature, :decode_and_validate, :error, %{reason: :invalid_payload})
     {:error, :invalid_payload}
   end
 
-  @spec validate_scheme(map(), map()) ::
-          :ok | {:error, {:invalid_upto_payment, upto_validation_error()}}
-  defp validate_scheme(payload, requirements) do
-    case effective_scheme(payload, requirements) do
-      "upto" ->
-        with {:ok, max_price} <- extract_max_price(payload, requirements),
-             {:ok, payment_value} <- extract_payment_value(payload) do
-          ensure_not_exceeds(payment_value, max_price)
-        end
+  # Scheme-specific structural validation dispatches through the scheme
+  # registry. Kinds with no registered scheme module pass through with :ok —
+  # the historical behavior for unknown schemes.
+  @spec validate_scheme(map(), map(), [module()]) :: :ok | {:error, term()}
+  defp validate_scheme(payload, requirements, schemes) do
+    scheme = effective_scheme(payload, requirements)
+    network = effective_network(payload, requirements)
 
-      _scheme ->
-        :ok
+    case Scheme.Registry.resolve(schemes, scheme, network) do
+      {:ok, module} -> Scheme.validate_payload(module, payload, requirements, [])
+      :error -> :ok
     end
   end
 
@@ -300,81 +360,10 @@ defmodule X402.PaymentSignature do
       Utils.nested_map_value(payload, [{"accepted", :accepted}, {"scheme", :scheme}])
   end
 
-  @spec extract_max_price(map(), map()) ::
-          {:ok, {non_neg_integer(), non_neg_integer()}}
-          | {:error, {:invalid_upto_payment, upto_validation_error()}}
-  defp extract_max_price(payload, requirements) do
-    value =
-      Utils.first_present([
-        Utils.map_value(requirements, {"amount", :amount}),
-        Utils.map_value(requirements, {"maxPrice", :maxPrice}),
-        Utils.map_value(requirements, {"maxAmountRequired", :maxAmountRequired}),
-        Utils.nested_map_value(payload, [{"accepted", :accepted}, {"amount", :amount}]),
-        Utils.map_value(payload, {"maxPrice", :maxPrice}),
-        Utils.map_value(payload, {"maxAmountRequired", :maxAmountRequired})
-      ])
-
-    case value do
-      nil ->
-        {:error, {:invalid_upto_payment, :missing_max_price}}
-
-      max_price ->
-        case Utils.parse_decimal(max_price) do
-          {:ok, parsed} -> {:ok, parsed}
-          :error -> {:error, {:invalid_upto_payment, :invalid_max_price}}
-        end
-    end
-  end
-
-  @spec extract_payment_value(map()) ::
-          {:ok, {non_neg_integer(), non_neg_integer()}}
-          | {:error, {:invalid_upto_payment, upto_validation_error()}}
-  defp extract_payment_value(payload) do
-    value =
-      Utils.first_present([
-        Utils.nested_map_value(payload, [
-          {"payload", :payload},
-          {"permit2Authorization", :permit2Authorization},
-          {"permitted", :permitted},
-          {"amount", :amount}
-        ]),
-        Utils.nested_map_value(payload, [
-          {"permit2Authorization", :permit2Authorization},
-          {"permitted", :permitted},
-          {"amount", :amount}
-        ]),
-        Utils.nested_map_value(payload, [{"payload", :payload}, {"maxAmount", :maxAmount}]),
-        Utils.map_value(payload, {"maxAmount", :maxAmount}),
-        Utils.map_value(payload, {"value", :value}),
-        Utils.nested_map_value(payload, [{"payload", :payload}, {"value", :value}]),
-        Utils.nested_map_value(payload, [
-          {"payload", :payload},
-          {"authorization", :authorization},
-          {"value", :value}
-        ]),
-        Utils.nested_map_value(payload, [{"authorization", :authorization}, {"value", :value}])
-      ])
-
-    case value do
-      nil ->
-        {:error, {:invalid_upto_payment, :missing_payment_value}}
-
-      payment_value ->
-        case Utils.parse_decimal(payment_value) do
-          {:ok, parsed} -> {:ok, parsed}
-          :error -> {:error, {:invalid_upto_payment, :invalid_payment_value}}
-        end
-    end
-  end
-
-  @spec ensure_not_exceeds(
-          {non_neg_integer(), non_neg_integer()},
-          {non_neg_integer(), non_neg_integer()}
-        ) :: :ok | {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
-  defp ensure_not_exceeds(payment_value, max_price) do
-    case Utils.compare_decimal(payment_value, max_price) do
-      :gt -> {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}}
-      _comparison -> :ok
-    end
+  @spec effective_network(map(), map()) :: String.t() | atom() | nil
+  defp effective_network(payload, requirements) do
+    Utils.map_value(requirements, {"network", :network}) ||
+      Utils.map_value(payload, {"network", :network}) ||
+      Utils.nested_map_value(payload, [{"accepted", :accepted}, {"network", :network}])
   end
 end
