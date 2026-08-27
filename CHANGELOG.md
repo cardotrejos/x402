@@ -20,6 +20,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the facilitator; payloads without an authorization object (other schemes,
   Permit2) and absent fields are skipped, so the facilitator remains the
   authority. (Ecosystem report §6.6.4/§8 P1.2.)
+- `put_new/3` callback on `X402.Extensions.PaymentIdentifier.Cache` — the
+  atomic first-writer-wins claim used for replay protection is now part of the
+  behaviour contract (TTL semantics and return values documented), so
+  alternative adapters (Redis, Mnesia, database-backed) can be plugged into
+  `X402.Plug.PaymentGate`; the cache moduledoc includes a Redis `SET NX PX`
+  adapter sketch
+- `X402.Plug.PaymentGate` `payment_identifier_cache:` now also accepts a
+  `{module, cache}` adapter tuple implementing
+  `X402.Extensions.PaymentIdentifier.Cache`; a bare pid/name keeps working and
+  is normalized to the bundled `ETSCache` adapter
+
+### Changed
+
+- `X402.Plug.PaymentGate` routes all replay claim/release calls through the
+  `X402.Extensions.PaymentIdentifier.Cache` behaviour instead of calling
+  `ETSCache` directly; adapter claim errors other than
+  `{:error, :already_exists}` fail closed with HTTP 500
+- Implementations of `X402.Extensions.PaymentIdentifier.Cache` must now export
+  `put_new/3`; `validate_adapter/1` rejects adapters without it
+
+### Documentation
+
+- Documented the clustered-BEAM double-execution hazard of the per-node ETS
+  replay cache in the `PaymentGate`, `Cache`, and `ETSCache` moduledocs
 
 ### Security
 

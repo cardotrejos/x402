@@ -4,6 +4,15 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
 
   Entries expire after `:ttl_ms` (default: 1 hour). Expired entries are removed
   by an internal periodic cleanup loop.
+
+  > #### Per-node only {: .warning}
+  >
+  > The ETS table lives on the local node. In a clustered BEAM deployment each
+  > node keeps its own independent table, so this adapter cannot prevent the
+  > same payment proof from being served once per node. See the
+  > "Clustered deployments" section in
+  > `X402.Extensions.PaymentIdentifier.Cache` for a shared-store adapter
+  > sketch.
   """
 
   use GenServer
@@ -140,6 +149,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   a non-expired entry for `payment_id` is already present. This is used to
   prevent concurrent requests from double-settling the same payment proof.
   """
+  @impl Cache
   @spec put_new(server(), Cache.key(), Cache.value()) ::
           :ok | {:error, :already_exists | :invalid_cache_value}
   def put_new(cache, payment_id, value) when is_binary(payment_id) do

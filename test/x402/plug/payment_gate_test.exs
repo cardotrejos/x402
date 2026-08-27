@@ -19,10 +19,14 @@ defmodule X402.Plug.PaymentGateTest do
   use ExUnit.Case, async: false
   doctest X402.Plug.PaymentGate
 
+  import Mox
   import Plug.Conn
   import Plug.Test
 
   alias X402.Extensions.PaymentIdentifier.ETSCache
+  alias X402.PaymentIdentifierCacheMock, as: CacheMock
+
+  setup :verify_on_exit!
   alias X402.Facilitator
   alias X402.Facilitator.Error
   alias X402.PaymentRequired
@@ -1035,6 +1039,204 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Replay protection through the Cache behaviour
+  # ---------------------------------------------------------------------------
+
+  describe "payment identifier cache adapters" do
+    test "init/1 wraps a pid or name in the default ETSCache adapter" do
+      pid = self()
+      name = :payment_gate_cache_compat
+
+      assert %{payment_identifier_cache: {ETSCache, ^pid}} =
+               PaymentGate.init(routes: [@route], payment_identifier_cache: pid)
+
+      assert %{payment_identifier_cache: {ETSCache, ^name}} =
+               PaymentGate.init(routes: [@route], payment_identifier_cache: name)
+
+      assert %{payment_identifier_cache: nil} = PaymentGate.init(routes: [@route])
+    end
+
+    test "init/1 accepts a {module, cache} adapter tuple as-is" do
+      assert %{payment_identifier_cache: {CacheMock, :mock_ref}} =
+               PaymentGate.init(
+                 routes: [@route],
+                 payment_identifier_cache: {CacheMock, :mock_ref}
+               )
+    end
+
+    test "init/1 rejects adapter tuples whose module misses callbacks" do
+      assert_raise NimbleOptions.ValidationError, ~r/put_new\/3/, fn ->
+        PaymentGate.init(
+          routes: [@route],
+          payment_identifier_cache: {X402.Extensions.PaymentIdentifier, :ref}
+        )
+      end
+    end
+
+    test "claims through a custom adapter and releases when the handler fails" do
+      facilitator = start_mock_facilitator()
+      parent = self()
+
+      expect(CacheMock, :put_new, fn :mock_ref, payment_id, :verified ->
+        send(parent, {:adapter_put_new, payment_id})
+        :ok
+      end)
+
+      expect(CacheMock, :delete, fn :mock_ref, payment_id ->
+        send(parent, {:adapter_delete, payment_id})
+        :ok
+      end)
+
+      response_conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> gate_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+        |> Plug.Conn.send_resp(500, "handler failed")
+
+      assert response_conn.status == 500
+      assert_receive {:adapter_put_new, payment_id}
+      assert_receive {:adapter_delete, ^payment_id}
+      refute_received {:settle_called, _, _, _}
+    end
+
+    test "releases the claim through the adapter when settlement fails" do
+      settle_body = %{
+        "success" => false,
+        "errorReason" => "insufficient_funds",
+        "transaction" => "",
+        "network" => @network
+      }
+
+      facilitator = start_mock_facilitator(settle: {:ok, %{status: 200, body: settle_body}})
+      parent = self()
+
+      expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified -> :ok end)
+
+      expect(CacheMock, :delete, fn :mock_ref, payment_id ->
+        send(parent, {:adapter_delete, payment_id})
+        :ok
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+
+      assert conn.status == 402
+      assert_receive {:adapter_delete, _payment_id}
+    end
+
+    test "rejects a duplicate claim from a custom adapter with 402" do
+      facilitator = start_mock_facilitator()
+
+      expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified ->
+        {:error, :already_exists}
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+
+      assert conn.status == 402
+      assert decode_payment_required!(conn)["error"] == "payment already processed"
+      refute_received {:settle_called, _, _, _}
+    end
+
+    test "fails closed with 500 when the adapter claim errors" do
+      facilitator = start_mock_facilitator()
+
+      expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified ->
+        {:error, :backend_unavailable}
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+
+      assert conn.status == 500
+      refute_received {:settle_called, _, _, _}
+    end
+
+    test "rejects duplicate payment proofs with the default ETS adapter" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      header = valid_payment_header()
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: cache
+        )
+
+      assert first.status == 200
+      assert_receive {:settle_called, _, _, _}
+
+      duplicate =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: cache
+        )
+
+      assert duplicate.status == 402
+      assert decode_payment_required!(duplicate)["error"] == "payment already processed"
+      refute_received {:settle_called, _, _, _}
+    end
+
+    test "exactly one of two concurrent identical requests wins the claim" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      header = valid_payment_header()
+
+      opts = [
+        routes: [@route],
+        facilitator: facilitator,
+        payment_identifier_cache: cache
+      ]
+
+      statuses =
+        1..2
+        |> Enum.map(fn _index ->
+          Task.async(fn ->
+            conn(:get, "/api/resource")
+            |> put_req_header("payment-signature", header)
+            |> gate_request(opts)
+            |> maybe_send_ok()
+            |> Map.fetch!(:status)
+          end)
+        end)
+        |> Task.await_many()
+
+      assert Enum.sort(statuses) == [200, 402]
+      assert_receive {:settle_called, _, _, _}
+      refute_received {:settle_called, _, _, _}
+    end
+  end
+
   describe "real facilitator client integration" do
     test "sends the upto ceiling to verify and the handler amount to settle" do
       bypass = Bypass.open()
@@ -1426,6 +1628,10 @@ defmodule X402.Plug.PaymentGateTest do
     conn
     |> gate_request(opts)
     |> maybe_send_ok()
+  end
+
+  defp unique_cache_name do
+    String.to_atom("payment_gate_cache_#{System.unique_integer([:positive, :monotonic])}")
   end
 
   defp gate_request(conn, opts), do: PaymentGate.call(conn, PaymentGate.init(opts))

@@ -1,7 +1,35 @@
 defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
   use ExUnit.Case, async: false
 
+  alias X402.Extensions.PaymentIdentifier.Cache
   alias X402.Extensions.PaymentIdentifier.ETSCache
+
+  test "conforms to the Cache behaviour, including put_new/3" do
+    behaviours =
+      ETSCache.module_info(:attributes)
+      |> Keyword.get_values(:behaviour)
+      |> List.flatten()
+
+    assert Cache in behaviours
+    assert X402.Behaviour.implements?(ETSCache, get: 2, put: 3, put_new: 3, delete: 2)
+    assert :ok = Cache.validate_adapter({ETSCache, ETSCache})
+  end
+
+  test "put_new/3 lets exactly one of many concurrent claimants win" do
+    cache = start_cache(ttl_ms: 60_000)
+
+    results =
+      1..50
+      |> Task.async_stream(
+        fn _index -> ETSCache.put_new(cache, "contested-payment", :verified) end,
+        max_concurrency: 50,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.count(results, &(&1 == :ok)) == 1
+    assert Enum.count(results, &(&1 == {:error, :already_exists})) == 49
+  end
 
   test "put/3 and get/2 store and retrieve verified entries" do
     cache = start_cache(ttl_ms: 1_000)
