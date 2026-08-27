@@ -10,32 +10,41 @@ defmodule X402.MCP.ClientTest do
   alias X402.MCP.Server
   alias X402.Signer.LocalKey
 
-  defmodule MockFacilitator do
-    @moduledoc false
-    use GenServer
+  # A real caller-side X402.Facilitator over a Bypass HTTP stub (the
+  # facilitator client executes verify/settle in the calling process).
+  defp start_bypass_facilitator(opts) do
+    owner = Keyword.fetch!(opts, :owner)
+    {:ok, %{status: v_status, body: v_body}} = Keyword.fetch!(opts, :verify)
+    {:ok, %{status: s_status, body: s_body}} = Keyword.fetch!(opts, :settle)
 
-    def start_link(opts) when is_list(opts), do: GenServer.start_link(__MODULE__, opts)
+    bypass = Bypass.open()
 
-    @impl true
-    def init(opts) do
-      {:ok,
-       %{
-         owner: Keyword.fetch!(opts, :owner),
-         verify: Keyword.fetch!(opts, :verify),
-         settle: Keyword.fetch!(opts, :settle)
-       }}
+    stub = fn path, tag, status, body ->
+      Bypass.stub(bypass, "POST", path, fn conn ->
+        {:ok, request_body, conn} = Plug.Conn.read_body(conn)
+        decoded = Jason.decode!(request_body)
+        send(owner, {tag, decoded["paymentPayload"], decoded["paymentRequirements"]})
+        Plug.Conn.resp(conn, status, Jason.encode!(body))
+      end)
     end
 
-    @impl true
-    def handle_call({:verify, payment_payload, requirements}, _from, state) do
-      send(state.owner, {:verify_called, payment_payload, requirements})
-      {:reply, state.verify, state}
-    end
+    stub.("/verify", :verify_called, v_status, v_body)
+    stub.("/settle", :settle_called, s_status, s_body)
 
-    def handle_call({:settle, payment_payload, requirements}, _from, state) do
-      send(state.owner, {:settle_called, payment_payload, requirements})
-      {:reply, state.settle, state}
-    end
+    suffix = System.unique_integer([:positive, :monotonic])
+    finch = String.to_atom("mcp_client_finch_#{suffix}")
+    name = String.to_atom("mcp_client_facilitator_#{suffix}")
+
+    start_supervised!(Supervisor.child_spec({Finch, name: finch}, id: finch))
+
+    start_supervised!(
+      {X402.Facilitator,
+       name: name,
+       finch: finch,
+       url: "http://localhost:#{bypass.port}",
+       max_retries: 0,
+       receive_timeout_ms: 2_000}
+    )
   end
 
   @asset "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
@@ -319,21 +328,20 @@ defmodule X402.MCP.ClientTest do
   describe "client-server loop" do
     setup do
       facilitator =
-        start_supervised!(
-          {MockFacilitator,
-           owner: self(),
-           verify: {:ok, %{status: 200, body: %{"isValid" => true}}},
-           settle:
-             {:ok,
-              %{
-                status: 200,
-                body: %{
-                  "success" => true,
-                  "transaction" => "0x" <> String.duplicate("ab", 32),
-                  "network" => @network,
-                  "payer" => "0x3333333333333333333333333333333333333333"
-                }
-              }}}
+        start_bypass_facilitator(
+          owner: self(),
+          verify: {:ok, %{status: 200, body: %{"isValid" => true}}},
+          settle:
+            {:ok,
+             %{
+               status: 200,
+               body: %{
+                 "success" => true,
+                 "transaction" => "0x" <> String.duplicate("ab", 32),
+                 "network" => @network,
+                 "payer" => "0x3333333333333333333333333333333333333333"
+               }
+             }}
         )
 
       cache =
@@ -399,12 +407,10 @@ defmodule X402.MCP.ClientTest do
 
     test "a rejected payment is surfaced without paying twice", %{config: config} do
       facilitator =
-        start_supervised!(
-          {MockFacilitator,
-           owner: self(),
-           verify: {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "bad"}}},
-           settle: {:ok, %{status: 200, body: %{}}}},
-          id: :rejecting_facilitator
+        start_bypass_facilitator(
+          owner: self(),
+          verify: {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "bad"}}},
+          settle: {:ok, %{status: 200, body: %{}}}
         )
 
       config = %{config | facilitator: facilitator}

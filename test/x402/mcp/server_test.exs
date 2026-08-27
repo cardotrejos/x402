@@ -21,60 +21,14 @@ defmodule X402.MCP.ServerTest do
   alias X402.Extensions.PaymentIdentifier.ETSCache
   alias X402.MCP.Server
 
-  defmodule MockFacilitator do
-    @moduledoc false
-    use GenServer
+  @default_settle_body %{
+    "success" => true,
+    "transaction" => "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    "network" => "eip155:84532",
+    "payer" => "0x1111111111111111111111111111111111111111"
+  }
 
-    @default_verify {:ok, %{status: 200, body: %{"isValid" => true, "payer" => "0xpayer"}}}
-
-    @default_settle {
-      :ok,
-      %{
-        status: 200,
-        body: %{
-          "success" => true,
-          "transaction" => "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-          "network" => "eip155:84532",
-          "payer" => "0x1111111111111111111111111111111111111111"
-        }
-      }
-    }
-
-    def start_link(opts) when is_list(opts), do: GenServer.start_link(__MODULE__, opts)
-
-    def default_settle_body, do: elem(@default_settle, 1).body
-
-    @impl true
-    def init(opts) do
-      {:ok,
-       %{
-         owner: Keyword.fetch!(opts, :owner),
-         verify: Keyword.get(opts, :verify, @default_verify),
-         settle: Keyword.get(opts, :settle, @default_settle)
-       }}
-    end
-
-    @impl true
-    def handle_call({:verify, payment_payload, requirements}, _from, state) do
-      send(state.owner, {:verify_called, payment_payload, requirements, nil})
-      {:reply, state.verify, state}
-    end
-
-    def handle_call({:verify, payment_payload, requirements, hooks_module}, _from, state) do
-      send(state.owner, {:verify_called, payment_payload, requirements, hooks_module})
-      {:reply, state.verify, state}
-    end
-
-    def handle_call({:settle, payment_payload, requirements}, _from, state) do
-      send(state.owner, {:settle_called, payment_payload, requirements, nil})
-      {:reply, state.settle, state}
-    end
-
-    def handle_call({:settle, payment_payload, requirements, hooks_module}, _from, state) do
-      send(state.owner, {:settle_called, payment_payload, requirements, hooks_module})
-      {:reply, state.settle, state}
-    end
-  end
+  defp default_settle_body, do: @default_settle_body
 
   @asset "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
   @receiver "0x1111111111111111111111111111111111111111"
@@ -99,8 +53,60 @@ defmodule X402.MCP.ServerTest do
     "extra" => %{"name" => "USDC", "version" => "2"}
   }
 
+  # A real caller-side X402.Facilitator over a Bypass HTTP stub — the
+  # facilitator client executes verify/settle in the calling process, so a
+  # GenServer speaking the old internal call protocol can no longer stand in.
   defp start_facilitator(opts \\ []) do
-    start_supervised!({MockFacilitator, [owner: self()] ++ opts}, id: make_ref())
+    owner = self()
+
+    verify =
+      Keyword.get(
+        opts,
+        :verify,
+        {:ok, %{status: 200, body: %{"isValid" => true, "payer" => "0xpayer"}}}
+      )
+
+    settle = Keyword.get(opts, :settle, {:ok, %{status: 200, body: @default_settle_body}})
+
+    bypass = Bypass.open()
+    stub_endpoint(bypass, owner, "/verify", :verify_called, verify)
+    stub_endpoint(bypass, owner, "/settle", :settle_called, settle)
+
+    suffix = System.unique_integer([:positive, :monotonic])
+    finch = String.to_atom("mcp_server_finch_#{suffix}")
+    name = String.to_atom("mcp_server_facilitator_#{suffix}")
+
+    start_supervised!(Supervisor.child_spec({Finch, name: finch}, id: finch))
+
+    start_supervised!(
+      {X402.Facilitator,
+       name: name,
+       finch: finch,
+       url: "http://localhost:#{bypass.port}",
+       max_retries: 0,
+       receive_timeout_ms: 2_000}
+    )
+  end
+
+  defp stub_endpoint(bypass, owner, path, tag, {:ok, %{status: status, body: body}}) do
+    Bypass.stub(bypass, "POST", path, fn conn ->
+      {:ok, request_body, conn} = Plug.Conn.read_body(conn)
+      decoded = Jason.decode!(request_body)
+      send(owner, {tag, decoded["paymentPayload"], decoded["paymentRequirements"], nil})
+      Plug.Conn.resp(conn, status, Jason.encode!(body))
+    end)
+  end
+
+  # Transport-level garbage cannot be expressed as {status, body} over real
+  # HTTP — answer with a non-JSON body so the facilitator client surfaces a
+  # malformed-response error, preserving the invariant under test.
+  defp stub_endpoint(bypass, owner, path, tag, _malformed) do
+    Bypass.stub(bypass, "POST", path, fn conn ->
+      {:ok, request_body, conn} = Plug.Conn.read_body(conn)
+      decoded = Jason.decode!(request_body)
+      send(owner, {tag, decoded["paymentPayload"], decoded["paymentRequirements"], nil})
+      Plug.Conn.resp(conn, 200, "not-json")
+    end)
   end
 
   defp config(facilitator, overrides \\ []) do
@@ -389,7 +395,7 @@ defmodule X402.MCP.ServerTest do
 
       assert result["content"] == [%{"type" => "text", "text" => "results"}]
       refute result["isError"]
-      assert result["_meta"]["x402/payment-response"] == MockFacilitator.default_settle_body()
+      assert result["_meta"]["x402/payment-response"] == default_settle_body()
 
       assert_received {:handler_called, %{"arguments" => %{"query" => "x402"}}}
       assert_received {:verify_called, ^payment, @requirements, nil}
@@ -416,10 +422,19 @@ defmodule X402.MCP.ServerTest do
 
         alias X402.Hooks.Context
 
-        def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+        def before_verify(%Context{} = context, _metadata) do
+          send(self(), {:hook_called, :before_verify})
+          {:cont, context}
+        end
+
         def after_verify(%Context{} = context, _metadata), do: {:cont, context}
         def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
-        def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+
+        def before_settle(%Context{} = context, _metadata) do
+          send(self(), {:hook_called, :before_settle})
+          {:cont, context}
+        end
+
         def after_settle(%Context{} = context, _metadata), do: {:cont, context}
         def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
       end
@@ -428,8 +443,11 @@ defmodule X402.MCP.ServerTest do
 
       Server.call(request(payment()), config, ok_handler())
 
-      assert_received {:verify_called, _payload, _requirements, PassthroughHooks}
-      assert_received {:settle_called, _payload, _requirements, PassthroughHooks}
+      # Hooks execute in the calling process with the caller-side facilitator.
+      assert_received {:hook_called, :before_verify}
+      assert_received {:hook_called, :before_settle}
+      assert_received {:verify_called, _payload, _requirements, _}
+      assert_received {:settle_called, _payload, _requirements, _}
     end
 
     test "returns the payment-required result with the facilitator's reason on failed verification" do
