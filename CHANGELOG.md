@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly zero while accepting payloads no facilitator would settle. Payloads
   declaring `x402Version: 1` or omitting the version now return
   `{:error, {:unsupported_x402_version, 1 | nil}}` (mapped to HTTP 400 by
-  `X402.Plug.PaymentGate`). The `{:missing_fields, _}` and
-  `{:invalid_format, _}` error reasons no longer occur.
+  `X402.Plug.PaymentGate`). The `{:invalid_format, _}` error reason no
+  longer occurs; `{:missing_fields, _}` remains for v2 `accepted` objects
+  missing required PaymentRequirements fields.
   (Ecosystem report §8 P0.1.)
 
 ## [0.5.0] - 2026-08-26

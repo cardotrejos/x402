@@ -37,6 +37,7 @@ defmodule X402.PaymentSignature do
           | :invalid_x402_version
           | :no_matching_requirements
           | {:unsupported_x402_version, 1 | nil}
+          | {:missing_fields, [String.t()]}
           | {:invalid_fields, [String.t()]}
           | {:invalid_upto_payment, upto_validation_error()}
 

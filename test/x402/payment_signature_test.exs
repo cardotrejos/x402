@@ -116,6 +116,13 @@ defmodule X402.PaymentSignatureTest do
       assert PaymentSignature.validate(Map.put(v2_payload("9000"), "extensions", [])) ==
                {:error, :invalid_payload}
     end
+
+    test "returns missing_fields for incomplete v2 accepted objects" do
+      payload = update_in(v2_payload("9000"), ["accepted"], &Map.delete(&1, "asset"))
+
+      assert PaymentSignature.validate(payload) ==
+               {:error, {:missing_fields, ["asset"]}}
+    end
   end
 
   describe "validate/2" do

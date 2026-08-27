@@ -1248,6 +1248,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec status_for_reason(term()) :: 400 | 402 | 500
     defp status_for_reason(reason) when reason in @invalid_request_reasons, do: 400
     defp status_for_reason({:unsupported_x402_version, _version}), do: 400
+    defp status_for_reason({:missing_fields, _fields}), do: 400
     defp status_for_reason({:invalid_upto_payment, _reason}), do: 400
     defp status_for_reason({:invalid_fields, _fields}), do: 400
     defp status_for_reason(:invalid_payment_requirements), do: 400
@@ -1310,6 +1311,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error(:no_matching_requirements), do: "No matching payment requirements"
     defp rejection_error(:already_exists), do: "payment already processed"
     defp rejection_error({:unsupported_x402_version, _version}), do: "unsupported x402 version"
+    defp rejection_error({:missing_fields, _fields}), do: "invalid_payload"
     defp rejection_error({:invalid_upto_payment, _reason}), do: "invalid_payload"
     defp rejection_error({:invalid_fields, _fields}), do: "invalid_payload"
     defp rejection_error(:invalid_payment_requirements), do: "invalid_payload"
