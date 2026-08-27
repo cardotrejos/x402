@@ -36,6 +36,11 @@ defmodule X402.MCPTest do
       assert MCP.fetch_payment(%{"_meta" => %{"x402/payment" => "paid"}}) == :error
       assert MCP.fetch_payment(%{"_meta" => "nope"}) == :error
     end
+
+    test "rejects non-map requests" do
+      assert MCP.fetch_payment(nil) == :error
+      assert MCP.fetch_payment("request") == :error
+    end
   end
 
   describe "put_payment/2" do
@@ -74,6 +79,10 @@ defmodule X402.MCPTest do
       result = %{"_meta" => %{"x402/payment-response" => %{"transaction" => "0xabc"}}}
 
       assert MCP.fetch_payment_response(result) == :error
+    end
+
+    test "rejects non-map results" do
+      assert MCP.fetch_payment_response(nil) == :error
     end
   end
 
@@ -123,6 +132,10 @@ defmodule X402.MCPTest do
 
       assert MCP.fetch_payment_required(result) == :error
     end
+
+    test "rejects non-map results" do
+      assert MCP.fetch_payment_required(nil) == :error
+    end
   end
 
   describe "fetch_payment_required_from_error/1" do
@@ -141,6 +154,10 @@ defmodule X402.MCPTest do
     test "rejects 402 errors without PaymentRequired data" do
       assert MCP.fetch_payment_required_from_error(%{"code" => 402, "data" => %{}}) == :error
       assert MCP.fetch_payment_required_from_error(%{"code" => 402}) == :error
+    end
+
+    test "rejects -32042 errors with non-map data" do
+      assert MCP.fetch_payment_required_from_error(%{"code" => -32_042, "data" => "x"}) == :error
     end
 
     test "rejects other error codes and non-map errors" do

@@ -115,6 +115,18 @@ defmodule X402.MCP.ClientTest do
       assert Client.call(@request, call_fun, signer: signer()) ==
                {:error, :invalid_tool_result}
     end
+
+    test "rejects signers that do not implement X402.Signer" do
+      call_fun = tracking_fun([@ok_result])
+
+      assert_raise NimbleOptions.ValidationError, ~r/X402.Signer/, fn ->
+        Client.call(@request, call_fun, signer: "not a signer")
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/X402.Signer/, fn ->
+        Client.call(@request, call_fun, signer: %URI{})
+      end
+    end
   end
 
   describe "call/3 payment flow" do
@@ -241,6 +253,13 @@ defmodule X402.MCP.ClientTest do
 
       assert Client.call(@request, call_fun, signer: signer()) ==
                {:error, {:transport_error, :closed}}
+    end
+
+    test "rejects invalid tool results on the retry" do
+      call_fun = tracking_fun([payment_required_result(), "nope"])
+
+      assert Client.call(@request, call_fun, signer: signer()) ==
+               {:error, :invalid_tool_result}
     end
   end
 

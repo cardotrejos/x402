@@ -100,7 +100,7 @@ defmodule X402.MCP.ServerTest do
   }
 
   defp start_facilitator(opts \\ []) do
-    start_supervised!({MockFacilitator, [owner: self()] ++ opts})
+    start_supervised!({MockFacilitator, [owner: self()] ++ opts}, id: make_ref())
   end
 
   defp config(facilitator, overrides \\ []) do
@@ -215,6 +215,26 @@ defmodule X402.MCP.ServerTest do
         Server.init(tool: "premium_search", accepts: [accept])
       end
     end
+
+    test "accepts an explicit authorization payment flow" do
+      accept = %{@accept | extra: %{"paymentFlow" => "authorization"}}
+      config = Server.init(tool: "premium_search", accepts: [accept])
+
+      assert hd(config.accepts)["extra"]["paymentFlow"] == "authorization"
+    end
+
+    test "omits empty optional resource fields" do
+      config = Server.init(tool: "premium_search", accepts: [@accept], service_name: "")
+
+      refute Map.has_key?(config.resource, "serviceName")
+    end
+
+    test "option validators reject invalid raw values" do
+      assert Server.validate_extra_map("nope") == {:error, "expected a map"}
+
+      assert Server.validate_atomic_amount(100) ==
+               {:error, "expected a digit-only atomic-unit amount"}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -252,6 +272,23 @@ defmodule X402.MCP.ServerTest do
       assert result["isError"] == true
       assert result["structuredContent"]["error"] == "Pay up"
       assert result["structuredContent"]["accepts"] == [@requirements]
+    end
+
+    test "payment_required_result/1 uses the default message" do
+      config = config(start_facilitator())
+
+      result = Server.payment_required_result(config)
+
+      assert result["structuredContent"]["error"] == "Payment required to access this tool"
+    end
+
+    test "payment_required_result/2 falls back to an internal error for corrupt configs" do
+      config = %{config(start_facilitator()) | extensions: %{"bad" => {:not, :json}}}
+
+      assert Server.payment_required_result(config) == %{
+               "isError" => true,
+               "content" => [%{"type" => "text", "text" => "Internal server error"}]
+             }
     end
   end
 
@@ -300,6 +337,16 @@ defmodule X402.MCP.ServerTest do
       result = Server.call(request(dropped), config, refute_handler())
 
       assert result["structuredContent"]["error"] == "No matching payment requirements"
+    end
+
+    test "rejects payments that cannot be encoded for the replay claim" do
+      config = config(start_facilitator())
+      unencodable = payment(%{"payload" => %{"bad" => {:not, :json}}})
+
+      result = Server.call(request(unencodable), config, refute_handler())
+
+      assert result["structuredContent"]["error"] == "invalid_payload"
+      refute_received {:verify_called, _payload, _requirements, _hooks}
     end
 
     test "rejects extension echoes that drop advertised values" do
@@ -413,6 +460,33 @@ defmodule X402.MCP.ServerTest do
                "content" => [%{"type" => "text", "text" => "Internal server error"}]
              }
     end
+
+    test "treats malformed verify responses as internal errors" do
+      internal_error = %{
+        "isError" => true,
+        "content" => [%{"type" => "text", "text" => "Internal server error"}]
+      }
+
+      for verify <- [
+            {:ok, %{status: 200, body: %{"payer" => "0xpayer"}}},
+            {:ok, %{status: 200, body: "not a map"}},
+            {:ok, %{}}
+          ] do
+        facilitator = start_facilitator(verify: verify)
+        config = config(facilitator)
+
+        assert Server.call(request(payment()), config, refute_handler()) == internal_error
+      end
+    end
+
+    test "reports a generic reason when verification fails without invalidReason" do
+      facilitator = start_facilitator(verify: {:ok, %{status: 200, body: %{"isValid" => false}}})
+      config = config(facilitator)
+
+      result = Server.call(request(payment()), config, refute_handler())
+
+      assert result["structuredContent"]["error"] == "facilitator rejected payment"
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -451,12 +525,36 @@ defmodule X402.MCP.ServerTest do
     end
 
     test "returns an opaque internal error on malformed settle responses" do
-      facilitator = start_facilitator(settle: {:ok, %{status: 200, body: %{"success" => true}}})
+      for settle <- [
+            {:ok, %{status: 200, body: %{"success" => true}}},
+            {:ok, %{status: 200, body: %{"transaction" => "0xabc"}}},
+            {:ok, %{status: 200, body: "not a map"}},
+            {:ok, %{status: 500, body: %{}}},
+            {:ok, %{}}
+          ] do
+        facilitator = start_facilitator(settle: settle)
+        config = config(facilitator)
+
+        result = Server.call(request(payment()), config, ok_handler())
+
+        assert result["content"] == [%{"type" => "text", "text" => "Internal server error"}]
+      end
+    end
+
+    test "reports a generic reason when settlement fails without errorReason" do
+      facilitator =
+        start_facilitator(
+          settle:
+            {:ok,
+             %{status: 200, body: %{"success" => false, "transaction" => "", "network" => "n"}}}
+        )
+
       config = config(facilitator)
 
       result = Server.call(request(payment()), config, ok_handler())
 
-      assert result["content"] == [%{"type" => "text", "text" => "Internal server error"}]
+      assert result["structuredContent"]["error"] ==
+               "Payment settlement failed: facilitator rejected payment"
     end
   end
 
@@ -494,6 +592,20 @@ defmodule X402.MCP.ServerTest do
       assert_raise RuntimeError, "boom", fn ->
         Server.call(request(payment()), config, fn _request -> raise "boom" end)
       end
+    end
+
+    test "re-throws handler throws after releasing the claim" do
+      cache =
+        start_supervised!({ETSCache, name: :"mcp_throw_#{System.unique_integer([:positive])}"})
+
+      config = config(start_facilitator(), payment_identifier_cache: cache)
+      request = request(payment())
+
+      assert catch_throw(Server.call(request, config, fn _request -> throw(:tool_bail) end)) ==
+               :tool_bail
+
+      retry = Server.call(request, config, ok_handler())
+      assert retry["_meta"]["x402/payment-response"]["success"] == true
     end
   end
 
