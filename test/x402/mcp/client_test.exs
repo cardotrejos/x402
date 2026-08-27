@@ -1,0 +1,414 @@
+defmodule X402.MCP.ClientTest do
+  use ExUnit.Case, async: true
+
+  doctest X402.MCP.Client
+
+  alias X402.EIP3009
+  alias X402.Extensions.PaymentIdentifier.ETSCache
+  alias X402.MCP
+  alias X402.MCP.Client
+  alias X402.MCP.Server
+  alias X402.Signer.LocalKey
+
+  defmodule MockFacilitator do
+    @moduledoc false
+    use GenServer
+
+    def start_link(opts) when is_list(opts), do: GenServer.start_link(__MODULE__, opts)
+
+    @impl true
+    def init(opts) do
+      {:ok,
+       %{
+         owner: Keyword.fetch!(opts, :owner),
+         verify: Keyword.fetch!(opts, :verify),
+         settle: Keyword.fetch!(opts, :settle)
+       }}
+    end
+
+    @impl true
+    def handle_call({:verify, payment_payload, requirements}, _from, state) do
+      send(state.owner, {:verify_called, payment_payload, requirements})
+      {:reply, state.verify, state}
+    end
+
+    def handle_call({:settle, payment_payload, requirements}, _from, state) do
+      send(state.owner, {:settle_called, payment_payload, requirements})
+      {:reply, state.settle, state}
+    end
+  end
+
+  @asset "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+  @receiver "0x2222222222222222222222222222222222222222"
+  @network "eip155:84532"
+
+  @requirements %{
+    "scheme" => "exact",
+    "network" => @network,
+    "amount" => "10000",
+    "asset" => @asset,
+    "payTo" => @receiver,
+    "maxTimeoutSeconds" => 300,
+    "extra" => %{"name" => "USDC", "version" => "2"}
+  }
+
+  @payment_required %{
+    "x402Version" => 2,
+    "error" => "Payment required to access this tool",
+    "resource" => %{"url" => "mcp://tool/premium_search", "mimeType" => "application/json"},
+    "accepts" => [@requirements],
+    "extensions" => %{}
+  }
+
+  @request %{"name" => "premium_search", "arguments" => %{"query" => "x402"}}
+
+  @ok_result %{"content" => [%{"type" => "text", "text" => "results"}]}
+
+  defp signer do
+    {:ok, signer} = LocalKey.new(:crypto.strong_rand_bytes(32))
+    signer
+  end
+
+  defp payment_required_result do
+    {:ok, result} = MCP.payment_required_result(@payment_required)
+    result
+  end
+
+  defp tracking_fun(responses) do
+    parent = self()
+    {:ok, agent} = Agent.start_link(fn -> responses end)
+
+    fn request ->
+      send(parent, {:tool_called, request})
+      Agent.get_and_update(agent, fn [head | rest] -> {head, rest} end)
+    end
+  end
+
+  describe "call/3 without payment required" do
+    test "returns the result as-is when the tool is free" do
+      call_fun = tracking_fun([@ok_result])
+
+      assert {:ok, %{result: @ok_result, payment_response: nil, paid: false}} =
+               Client.call(@request, call_fun, signer: signer())
+
+      assert_received {:tool_called, @request}
+      refute_received {:tool_called, _request}
+    end
+
+    test "accepts {:ok, result} returns from the tool-call function" do
+      call_fun = tracking_fun([{:ok, @ok_result}])
+
+      assert {:ok, %{result: @ok_result, paid: false}} =
+               Client.call(@request, call_fun, signer: signer())
+    end
+
+    test "propagates transport errors" do
+      call_fun = tracking_fun([{:error, :timeout}])
+
+      assert Client.call(@request, call_fun, signer: signer()) ==
+               {:error, {:transport_error, :timeout}}
+    end
+
+    test "rejects invalid tool results" do
+      call_fun = tracking_fun(["nope"])
+
+      assert Client.call(@request, call_fun, signer: signer()) ==
+               {:error, :invalid_tool_result}
+    end
+  end
+
+  describe "call/3 payment flow" do
+    test "signs and retries once with the payment in _meta" do
+      paid_result =
+        MCP.put_payment_response(@ok_result, %{"success" => true, "network" => @network})
+
+      call_fun = tracking_fun([payment_required_result(), paid_result])
+      signer = signer()
+
+      assert {:ok, %{result: result, payment_response: receipt, paid: true}} =
+               Client.call(@request, call_fun, signer: signer)
+
+      assert result == paid_result
+      assert receipt == %{"success" => true, "network" => @network}
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, retried}
+      assert retried["name"] == "premium_search"
+      assert retried["arguments"] == %{"query" => "x402"}
+
+      assert {:ok, payload} = MCP.fetch_payment(retried)
+      assert payload["x402Version"] == 2
+      assert payload["accepted"] == @requirements
+      assert payload["resource"] == @payment_required["resource"]
+
+      authorization = payload["payload"]["authorization"]
+      assert authorization["from"] == signer.address
+      assert authorization["to"] == @receiver
+      assert authorization["value"] == "10000"
+
+      assert {:ok, domain} = EIP3009.domain(@requirements)
+      assert {:ok, digest} = EIP3009.eip712_digest(domain, authorization)
+
+      assert EIP3009.recover_signer(digest, payload["payload"]["signature"]) ==
+               {:ok, signer.address}
+    end
+
+    test "detects payment-required results carried only in content text" do
+      text_only = %{
+        "isError" => true,
+        "content" => [%{"type" => "text", "text" => Jason.encode!(@payment_required)}]
+      }
+
+      call_fun = tracking_fun([text_only, @ok_result])
+
+      assert {:ok, %{result: @ok_result, paid: true}} =
+               Client.call(@request, call_fun, signer: signer())
+    end
+
+    test "detects payment-required JSON-RPC errors (402 and -32042)" do
+      error_402 = {:error, %{"code" => 402, "message" => "pay", "data" => @payment_required}}
+
+      assert {:ok, %{paid: true}} =
+               Client.call(@request, tracking_fun([error_402, @ok_result]), signer: signer())
+
+      elicitation =
+        {:error,
+         %{"code" => -32_042, "message" => "pay", "data" => %{"x402" => @payment_required}}}
+
+      assert {:ok, %{paid: true}} =
+               Client.call(@request, tracking_fun([elicitation, @ok_result]), signer: signer())
+    end
+
+    test "never pays twice: a second payment-required result is returned as-is" do
+      call_fun = tracking_fun([payment_required_result(), payment_required_result()])
+
+      assert {:ok, %{result: second, payment_response: nil, paid: true}} =
+               Client.call(@request, call_fun, signer: signer())
+
+      assert second["isError"] == true
+      assert_received {:tool_called, _first}
+      assert_received {:tool_called, _second}
+      refute_received {:tool_called, _third}
+    end
+
+    test "refuses to pay for requests that already carry a payment" do
+      request = MCP.put_payment(@request, %{"x402Version" => 2, "payload" => %{}})
+      call_fun = tracking_fun([payment_required_result()])
+
+      assert Client.call(request, call_fun, signer: signer()) ==
+               {:error, :payment_already_attempted}
+
+      assert_received {:tool_called, _first}
+      refute_received {:tool_called, _second}
+    end
+
+    test "the on_payment_required hook can cancel the payment" do
+      parent = self()
+      call_fun = tracking_fun([payment_required_result()])
+
+      hook = fn payment_required ->
+        send(parent, {:hook_called, payment_required})
+        :cancel
+      end
+
+      assert Client.call(@request, call_fun, signer: signer(), on_payment_required: hook) ==
+               {:error, :payment_cancelled}
+
+      assert_received {:hook_called, @payment_required}
+      assert_received {:tool_called, _first}
+      refute_received {:tool_called, _second}
+    end
+
+    test "any other hook return value continues the payment" do
+      call_fun = tracking_fun([payment_required_result(), @ok_result])
+
+      assert {:ok, %{paid: true}} =
+               Client.call(@request, call_fun,
+                 signer: signer(),
+                 on_payment_required: fn _payment_required -> :ok end
+               )
+    end
+
+    test "selection filters apply to the advertised requirements" do
+      call_fun = tracking_fun([payment_required_result()])
+
+      assert Client.call(@request, call_fun, signer: signer(), max_amount: "50") ==
+               {:error, :no_acceptable_requirements}
+    end
+
+    test "propagates transport errors on the retry" do
+      call_fun = tracking_fun([payment_required_result(), {:error, :closed}])
+
+      assert Client.call(@request, call_fun, signer: signer()) ==
+               {:error, {:transport_error, :closed}}
+    end
+  end
+
+  describe "build_payment_meta/3" do
+    test "builds the _meta entries from a PaymentRequired map" do
+      signer = signer()
+
+      assert {:ok, meta} = Client.build_payment_meta(@payment_required, signer)
+      assert %{"x402/payment" => payload} = meta
+      assert payload["accepted"] == @requirements
+    end
+
+    test "builds the _meta entries from a payment-required tool result" do
+      assert {:ok, %{"x402/payment" => payload}} =
+               Client.build_payment_meta(payment_required_result(), signer())
+
+      assert payload["accepted"] == @requirements
+    end
+
+    test "propagates selection errors" do
+      assert Client.build_payment_meta(@payment_required, signer(), max_amount: "1") ==
+               {:error, :no_acceptable_requirements}
+    end
+  end
+
+  describe "call/3 telemetry" do
+    test "emits [:x402, :mcp, :call]" do
+      handler_id = "mcp-client-test-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:x402, :mcp, :call],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Client.call(@request, tracking_fun([@ok_result]), signer: signer())
+
+      assert_received {:telemetry, [:x402, :mcp, :call], %{count: 1}, %{status: :ok, paid: false}}
+
+      Client.call(@request, tracking_fun([{:error, :timeout}]), signer: signer())
+
+      assert_received {:telemetry, [:x402, :mcp, :call], %{count: 1},
+                       %{status: :error, reason: {:transport_error, :timeout}}}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Full client ⇄ server loop
+  # ---------------------------------------------------------------------------
+
+  describe "client-server loop" do
+    setup do
+      facilitator =
+        start_supervised!(
+          {MockFacilitator,
+           owner: self(),
+           verify: {:ok, %{status: 200, body: %{"isValid" => true}}},
+           settle:
+             {:ok,
+              %{
+                status: 200,
+                body: %{
+                  "success" => true,
+                  "transaction" => "0x" <> String.duplicate("ab", 32),
+                  "network" => @network,
+                  "payer" => "0x3333333333333333333333333333333333333333"
+                }
+              }}}
+        )
+
+      cache =
+        start_supervised!({ETSCache, name: :"mcp_loop_#{System.unique_integer([:positive])}"})
+
+      config =
+        Server.init(
+          tool: "premium_search",
+          accepts: [
+            %{
+              price: "10000",
+              network: @network,
+              asset: @asset,
+              pay_to: @receiver,
+              max_timeout_seconds: 300,
+              extra: %{"name" => "USDC", "version" => "2"}
+            }
+          ],
+          facilitator: facilitator,
+          payment_identifier_cache: cache
+        )
+
+      %{config: config}
+    end
+
+    test "the client pays for a wrapped tool end to end", %{config: config} do
+      parent = self()
+      signer = signer()
+
+      handler = fn request ->
+        send(parent, {:handler_called, request})
+        @ok_result
+      end
+
+      call_fun = fn request ->
+        send(parent, {:tool_called, request})
+        Server.call(request, config, handler)
+      end
+
+      assert {:ok, %{result: result, payment_response: receipt, paid: true}} =
+               Client.call(@request, call_fun, signer: signer, max_amount: "10000")
+
+      assert result["content"] == [%{"type" => "text", "text" => "results"}]
+      assert receipt["success"] == true
+      assert receipt["transaction"] == "0x" <> String.duplicate("ab", 32)
+
+      # Exactly two tool calls: the unpaid probe and the paid retry.
+      assert_received {:tool_called, _first}
+      assert_received {:tool_called, _second}
+      refute_received {:tool_called, _third}
+
+      # The handler ran exactly once, for the paid call.
+      assert_received {:handler_called, _request}
+      refute_received {:handler_called, _request}
+
+      # The facilitator verified and settled the signed payment once.
+      assert_received {:verify_called, payload, requirements}
+      assert payload["payload"]["authorization"]["from"] == signer.address
+      assert requirements["payTo"] == @receiver
+      assert_received {:settle_called, _payload, _requirements}
+      refute_received {:verify_called, _payload, _requirements}
+    end
+
+    test "a rejected payment is surfaced without paying twice", %{config: config} do
+      facilitator =
+        start_supervised!(
+          {MockFacilitator,
+           owner: self(),
+           verify: {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "bad"}}},
+           settle: {:ok, %{status: 200, body: %{}}}},
+          id: :rejecting_facilitator
+        )
+
+      config = %{config | facilitator: facilitator}
+      parent = self()
+
+      call_fun = fn request ->
+        send(parent, {:tool_called, request})
+        Server.call(request, config, fn _request -> @ok_result end)
+      end
+
+      assert {:ok, %{result: result, payment_response: nil, paid: true}} =
+               Client.call(@request, call_fun, signer: signer())
+
+      # The retry's payment was rejected: the server re-advertises payment
+      # required and the client returns it as-is instead of signing again.
+      assert result["isError"] == true
+      assert result["structuredContent"]["error"] == "bad"
+
+      assert_received {:tool_called, _first}
+      assert_received {:tool_called, _second}
+      refute_received {:tool_called, _third}
+      assert_received {:verify_called, _payload, _requirements}
+      refute_received {:settle_called, _payload, _requirements}
+    end
+  end
+end
