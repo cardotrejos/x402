@@ -174,5 +174,23 @@ defmodule X402.Solana.TransactionTest do
       wire = <<1>> <> <<0::512>> <> bytes
       assert Transaction.decode(wire) == {:error, :invalid_transaction}
     end
+
+    test "treats signatures that are not 64 bytes as missing" do
+      wire = Transaction.serialize(compiled(), %{@client => "way too short"})
+      assert {:ok, decoded} = Transaction.decode(wire)
+      assert decoded.signatures == [<<0::512>>, <<0::512>>]
+    end
+
+    test "rejects non-binary input and truncated lookup sections" do
+      assert Transaction.decode(nil) == {:error, :invalid_transaction}
+
+      %{bytes: bytes} = compiled()
+      body_size = byte_size(bytes) - 1
+      <<body::binary-size(body_size), 0>> = bytes
+
+      # ALT count says 1 but only a single byte of the table follows.
+      truncated = <<2>> <> <<0::512>> <> <<0::512>> <> body <> <<1, 7>>
+      assert Transaction.decode(truncated) == {:error, :invalid_transaction}
+    end
   end
 end

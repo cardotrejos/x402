@@ -254,6 +254,47 @@ defmodule X402.Scheme.ExactSVMTest do
 
       assert ExactSVM.sign(requirements(%{"amount" => "-3"}), signer(), []) ==
                {:error, :invalid_amount}
+
+      assert ExactSVM.sign(requirements(%{"amount" => nil}), signer(), []) ==
+               {:error, :invalid_amount}
+    end
+
+    test "rejects invalid asset and payTo addresses" do
+      evm_address = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+
+      assert ExactSVM.sign(requirements(%{"asset" => evm_address}), signer(), []) ==
+               {:error, :invalid_asset}
+
+      assert ExactSVM.sign(requirements(%{"payTo" => evm_address}), signer(), []) ==
+               {:error, :invalid_pay_to}
+    end
+
+    test "rejects a malformed :svm_blockhash option" do
+      no_hint = requirements(%{"extra" => %{"feePayer" => @fee_payer}})
+
+      assert ExactSVM.sign(no_hint, signer(), svm_blockhash: "bogus") ==
+               {:error, :invalid_blockhash}
+    end
+
+    test "wraps a fetcher returning a bare value" do
+      no_hint = requirements(%{"extra" => %{"feePayer" => @fee_payer}})
+
+      assert ExactSVM.sign(no_hint, signer(), svm_blockhash_fetcher: fn _network -> :whoops end) ==
+               {:error, {:blockhash_fetch_failed, :whoops}}
+    end
+
+    test "known assets keep their table metadata under partial overrides" do
+      # Explicit token program with table decimals.
+      assert ExactSVM.sign(requirements(), signer(), svm_token_program: Solana.token_program()) ==
+               {:ok, %{"transaction" => @reference_transaction}}
+
+      # Explicit decimals with the table's token program.
+      assert ExactSVM.sign(requirements(), signer(), svm_decimals: 6) ==
+               {:ok, %{"transaction" => @reference_transaction}}
+    end
+
+    test "signable? requires a requirements map" do
+      refute ExactSVM.signable?(nil)
     end
   end
 
@@ -304,6 +345,16 @@ defmodule X402.Scheme.ExactSVMTest do
     test "skips the fee payer check when the requirements do not advertise one" do
       {payload, reqs} = signed_payload()
       assert ExactSVM.validate_payload(payload, Map.put(reqs, "extra", %{}), []) == :ok
+    end
+
+    test "treats a non-map scheme payload as a missing transaction" do
+      {_payload, reqs} = signed_payload()
+
+      assert ExactSVM.validate_payload(%{"payload" => "nope"}, reqs, []) ==
+               {:error, {:invalid_scheme_payment, :missing_transaction}}
+
+      assert ExactSVM.validate_payload(%{}, reqs, []) ==
+               {:error, {:invalid_scheme_payment, :missing_transaction}}
     end
   end
 
@@ -391,6 +442,51 @@ defmodule X402.Scheme.ExactSVMTest do
 
       assert ExactSVM.precheck(wire_payload(compiled), reqs, []) ==
                {:error, {:precheck_failed, :invalid_compute_limit_instruction}}
+    end
+
+    test "rejects a malformed compute price and a missing positional transfer" do
+      {_payload, reqs} = signed_payload()
+      [limit, price, transfer] = instructions_without_memo()
+
+      bogus_price = %{program: Solana.compute_budget_program(), accounts: [], data: <<9, 9>>}
+
+      {:ok, compiled} =
+        Transaction.compile(@fee_payer, [limit, bogus_price, transfer], @blockhash)
+
+      assert ExactSVM.precheck(wire_payload(compiled), reqs, []) ==
+               {:error, {:precheck_failed, :invalid_compute_price_instruction}}
+
+      {:ok, compiled} =
+        Transaction.compile(@fee_payer, [limit, price, Transaction.memo("x")], @blockhash)
+
+      assert ExactSVM.precheck(wire_payload(compiled), reqs, []) ==
+               {:error, {:precheck_failed, :missing_transfer_instruction}}
+    end
+
+    test "rejects two memo instructions when the seller pinned one" do
+      {_payload, reqs} = signed_payload()
+
+      {:ok, compiled} =
+        Transaction.compile(
+          @fee_payer,
+          instructions_without_memo() ++ [Transaction.memo(@memo), Transaction.memo("second")],
+          @blockhash
+        )
+
+      assert ExactSVM.precheck(wire_payload(compiled), reqs, []) ==
+               {:error, {:precheck_failed, :memo_count}}
+    end
+
+    test "skips semantic checks the requirements cannot back locally" do
+      {payload, reqs} = signed_payload()
+
+      uninterpretable =
+        reqs
+        |> Map.put("amount", "not-a-number")
+        |> Map.put("asset", "0xnot-solana")
+        |> Map.put("payTo", "0xnot-solana")
+
+      assert ExactSVM.precheck(payload, uninterpretable, []) == :ok
     end
 
     test "rejects a fee payer referenced by an instruction (isolation, spec 2.1.1)" do
