@@ -173,6 +173,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:extensions` option — client extension enrichers applied to the
   assembled payload (how gas-sponsoring data is attached opt-in)
 - `integration/e2e_server/` — resource-server component for the official x402 cross-language e2e interop harness (`X402.Plug.PaymentGate` + `X402.Facilitator` behind Bandit), including a ready-to-copy `e2e/servers/elixir/http/bandit/` tree for the foundation repo, the upstream patch list, and a local smoke suite (`verify.sh`)
+- MCP transport (report §8 P1.6): `X402.MCP` — library-agnostic pure
+  functions implementing the x402 MCP transport over plain tool-call
+  request/result maps (`_meta["x402/payment"]` payloads,
+  `_meta["x402/payment-response"]` receipts, payment-required results with
+  `structuredContent` + `content[0].text`, and `402`/`-32042` JSON-RPC
+  payment errors)
+- `X402.MCP.Server` — wraps any MCP tool handler with the
+  verify → execute → settle flow against `X402.Facilitator`, validating
+  payloads as strictly as `X402.Plug.PaymentGate` (v2 version check,
+  `accepted` matching, extension echo) with optional replay protection via
+  the same `payment_identifier_cache` option
+- `X402.MCP.Client` — drives any tool-call function through the
+  detect → sign → retry-once loop (never pays twice) with the same
+  `on_payment_required` veto hook and `max_amount` budget guard as
+  `X402.Client.Finch`, plus `build_payment_meta/3` for manual retries
+- `[:x402, :mcp, :payment_required | :payment_verified | :payment_rejected | :call]`
+  telemetry events
+- `guides/mcp.md` — "Paid MCP Tools in Elixir"
 
 ## [0.5.0] - 2026-08-26
 

@@ -118,6 +118,7 @@ defmodule X402.MixProject do
         "guides/getting-started.md": [title: "Getting Started"],
         "guides/client.md": [title: "Paying for Resources"],
         "guides/plug-integration.md": [title: "Plug/Phoenix Integration"],
+        "guides/mcp.md": [title: "Paid MCP Tools"],
         "guides/live-smoke-tests.md": [title: "Live Smoke Tests"]
       ],
       groups_for_extras: [
@@ -150,6 +151,11 @@ defmodule X402.MixProject do
         ],
         "Plug Integration": [
           X402.Plug.PaymentGate
+        ],
+        "MCP Transport": [
+          X402.MCP,
+          X402.MCP.Server,
+          X402.MCP.Client
         ],
         Utilities: [
           X402.Wallet
