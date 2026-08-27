@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the facilitator; payloads without an authorization object (other schemes,
   Permit2) and absent fields are skipped, so the facilitator remains the
   authority. (Ecosystem report §6.6.4/§8 P1.2.)
+- `X402.Plug.PaymentGate` `claim_order:` option (`:after_verify` |
+  `:before_verify`, default `:after_verify` — unchanged behavior). With
+  `:before_verify` the gate claims the payment proof before calling the
+  facilitator, rejecting replayed duplicates with 402 without any facilitator
+  round-trip, and releases the claim when verification fails for any reason;
+  release-on-handler-error and release-on-settle-failure semantics are
+  unchanged. Trade-off documented in the moduledoc: `:before_verify` sheds
+  replay-storm load from the facilitator, but a node crash during
+  verification strands the claim until the cache TTL expires, while
+  `:after_verify` never strands a claim on verification but pays one verify
+  call per replayed request
 - `put_new/3` callback on `X402.Extensions.PaymentIdentifier.Cache` — the
   atomic first-writer-wins claim used for replay protection is now part of the
   behaviour contract (TTL semantics and return values documented), so

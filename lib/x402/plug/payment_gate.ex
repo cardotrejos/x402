@@ -39,6 +39,26 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     the protected handler responds with a status >= 400 or settlement fails,
     so clients may retry a payment whose resource was never delivered.
 
+    The `:claim_order` option controls when the claim is taken relative to
+    facilitator verification:
+
+    * `:after_verify` (default) — the claim is taken only after the
+      facilitator has verified the proof. A replayed proof can never strand a
+      claim through verification, but **every** replayed request pays a full
+      facilitator verify round-trip before it is rejected, so a replay storm
+      translates directly into facilitator load.
+    * `:before_verify` — the claim is taken before contacting the
+      facilitator and released again if verification fails for any reason.
+      Duplicates are rejected locally without any facilitator call, which
+      sheds replay-storm load. The trade-off: a node that crashes between
+      claiming and releasing (now including the verify round-trip window)
+      strands the claim until the cache TTL expires, so a legitimate retry of
+      that same payment is rejected with 402 until then.
+
+    Both orderings keep the existing release semantics: the claim is released
+    when the handler responds with a status >= 400 or settlement fails, and a
+    duplicate claim is rejected with the same 402 duplicate-payment error.
+
     > #### Clustered deployments can serve one payment twice {: .warning}
     >
     > The default `X402.Extensions.PaymentIdentifier.ETSCache` adapter is
@@ -253,6 +273,20 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         for the clustering hazard.
         """
       ],
+      claim_order: [
+        type: {:in, [:after_verify, :before_verify]},
+        default: :after_verify,
+        doc: """
+        When the replay claim is taken relative to facilitator verification.
+        `:after_verify` (default) never strands a claim on verification but
+        pays a facilitator verify round-trip per replayed request;
+        `:before_verify` rejects duplicates before contacting the facilitator
+        (shedding replay-storm load) and releases the claim if verification
+        fails, at the cost that a node crash during verification strands the
+        claim until the cache TTL expires. Only meaningful when
+        `:payment_identifier_cache` is configured.
+        """
+      ],
       routes: [
         type: {:list, {:custom, __MODULE__, :validate_route, []}},
         required: true,
@@ -274,11 +308,15 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       ]
     ]
 
+    @typedoc "Claim ordering relative to facilitator verification."
+    @type claim_order :: :after_verify | :before_verify
+
     @typedoc "Configuration map produced by `init/1`."
     @type options :: %{
             facilitator: Facilitator.server(),
             hooks: module(),
             payment_identifier_cache: Cache.adapter() | nil,
+            claim_order: claim_order(),
             routes: [compiled_route()],
             local_prechecks: boolean()
           }
@@ -418,6 +456,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         facilitator: Keyword.fetch!(validated_opts, :facilitator),
         hooks: Keyword.fetch!(validated_opts, :hooks),
         payment_identifier_cache: cache,
+        claim_order: Keyword.fetch!(validated_opts, :claim_order),
         routes:
           validated_opts
           |> Keyword.fetch!(:routes)
@@ -460,8 +499,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     Gates matching requests behind x402 v2 payment verification.
     """
     @spec call(Plug.Conn.t(), options()) :: Plug.Conn.t()
-    def call(%Plug.Conn{} = conn, %{routes: routes} = options) do
-      if is_nil(options.payment_identifier_cache), do: warn_no_idempotency_cache_once()
+    def call(%Plug.Conn{} = conn, %{routes: routes} = opts) do
+      if is_nil(opts.payment_identifier_cache), do: warn_no_idempotency_cache_once()
 
       request_path = decoded_request_path(conn)
       request_method = normalize_method(conn.method)
@@ -472,13 +511,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           conn
 
         route ->
-          handle_payment_gate(conn, options, route, request_method, request_path)
+          handle_payment_gate(conn, opts, route, request_method, request_path)
       end
     end
 
     @spec handle_payment_gate(Plug.Conn.t(), options(), compiled_route(), atom(), String.t()) ::
             Plug.Conn.t()
-    defp handle_payment_gate(conn, options, route, request_method, request_path) do
+    defp handle_payment_gate(conn, opts, route, request_method, request_path) do
       case payment_header(conn) do
         :missing ->
           emit(:payment_required, %{method: request_method, path: request_path, route: route.path})
@@ -492,14 +531,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           )
 
         {:ok, header} ->
-          verify_and_prepare_settlement(
-            conn,
-            options,
-            route,
-            request_method,
-            request_path,
-            header
-          )
+          verify_and_prepare_settlement(conn, opts, route, request_method, request_path, header)
 
         {:error, reason} ->
           emit(:payment_rejected, %{
@@ -528,27 +560,18 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             String.t(),
             String.t()
           ) :: Plug.Conn.t()
-    defp verify_and_prepare_settlement(conn, options, route, request_method, request_path, header) do
-      %{
-        facilitator: facilitator,
-        hooks: hooks,
-        payment_identifier_cache: payment_identifier_cache
-      } = options
-
+    defp verify_and_prepare_settlement(conn, opts, route, request_method, request_path, header) do
       accepts = route_accepts(route)
       payment_id = :crypto.hash(:sha256, header) |> Base.encode16(case: :lower)
 
       with {:ok, payment_payload, requirements} <-
              decode_and_validate_payment(header, accepts, route.extensions),
-           :ok <- run_local_prechecks(options.local_prechecks, payment_payload, requirements),
-           {:ok, verify_response} <-
-             facilitator_verify(facilitator, payment_payload, requirements, hooks),
-           :ok <- ensure_verify_success(verify_response),
-           :ok <- claim_payment(payment_identifier_cache, payment_id) do
+           :ok <- run_local_prechecks(opts.local_prechecks, payment_payload, requirements),
+           :ok <- claim_and_verify(opts, payment_id, payment_payload, requirements) do
         settlement_context = %{
-          facilitator: facilitator,
-          hooks: hooks,
-          payment_identifier_cache: payment_identifier_cache,
+          facilitator: opts.facilitator,
+          hooks: opts.hooks,
+          payment_identifier_cache: opts.payment_identifier_cache,
           payment_id: payment_id,
           payment_payload: payment_payload,
           requirements: requirements,
@@ -811,6 +834,47 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
         {:error, reason} ->
           {:error, reason, nil}
+      end
+    end
+
+    # Orders the replay claim relative to facilitator verification.
+    #
+    # :after_verify — verify first, then claim. Verification failures never
+    # touch the cache, but replayed requests pay a verify round-trip each.
+    #
+    # :before_verify — claim first, rejecting duplicates without contacting
+    # the facilitator; release the claim when verification fails for any
+    # reason so the payer can retry.
+    @spec claim_and_verify(options(), String.t(), map(), map()) :: :ok | {:error, term()}
+    defp claim_and_verify(%{claim_order: :after_verify} = opts, payment_id, payload, requirements) do
+      with :ok <- verify_payment(opts, payload, requirements) do
+        claim_payment(opts.payment_identifier_cache, payment_id)
+      end
+    end
+
+    defp claim_and_verify(
+           %{claim_order: :before_verify} = opts,
+           payment_id,
+           payload,
+           requirements
+         ) do
+      with :ok <- claim_payment(opts.payment_identifier_cache, payment_id) do
+        case verify_payment(opts, payload, requirements) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            release_claim(opts.payment_identifier_cache, payment_id)
+            {:error, reason}
+        end
+      end
+    end
+
+    @spec verify_payment(options(), map(), map()) :: :ok | {:error, term()}
+    defp verify_payment(opts, payment_payload, requirements) do
+      with {:ok, verify_response} <-
+             facilitator_verify(opts.facilitator, payment_payload, requirements, opts.hooks) do
+        ensure_verify_success(verify_response)
       end
     end
 

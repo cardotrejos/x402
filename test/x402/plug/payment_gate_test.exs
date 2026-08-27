@@ -1040,6 +1040,250 @@ defmodule X402.Plug.PaymentGateTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Claim ordering relative to facilitator verification
+  # ---------------------------------------------------------------------------
+
+  describe "claim_order" do
+    test "defaults to :after_verify" do
+      assert %{claim_order: :after_verify} = PaymentGate.init(routes: [@route])
+    end
+
+    test "init/1 rejects invalid claim_order values" do
+      assert_raise NimbleOptions.ValidationError, ~r/claim_order/, fn ->
+        PaymentGate.init(routes: [@route], claim_order: :sometimes)
+      end
+    end
+
+    test ":after_verify claims only after the facilitator verified" do
+      facilitator = start_mock_facilitator()
+
+      expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified ->
+        # The verify round-trip must already have completed when the claim runs.
+        assert_received {:verify_called, _, _, _}
+        :ok
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref},
+          claim_order: :after_verify
+        )
+
+      assert conn.status == 200
+    end
+
+    test ":after_verify never touches the cache when verification fails" do
+      facilitator =
+        start_mock_facilitator(
+          verify:
+            {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "declined"}}}
+        )
+
+      # No CacheMock expectations: any adapter call would raise UnexpectedCallError.
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+
+      assert conn.status == 402
+    end
+
+    test ":before_verify claims before contacting the facilitator" do
+      facilitator = start_mock_facilitator()
+
+      expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified ->
+        # The claim must run before any facilitator verify round-trip.
+        refute_received {:verify_called, _, _, _}
+        :ok
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref},
+          claim_order: :before_verify
+        )
+
+      assert conn.status == 200
+      assert_receive {:verify_called, _, _, _}
+      assert_receive {:settle_called, _, _, _}
+    end
+
+    test ":before_verify releases the claim when verification is rejected" do
+      facilitator =
+        start_mock_facilitator(
+          verify:
+            {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "declined"}}}
+        )
+
+      parent = self()
+
+      expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified -> :ok end)
+
+      expect(CacheMock, :delete, fn :mock_ref, payment_id ->
+        send(parent, {:adapter_delete, payment_id})
+        :ok
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref},
+          claim_order: :before_verify
+        )
+
+      assert conn.status == 402
+      assert_receive {:adapter_delete, _payment_id}
+      refute_received {:settle_called, _, _, _}
+    end
+
+    test ":before_verify releases the claim on facilitator transport errors" do
+      error = %Error{type: :transport_error, reason: :closed, retryable: true}
+      facilitator = start_mock_facilitator(verify: {:error, error})
+      parent = self()
+
+      expect(CacheMock, :put_new, fn :mock_ref, _payment_id, :verified -> :ok end)
+
+      expect(CacheMock, :delete, fn :mock_ref, payment_id ->
+        send(parent, {:adapter_delete, payment_id})
+        :ok
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref},
+          claim_order: :before_verify
+        )
+
+      assert conn.status == 500
+      assert_receive {:adapter_delete, _payment_id}
+    end
+
+    test ":before_verify allows a retry after a failed verification" do
+      reject =
+        start_mock_facilitator(
+          verify:
+            {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "declined"}}}
+        )
+
+      accept = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      header = valid_payment_header()
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(
+          routes: [@route],
+          facilitator: reject,
+          payment_identifier_cache: cache,
+          claim_order: :before_verify
+        )
+
+      assert first.status == 402
+
+      retry =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(
+          routes: [@route],
+          facilitator: accept,
+          payment_identifier_cache: cache,
+          claim_order: :before_verify
+        )
+
+      assert retry.status == 200
+      assert_receive {:settle_called, _, _, _}
+    end
+
+    test ":before_verify rejects a duplicate without any facilitator call" do
+      bypass = Bypass.open()
+      finch = String.to_atom("payment_gate_finch_#{System.unique_integer([:positive])}")
+
+      facilitator_name =
+        String.to_atom("payment_gate_facilitator_#{System.unique_integer([:positive])}")
+
+      start_supervised!({Finch, name: finch})
+
+      # expect_once fails the test if either endpoint is hit more than once,
+      # proving the duplicate request below causes zero facilitator calls.
+      Bypass.expect_once(bypass, "POST", "/verify", fn bypass_conn ->
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{"isValid" => true, "payer" => @receiver})
+        )
+      end)
+
+      Bypass.expect_once(bypass, "POST", "/settle", fn bypass_conn ->
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{
+            "success" => true,
+            "transaction" => "0xsettled",
+            "network" => @network,
+            "payer" => @receiver
+          })
+        )
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: facilitator_name,
+           finch: finch,
+           url: "http://localhost:#{bypass.port}",
+           max_retries: 0}
+        )
+
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      header = valid_payment_header()
+
+      opts = [
+        routes: [@route],
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(opts)
+
+      assert first.status == 200
+      assert decode_payment_response!(first)["success"] == true
+
+      duplicate =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(opts)
+
+      assert duplicate.status == 402
+      assert decode_payment_required!(duplicate)["error"] == "payment already processed"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Replay protection through the Cache behaviour
   # ---------------------------------------------------------------------------
 
