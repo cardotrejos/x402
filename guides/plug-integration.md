@@ -194,6 +194,32 @@ verification and before the handler. A handler error or failed settlement
 releases the claim; a successful settlement retains it. If the claim fails
 (duplicate), the request is rejected with `"payment already processed"`.
 
+The ETS cache is per-node: in a clustered deployment each node keeps its own
+table, so a replayed proof routed to two nodes is served once per node. For
+clusters, use the Redis adapter (requires the optional `redix` dependency;
+you supervise the connection):
+
+```elixir
+# In your supervision tree
+children = [
+  {Redix, {System.fetch_env!("REDIS_URL"), name: MyApp.Redis}},
+  # ... other children
+]
+
+# In your plug config
+{:ok, cache} = X402.Extensions.PaymentIdentifier.RedisCache.new(conn: MyApp.Redis)
+
+plug X402.Plug.PaymentGate,
+  facilitator: MyApp.Facilitator,
+  payment_identifier_cache: {X402.Extensions.PaymentIdentifier.RedisCache, cache},
+  routes: [...]
+```
+
+The claim is a single `SET NX PX` command, so it stays atomic across all
+nodes; Redis or connection errors fail closed (the protected handler does not
+run). Configure the Redis server with `maxmemory-policy noeviction` so live
+claims are never evicted.
+
 ## Conn Assigns
 
 After successful verification, the Plug assigns these to the connection before
