@@ -1524,8 +1524,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
       case paywall.render(required_payload, conn_info) do
         {:ok, html} ->
+          # The paywall exposes a one-click wallet-signature flow; deny
+          # framing so a third-party page cannot overlay it and clickjack an
+          # EIP-3009 authorization.
           conn
           |> put_resp_content_type("text/html")
+          |> put_resp_header("x-frame-options", "DENY")
+          |> put_resp_header("content-security-policy", "frame-ancestors 'none'")
           |> resp(402, html)
 
         {:error, reason} ->

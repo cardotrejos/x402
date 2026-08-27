@@ -1985,6 +1985,21 @@ defmodule X402.Plug.PaymentGateTest do
       assert conn.resp_body =~ @asset
     end
 
+    test "denies framing on the HTML paywall (clickjacking defense)" do
+      conn =
+        conn(:get, "/api/resource")
+        |> browser_conn()
+        |> run_request(routes: [@route], facilitator: self(), paywall: X402.Paywall.Default)
+
+      assert get_resp_header(conn, "x-frame-options") == ["DENY"]
+      assert get_resp_header(conn, "content-security-policy") == ["frame-ancestors 'none'"]
+
+      # JSON 402s keep their existing header surface.
+      json = run_request(conn(:get, "/api/resource"), routes: [@route], facilitator: self())
+      assert get_resp_header(json, "x-frame-options") == []
+      assert get_resp_header(json, "content-security-policy") == []
+    end
+
     test "serves HTML for a bare text/html Accept with a Mozilla User-Agent" do
       conn =
         conn(:get, "/api/resource")

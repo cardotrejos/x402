@@ -214,7 +214,17 @@ defmodule X402.Paywall.Default do
     async function deliver(response) {
       var contentType = response.headers.get("content-type") || "";
       var text = await response.text();
-      if (contentType.indexOf("text/html") === 0) {
+      var sameOrigin = false;
+      try {
+        sameOrigin = new URL(response.url).origin === window.location.origin;
+      } catch (error) {
+        sameOrigin = false;
+      }
+      // Only replace the document with HTML that is same-origin and was not
+      // reached through a redirect: document.write executes the body as the
+      // CURRENT origin, so a followed redirect to attacker-readable HTML
+      // would run as first-party script on the gated host.
+      if (contentType.indexOf("text/html") === 0 && sameOrigin && !response.redirected) {
         document.open();
         document.write(text);
         document.close();
@@ -252,7 +262,19 @@ defmodule X402.Paywall.Default do
           throw new Error(paymentError(response) || "Payment failed with status " + response.status + ".");
         }
         setStatus("Payment accepted. Loading content…");
-        await deliver(response);
+        // The payment has settled: a failure from here on must never
+        // re-enable the pay button — a retry would sign a fresh nonce and
+        // settle a second payment for the same page view.
+        try {
+          await deliver(response);
+        } catch (error) {
+          setStatus(
+            "Payment accepted, but the content could not be displayed. " +
+              "Do not pay again — refresh or contact the site with your receipt.",
+            "error"
+          );
+        }
+        return;
       } catch (error) {
         var message = error && error.message ? error.message : "Payment failed.";
         if (error && error.code === 4001) {

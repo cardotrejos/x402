@@ -150,5 +150,23 @@ defmodule X402.Paywall.DefaultTest do
       refute html =~ "@import"
       assert byte_size(html) < 16_384
     end
+
+    test "guards content delivery against cross-origin and redirected HTML" do
+      assert {:ok, html} = Default.render(payment_required(), @conn_info)
+
+      # document.write executes as the current origin — the script must gate
+      # it on same-origin, non-redirected responses (security review finding).
+      assert html =~ "response.redirected"
+      assert html =~ "window.location.origin"
+      assert html =~ ~r/sameOrigin && !response\.redirected/
+    end
+
+    test "never re-enables payment after a settled payment fails to display" do
+      assert {:ok, html} = Default.render(payment_required(), @conn_info)
+
+      # A deliver() failure after response.ok must not re-enable the pay
+      # button — a retry would sign a fresh nonce and settle a second payment.
+      assert html =~ "Do not pay again"
+    end
   end
 end
