@@ -122,6 +122,7 @@ defmodule X402.MixProject do
         "guides/getting-started.md": [title: "Getting Started"],
         "guides/client.md": [title: "Paying for Resources"],
         "guides/plug-integration.md": [title: "Plug/Phoenix Integration"],
+        "guides/custom-schemes.md": [title: "Custom Payment Schemes"],
         "guides/mcp.md": [title: "Paid MCP Tools"],
         "guides/paywall.md": [title: "Browser Paywall"],
         "guides/live-smoke-tests.md": [title: "Live Smoke Tests"]
@@ -158,6 +159,13 @@ defmodule X402.MixProject do
           X402.Plug.PaymentGate,
           X402.Paywall,
           X402.Paywall.Default
+        ],
+        "Payment Schemes": [
+          X402.Scheme,
+          X402.Scheme.Registry,
+          X402.Scheme.ExactEVM,
+          X402.Scheme.UptoEVM,
+          X402.Scheme.EVM
         ],
         "MCP Transport": [
           X402.MCP,

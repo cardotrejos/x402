@@ -45,6 +45,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot inject markup. A renderer returning `{:error, reason}` logs a
   warning and falls back to the JSON body. See the new "Browser Paywall"
   guide.
+- **`X402.Scheme` behaviour — pluggable payment schemes** (ecosystem report
+  §5.3.1/§8 P1.1): everything scheme-specific now dispatches through one
+  behaviour, so adding a chain or scheme means writing one module and
+  passing it as an option instead of editing core modules. Callbacks:
+  `scheme/0` and `networks/0` (metadata — CAIP-2 patterns with trailing-`*`
+  wildcards), `sign/3` and the optional `signable?/1` (client side),
+  `validate_payload/3` and `precheck/3` (server side). Resolution lives in
+  `X402.Scheme.Registry` (exact CAIP-2 match beats wildcard, longest
+  wildcard prefix wins, user modules beat built-ins) and is seeded with
+  `X402.Scheme.ExactEVM` (`exact` on `eip155:*`, EIP-3009 signing plus the
+  existing local pre-checks) and `X402.Scheme.UptoEVM` (`upto` on
+  `eip155:*`, the existing ceiling validation) — extracted from
+  `X402.Client`, `X402.Plug.PaymentGate`, and `X402.PaymentSignature`
+  with unchanged external behavior. Custom schemes register via the new
+  `schemes:` option on `X402.Plug.PaymentGate` (routes may then use the
+  registered scheme names), `X402.Client.build_payment/3` /
+  `select_requirements/2`, `X402.Client.Finch.request/3`, and the new
+  `X402.PaymentSignature.validate/3` / `decode_and_validate/3` — no
+  application environment, no global registration. Kinds with no
+  registered module keep their historical behavior: validation passes
+  through, the gate skips pre-checks, and the client returns
+  `{:error, {:unsupported_kind, scheme, network}}`. Scheme
+  `validate_payload/3` failures shaped `{:invalid_scheme_payment, reason}`
+  are answered with HTTP 400 by the gate. Shared EVM authorization
+  pre-checks are reusable via `X402.Scheme.EVM.authorization_precheck/3`.
+  See the new Custom Payment Schemes guide
 - **Local pre-verification checks in `X402.Plug.PaymentGate`** (option
   `local_prechecks:`, default `true`): before the facilitator round-trip, the
   gate now validates the EIP-3009-style `payload.authorization` object against

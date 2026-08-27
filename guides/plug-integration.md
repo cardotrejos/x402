@@ -45,7 +45,7 @@ plug X402.Plug.PaymentGate,
 | `:method` | `atom()` | **yes** | HTTP method (`:get`, `:post`, `:put`, `:delete`, `:patch`, `:head`, `:options`, `:trace`, or `:any` for all) |
 | `:path` | `String.t()` | **yes** | Route path. Exact matches (`/api/data`) or glob patterns (`/api/*`) |
 | `:accepts` | `[map()]` | no | Multiple payment options (see "Multiple Accepts" below) |
-| `:scheme` | `String.t()` | no | `"exact"` (default) or `"upto"` |
+| `:scheme` | `String.t()` | no | `"exact"` (default), `"upto"`, or the scheme name of a module passed in the plug's `:schemes` option — see the [Custom Payment Schemes](custom-schemes.md) guide |
 | `:price` | `String.t()` | conditionally | Payment amount in atomic token units. Required when `:accepts` is empty |
 | `:network` | `String.t()` | conditionally | CAIP-2 network identifier (e.g. `"eip155:8453"`) |
 | `:asset` | `String.t()` | conditionally | Token contract address |

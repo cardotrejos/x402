@@ -9,9 +9,11 @@ defmodule X402.Client do
   own HTTP client, or use `X402.Client.Finch` for a ready-made
   402 → sign → retry flow.
 
-  This release signs the `exact` scheme on EVM (`eip155:*`) networks via
-  EIP-3009 (`X402.EIP3009`); other scheme/network combinations return
-  `{:error, {:unsupported_kind, scheme, network}}`.
+  Signing dispatches through `X402.Scheme.Registry`: out of the box this
+  client signs the `exact` scheme on EVM (`eip155:*`) networks via EIP-3009
+  (`X402.Scheme.ExactEVM`); other scheme/network combinations return
+  `{:error, {:unsupported_kind, scheme, network}}` unless a matching
+  `X402.Scheme` module is passed with the `:schemes` option.
 
   ## Example
 
@@ -26,6 +28,7 @@ defmodule X402.Client do
 
   alias X402.EIP3009
   alias X402.PaymentRequirements
+  alias X402.Scheme
   alias X402.Signer
   alias X402.Telemetry
   alias X402.Utils
@@ -51,6 +54,15 @@ defmodule X402.Client do
       doc: """
       Only select requirements whose `amount` (in atomic units) does not
       exceed this value — the budget guard for automated payers.
+      """
+    ],
+    schemes: [
+      type: {:list, {:custom, Scheme, :validate_module, []}},
+      default: [],
+      doc: """
+      Additional `X402.Scheme` modules consulted (before the built-ins) when
+      deciding which requirements this client can sign and how to sign
+      them — see `X402.Scheme.Registry`.
       """
     ]
   ]
@@ -85,7 +97,8 @@ defmodule X402.Client do
           network: String.t(),
           scheme: String.t(),
           asset: String.t(),
-          max_amount: String.t() | non_neg_integer()
+          max_amount: String.t() | non_neg_integer(),
+          schemes: [module()]
         ]
 
   @type select_error :: :no_acceptable_requirements | :invalid_payment_required
@@ -103,10 +116,12 @@ defmodule X402.Client do
 
   Accepts a decoded `PaymentRequired` map (its `accepts` list is used) or a
   bare list of requirements maps. Returns the first entry that passes the
-  option filters **and** that this client can sign: `exact` scheme on an
-  `eip155:*` network, structurally valid per
-  `X402.PaymentRequirements.validate/1`, with the EIP-712 domain fields
-  (`extra.name` / `extra.version`) present.
+  option filters **and** that this client can sign: structurally valid per
+  `X402.PaymentRequirements.validate/1` and resolved by
+  `X402.Scheme.Registry` to a scheme module with a sign callback — by
+  default `exact` on an `eip155:*` network via `X402.Scheme.ExactEVM`,
+  which additionally requires the EIP-712 domain fields (`extra.name` /
+  `extra.version`). Pass additional schemes with the `:schemes` option.
 
   The selected entry is returned exactly as the server sent it, so it can be
   echoed verbatim as the payload's `accepted` value.
@@ -138,11 +153,12 @@ defmodule X402.Client do
           {:ok, map()} | {:error, select_error()}
   def select_requirements(payment_required, opts \\ []) do
     opts = NimbleOptions.validate!(opts, @select_opts_schema)
+    schemes = Keyword.fetch!(opts, :schemes)
 
     with {:ok, accepts} <- fetch_accepts(payment_required) do
       accepts
       |> Enum.filter(&(is_map(&1) and matches_filters?(&1, opts)))
-      |> Enum.find(&supported?/1)
+      |> Enum.find(&supported?(&1, schemes))
       |> case do
         nil ->
           Telemetry.emit(:client, :select, :error, %{reason: :no_acceptable_requirements})
@@ -176,9 +192,13 @@ defmodule X402.Client do
   example `X402.Extensions.EIP2612GasSponsoring.enricher/2` for
   gas-sponsored Permit2 approvals.
 
-  Signing dispatches on the scheme and network of the chosen requirements;
-  this release supports `exact` on `eip155:*` networks (EIP-3009). Other
-  combinations return `{:error, {:unsupported_kind, scheme, network}}`.
+  Signing dispatches on the scheme and network of the chosen requirements
+  through `X402.Scheme.Registry`; out of the box this supports `exact` on
+  `eip155:*` networks (EIP-3009). Other combinations return
+  `{:error, {:unsupported_kind, scheme, network}}` unless a matching
+  module is passed with the `:schemes` option. Scheme modules receive the
+  validated build options, so options like `:valid_after_buffer` reach
+  `c:X402.Scheme.sign/3`.
 
   ## Options
 
@@ -296,19 +316,23 @@ defmodule X402.Client do
     end
   end
 
-  @spec supported?(map()) :: boolean()
-  defp supported?(requirements) do
+  @spec supported?(map(), [module()]) :: boolean()
+  defp supported?(requirements, schemes) do
     PaymentRequirements.validate(requirements) == :ok and
-      supported_kind?(
-        Utils.map_value(requirements, {"scheme", :scheme}),
-        Utils.map_value(requirements, {"network", :network})
-      ) and
-      match?({:ok, _domain}, EIP3009.domain(requirements))
+      case resolve_scheme(requirements, schemes) do
+        {:ok, module} -> Scheme.signs?(module) and Scheme.signable?(module, requirements)
+        :error -> false
+      end
   end
 
-  @spec supported_kind?(term(), term()) :: boolean()
-  defp supported_kind?("exact", "eip155:" <> _chain_id), do: true
-  defp supported_kind?(_scheme, _network), do: false
+  @spec resolve_scheme(map(), [module()]) :: {:ok, module()} | :error
+  defp resolve_scheme(requirements, schemes) do
+    Scheme.Registry.resolve(
+      schemes,
+      Utils.map_value(requirements, {"scheme", :scheme}),
+      Utils.map_value(requirements, {"network", :network})
+    )
+  end
 
   # -- Payload assembly -------------------------------------------------------
 
@@ -346,9 +370,10 @@ defmodule X402.Client do
     scheme = Utils.map_value(requirements, {"scheme", :scheme})
     network = Utils.map_value(requirements, {"network", :network})
 
-    if supported_kind?(scheme, network) do
-      case EIP3009.sign(requirements, signer, valid_after_buffer: opts[:valid_after_buffer]) do
-        {:ok, scheme_payload} ->
+    with {:ok, module} <- resolve_scheme(requirements, Keyword.fetch!(opts, :schemes)),
+         true <- Scheme.signs?(module) do
+      case module.sign(requirements, signer, opts) do
+        {:ok, scheme_payload} when is_map(scheme_payload) ->
           Telemetry.emit(:client, :sign, :ok, %{scheme: scheme, network: network})
           {:ok, scheme_payload}
 
@@ -360,15 +385,27 @@ defmodule X402.Client do
           })
 
           error
+
+        other ->
+          reason = {:invalid_scheme_payload, other}
+
+          Telemetry.emit(:client, :sign, :error, %{
+            reason: reason,
+            scheme: scheme,
+            network: network
+          })
+
+          {:error, reason}
       end
     else
-      Telemetry.emit(:client, :sign, :error, %{
-        reason: :unsupported_kind,
-        scheme: scheme,
-        network: network
-      })
+      _unsupported ->
+        Telemetry.emit(:client, :sign, :error, %{
+          reason: :unsupported_kind,
+          scheme: scheme,
+          network: network
+        })
 
-      {:error, {:unsupported_kind, scheme, network}}
+        {:error, {:unsupported_kind, scheme, network}}
     end
   end
 
