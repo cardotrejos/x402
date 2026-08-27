@@ -4,6 +4,7 @@ defmodule X402.Scheme.UptoEVMTest do
   doctest X402.Scheme.UptoEVM
 
   alias X402.Scheme.UptoEVM
+  alias X402.Signer.LocalKey
 
   @requirements %{
     "scheme" => "upto",
@@ -42,7 +43,7 @@ defmodule X402.Scheme.UptoEVMTest do
 
   describe "sign/3" do
     test "signs the Permit2 upto payload through X402.Permit2" do
-      {:ok, signer} = X402.Signer.LocalKey.new("0x" <> String.duplicate("11", 32))
+      {:ok, signer} = LocalKey.new("0x" <> String.duplicate("11", 32))
 
       requirements = %{
         "scheme" => "upto",
