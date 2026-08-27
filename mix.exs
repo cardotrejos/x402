@@ -78,6 +78,10 @@ defmodule X402.MixProject do
       {:ex_secp256k1, "~> 0.8.0", optional: true},
       {:ex_keccak, "~> 0.7.8", optional: true},
 
+      # Redis client (optional — only needed for the Redis payment
+      # identifier cache adapter; users supervise the connection)
+      {:redix, "~> 1.5", optional: true},
+
       # Documentation
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
 
@@ -164,6 +168,11 @@ defmodule X402.MixProject do
           X402.Extensions.Bazaar,
           X402.Extensions.EIP2612GasSponsoring,
           X402.Extensions.ERC20ApprovalGasSponsoring,
+          X402.Extensions.PaymentIdentifier,
+          X402.Extensions.PaymentIdentifier.Cache,
+          X402.Extensions.PaymentIdentifier.ETSCache,
+          X402.Extensions.PaymentIdentifier.RedisCache,
+          X402.Extensions.PaymentIdentifier.RedisCache.Command,
           X402.Extensions.SIWX,
           X402.Extensions.SIWX.Verifier,
           X402.Extensions.SIWX.Verifier.Default,

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `X402.Extensions.PaymentIdentifier.RedisCache` — a Redis-backed
+  `X402.Extensions.PaymentIdentifier.Cache` adapter for clustered
+  deployments (ROADMAP P1.3b), over the **new optional `redix` dependency**.
+  The replay-protection claim is a single atomic `SET key value NX PX ttl`,
+  so a replayed payment proof is claimed exactly once across all nodes;
+  expiry is server-side (an expired claim never blocks a retry), live claims
+  are never evicted by the adapter, and connection/Redis errors surface as
+  `{:error, reason}` so `X402.Plug.PaymentGate` fails closed. The adapter
+  does not own the connection — users supervise `Redix` themselves and pass
+  the pid/name to `RedisCache.new/1` (`:ttl_ms`, `:namespace`, and an
+  injectable `:command` module implementing
+  `X402.Extensions.PaymentIdentifier.RedisCache.Command` for testing without
+  a live server). A live conformance suite tagged `:redis` (excluded by
+  default) runs against `REDIS_URL`
 - **Local pre-verification checks in `X402.Plug.PaymentGate`** (option
   `local_prechecks:`, default `true`): before the facilitator round-trip, the
   gate now validates the EIP-3009-style `payload.authorization` object against

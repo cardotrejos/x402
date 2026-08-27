@@ -26,13 +26,18 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   > resource has already been served twice.
   >
   > If you run more than one node, supply an adapter backed by a shared store
-  > (Redis, Mnesia, your database) instead of the default ETS adapter.
+  > instead of the default ETS adapter — the bundled
+  > `X402.Extensions.PaymentIdentifier.RedisCache` (over the optional `redix`
+  > dependency), or your own Mnesia- or database-backed implementation.
 
   ## Writing a distributed adapter
 
   `c:put_new/3` must combine "insert if absent" and "expire after TTL" in a
   single atomic operation of the backing store. In Redis that operation is
-  `SET key value NX PX ttl`. A minimal adapter sketch:
+  `SET key value NX PX ttl` — the bundled
+  `X402.Extensions.PaymentIdentifier.RedisCache` adapter implements exactly
+  this contract over a `Redix` connection you supervise. For a different
+  backing store, a minimal adapter sketch:
 
       defmodule MyApp.RedisPaymentCache do
         @behaviour X402.Extensions.PaymentIdentifier.Cache
