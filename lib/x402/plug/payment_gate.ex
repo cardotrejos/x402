@@ -30,6 +30,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     and
     [HTTP transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/http.md).
 
+    ## Browser paywall
+
+    With `paywall: X402.Paywall.Default` (or any `X402.Paywall`
+    implementation), pre-handler 402 responses to browser page loads —
+    `Accept` containing `text/html` and `User-Agent` containing `Mozilla`,
+    the heuristic shared by the reference x402 middlewares — carry a
+    human-usable HTML page instead of the `{}` JSON body. The
+    `PAYMENT-REQUIRED` header is identical on both forms and all other
+    responses are unchanged. See the "Browser Paywall" guide.
+
     ## Replay protection
 
     When `:payment_identifier_cache` is configured, the gate claims the SHA-256
@@ -82,6 +92,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     alias X402.PaymentRequirements
     alias X402.PaymentResponse
     alias X402.PaymentSignature
+    alias X402.Paywall
     alias X402.Utils
 
     require Logger
@@ -305,6 +316,22 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         pass through untouched. Failures answer 402 without a facilitator
         round-trip.
         """
+      ],
+      paywall: [
+        type: {:or, [nil, {:custom, Paywall, :validate_module, []}]},
+        default: nil,
+        doc: """
+        Optional browser paywall renderer implementing `X402.Paywall`
+        (`X402.Paywall.Default` ships a self-contained wallet-enabled page).
+        When set, pre-handler 402 responses to requests that look like a
+        browser page load — `Accept` header containing `text/html` **and**
+        `User-Agent` containing `Mozilla`, mirroring the reference x402
+        middlewares — carry the rendered HTML body instead of the default
+        `{}` JSON body. The `PAYMENT-REQUIRED` header is identical on both
+        forms, and every other response (API clients, absent `Accept`
+        headers, 400/500 statuses, post-handler settlement failures) is
+        byte-identical to running without `:paywall`.
+        """
       ]
     ]
 
@@ -318,7 +345,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             payment_identifier_cache: Cache.adapter() | nil,
             claim_order: claim_order(),
             routes: [compiled_route()],
-            local_prechecks: boolean()
+            local_prechecks: boolean(),
+            paywall: module() | nil
           }
 
     @typedoc false
@@ -461,7 +489,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           validated_opts
           |> Keyword.fetch!(:routes)
           |> Enum.map(&compile_route/1),
-        local_prechecks: Keyword.fetch!(validated_opts, :local_prechecks)
+        local_prechecks: Keyword.fetch!(validated_opts, :local_prechecks),
+        paywall: Keyword.fetch!(validated_opts, :paywall)
       }
     end
 
@@ -527,7 +556,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             route,
             request_path,
             "PAYMENT-SIGNATURE header is required",
-            status: 402
+            status: 402,
+            paywall: opts.paywall
           )
 
         {:ok, header} ->
@@ -547,7 +577,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             request_path,
             rejection_error(reason),
             status: status_for_reason(reason),
-            reason: reason
+            reason: reason,
+            paywall: opts.paywall
           )
       end
     end
@@ -601,7 +632,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             request_path,
             rejection_error(reason),
             status: status_for_reason(reason),
-            reason: reason
+            reason: reason,
+            paywall: opts.paywall
           )
       end
     end
@@ -1442,6 +1474,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp payment_error_conn(conn, route, request_path, error_message, opts) do
       status = Keyword.get(opts, :status, 402)
       reason = Keyword.get(opts, :reason)
+      paywall = Keyword.get(opts, :paywall)
       required_payload = payment_required_payload(conn, route, request_path, error_message)
 
       with {:ok, encoded_required} <- PaymentRequired.encode(required_payload),
@@ -1449,10 +1482,87 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         response_conn
         |> put_resp_header("payment-required", encoded_required)
         |> delete_resp_header("content-length")
-        |> put_resp_content_type("application/json")
-        |> resp(status, "{}")
+        |> put_payment_error_body(status, required_payload, request_path, paywall)
       else
         {:error, _reason} -> internal_error_conn(conn)
+      end
+    end
+
+    # The HTML paywall applies only to 402 responses to requests that look
+    # like a browser page load. Every other combination — no :paywall
+    # configured, non-402 statuses, API clients — keeps the empty JSON body,
+    # byte-identical to running without the option.
+    @spec put_payment_error_body(
+            Plug.Conn.t(),
+            integer(),
+            map(),
+            String.t(),
+            module() | nil
+          ) :: Plug.Conn.t()
+    defp put_payment_error_body(conn, 402, required_payload, request_path, paywall)
+         when not is_nil(paywall) do
+      case browser_request?(conn) do
+        true -> paywall_response(conn, required_payload, request_path, paywall)
+        false -> json_error_body(conn, 402)
+      end
+    end
+
+    defp put_payment_error_body(conn, status, _required_payload, _request_path, _paywall) do
+      json_error_body(conn, status)
+    end
+
+    @spec json_error_body(Plug.Conn.t(), integer()) :: Plug.Conn.t()
+    defp json_error_body(conn, status) do
+      conn
+      |> put_resp_content_type("application/json")
+      |> resp(status, "{}")
+    end
+
+    @spec paywall_response(Plug.Conn.t(), map(), String.t(), module()) :: Plug.Conn.t()
+    defp paywall_response(conn, required_payload, request_path, paywall) do
+      conn_info = %{method: conn.method, request_path: request_path, status: 402}
+
+      case paywall.render(required_payload, conn_info) do
+        {:ok, html} ->
+          # The paywall exposes a one-click wallet-signature flow; deny
+          # framing so a third-party page cannot overlay it and clickjack an
+          # EIP-3009 authorization.
+          conn
+          |> put_resp_content_type("text/html")
+          |> put_resp_header("x-frame-options", "DENY")
+          |> put_resp_header("content-security-policy", "frame-ancestors 'none'")
+          |> resp(402, html)
+
+        {:error, reason} ->
+          Logger.warning(
+            "[X402.Plug.PaymentGate] paywall renderer #{inspect(paywall)} failed " <>
+              "(#{inspect(reason)}); falling back to the JSON 402 body"
+          )
+
+          json_error_body(conn, 402)
+      end
+    end
+
+    # Mirrors the browser heuristic of the reference x402 middlewares (Go and
+    # TypeScript): a request is a browser page load when its Accept header
+    # contains "text/html" AND its User-Agent contains "Mozilla". Absent
+    # headers never match, so API clients keep the JSON body.
+    @spec browser_request?(Plug.Conn.t()) :: boolean()
+    defp browser_request?(conn) do
+      # GET only: the paywall page's payment retry re-issues the request as a
+      # plain GET of the current URL, so serving it for a browser form POST
+      # would silently retry with the wrong method (and without the form
+      # body). Non-GET browser requests keep the JSON 402.
+      conn.method == "GET" and
+        String.contains?(first_req_header(conn, "accept"), "text/html") and
+        String.contains?(first_req_header(conn, "user-agent"), "Mozilla")
+    end
+
+    @spec first_req_header(Plug.Conn.t(), String.t()) :: String.t()
+    defp first_req_header(conn, name) do
+      case get_req_header(conn, name) do
+        [value | _rest] when is_binary(value) -> value
+        _missing -> ""
       end
     end
 

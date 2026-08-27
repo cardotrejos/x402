@@ -23,6 +23,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `X402.Extensions.PaymentIdentifier.RedisCache.Command` for testing without
   a live server). A live conformance suite tagged `:redis` (excluded by
   default) runs against `REDIS_URL`
+- **Browser paywall** (ecosystem report §8 P2.5): new `paywall:` option on
+  `X402.Plug.PaymentGate` (default `nil` — behavior unchanged). When set to a
+  module implementing the new `X402.Paywall` behaviour, pre-handler 402
+  responses to requests that look like a browser page load (`Accept` header
+  containing `text/html` **and** `User-Agent` containing `Mozilla`, the
+  heuristic shared by the reference Go/TypeScript middlewares) carry a
+  human-usable HTML body instead of the `{}` JSON body. The
+  `PAYMENT-REQUIRED` header is identical on both forms, and API clients,
+  absent-`Accept` requests, 400/500 statuses, and post-handler settlement
+  failures remain byte-identical to previous releases. Ships
+  `X402.Paywall.Default`, a self-contained few-KB page (inline CSS, no
+  external requests, no build step) that shows the advertised price, asset,
+  network, and recipient, embeds the exact Base64 `PAYMENT-REQUIRED` value
+  with manual retry instructions, and includes a dependency-free EIP-1193
+  wallet flow for `exact`/`eip3009` EVM options — sign the
+  `TransferWithAuthorization` typed data via `eth_signTypedData_v4`, retry
+  with `PAYMENT-SIGNATURE`, replace the document — degrading gracefully
+  without a wallet. All interpolated values are HTML-escaped and the embedded
+  config JSON is script-safe, so hostile route descriptions or service names
+  cannot inject markup. A renderer returning `{:error, reason}` logs a
+  warning and falls back to the JSON body. See the new "Browser Paywall"
+  guide.
 - **Local pre-verification checks in `X402.Plug.PaymentGate`** (option
   `local_prechecks:`, default `true`): before the facilitator round-trip, the
   gate now validates the EIP-3009-style `payload.authorization` object against
