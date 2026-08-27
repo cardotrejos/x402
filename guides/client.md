@@ -198,6 +198,52 @@ added alongside it, per the spec's append-only rule. Resource servers
 declare support with `build_extension/0` and validate a client's echoed
 data with `extract_info/1` and `validate_info/1` on either module.
 
+## Paying on Solana (SVM)
+
+The client also signs the `exact` scheme on `solana:*` networks out of the
+box, following the x402 SVM scheme specification: it builds a v0 Solana
+transaction — compute budget instructions, an SPL Token / Token-2022
+`TransferChecked` to the Associated Token Account derived from the server's
+`payTo` and `asset`, and a Memo for transaction uniqueness — signs it with
+the payer's Ed25519 key, and leaves the fee payer's signature slot empty.
+The server's sponsor (`extra.feePayer`, **required** in the advertised
+requirements) verifies and co-signs at settlement, so the payer never pays
+network fees. On-chain verification and settlement stay with the
+facilitator; the SDK never talks to a Solana RPC node.
+
+```elixir
+{:ok, signer} = X402.Signer.SolanaKey.new(System.fetch_env!("SOLANA_PAYER_KEY"))
+
+{:ok, payload} =
+  X402.Client.build_payment(payment_required, signer,
+    network: "solana:*",
+    # Only needed when the server's 402 does not include an
+    # extra.recentBlockhash hint: bring a blockhash yourself...
+    svm_blockhash: recent_blockhash
+    # ...or let the client fetch one through your RPC layer:
+    # svm_blockhash_fetcher: fn _network -> MyApp.RPC.latest_blockhash() end
+  )
+```
+
+`X402.Signer.SolanaKey.new/1` accepts a raw 32-byte Ed25519 seed, a
+64-byte `solana-keygen` keypair, or the Base58/Base64 encoding of either.
+Signing uses OTP's `:crypto` — no extra dependencies.
+
+Two option pairs matter for less common setups:
+
+* **Blockhash** — servers should advertise `extra.recentBlockhash` in
+  their requirements (it saves the client an RPC round-trip); when they
+  do, no option is needed. Otherwise pass `:svm_blockhash` or
+  `:svm_blockhash_fetcher`.
+* **Asset metadata** — `TransferChecked` needs the mint's decimals and
+  owning token program. Well-known stablecoins (USDC, USDT, USDG, PYUSD,
+  CASH on mainnet/devnet/testnet) are built in; for other mints pass
+  `:svm_decimals` and `:svm_token_program`.
+
+Custom Solana signers implement the optional
+`X402.Signer.sign_ed25519/2` callback instead of `sign_eip712/3` — see
+below.
+
 ## Custom signers
 
 `X402.Signer.LocalKey` holds a raw private key in memory — fine for testing
@@ -225,6 +271,12 @@ end
 
 Anything that returns `{:ok, address}` and `{:ok, signature}` plugs into
 `X402.Client.build_payment/3` and `X402.Client.Finch.request/3` unchanged.
+
+The chain-family callbacks are optional: implement `sign_eip712/3` for EVM
+payments, `sign_ed25519/2` (a 64-byte Ed25519 signature over the Solana
+transaction message bytes) for SVM payments, or both. A scheme asked to
+sign with a signer that lacks its callback returns
+`{:error, :unsupported_signer}`.
 
 ## Telemetry
 

@@ -14,9 +14,11 @@ defmodule X402.Scheme do
   `X402.Plug.PaymentGate`.
 
   The built-in schemes are `X402.Scheme.ExactEVM` (`exact` on `eip155:*`
-  networks via EIP-3009) and `X402.Scheme.UptoEVM` (`upto` on `eip155:*`
-  networks via Permit2). Resolution — including wildcard CAIP-2 matching
-  and exact-match precedence — is handled by `X402.Scheme.Registry`.
+  networks via EIP-3009), `X402.Scheme.ExactSVM` (`exact` on `solana:*`
+  networks via partially signed v0 transactions), and `X402.Scheme.UptoEVM`
+  (`upto` on `eip155:*` networks via Permit2). Resolution — including
+  wildcard CAIP-2 matching and exact-match precedence — is handled by
+  `X402.Scheme.Registry`.
 
   ## Callbacks and the roles they serve
 
