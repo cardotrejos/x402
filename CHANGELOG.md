@@ -30,6 +30,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address are never selected, and signing one returns
   `{:error, {:missing_extra, "facilitatorAddress"}}`. See the new
   Metered `upto` payments section in the client guide
+- **SVM (Solana) `exact` scheme — `X402.Scheme.ExactSVM`** (ecosystem
+  report §8 P2.3): the client half of `exact` on `solana:*` networks plus
+  structural server-side validation, registered as a built-in. `sign/3`
+  builds the reference v0 transaction byte-for-byte (`SetComputeUnitLimit`,
+  `SetComputeUnitPrice`, SPL Token / Token-2022 `TransferChecked` to the
+  ATA derived from `payTo` + `asset`, and a Memo — the seller's
+  `extra.memo` or a random nonce), signs it with the payer's Ed25519 key,
+  and leaves the sponsor's (`extra.feePayer`, required) signature slot as
+  the zeroed placeholder of a partially signed transaction. Blockhash
+  resolution follows the spec (server's `extra.recentBlockhash` hint, then
+  the new `:svm_blockhash` / `:svm_blockhash_fetcher` client options), and
+  `:svm_decimals` / `:svm_token_program` cover mints outside the built-in
+  known-asset table. `validate_payload/3` enforces the wire shape (Base64,
+  1232-byte cap, decodable v0/legacy transaction, advertised fee payer as
+  account 0); `precheck/3` enforces the facilitator's static-path
+  whitelist (spec §3.1: 3–7 instructions in the reference order, the
+  5 lamports/CU cap, §2.1.1 fee payer isolation, transfer semantics, memo
+  enforcement) without any RPC. On-chain verification and settlement stay
+  facilitator-delegated; transactions using address lookup tables skip the
+  local pre-checks
+- **`X402.Signer.SolanaKey` and the optional `sign_ed25519/2` signer
+  callback**: Ed25519 signing over OTP's `:crypto` (no new dependencies);
+  `new/1` accepts a raw 32-byte seed, a 64-byte `solana-keygen` keypair,
+  or Base58/Base64 encodings of either. The `X402.Signer` chain-family
+  callbacks are now both optional — a signer implements the families it
+  supports and the dispatchers return `{:error, :unsupported_signer}` for
+  the rest
+- **Solana primitives, dependency-free**: `X402.Base58` (Bitcoin-alphabet
+  encode/decode), `X402.Solana` (address validation, Ed25519 on-curve
+  check, `find_program_address/2`, `associated_token_address/3`), and
+  `X402.Solana.Transaction` (compact-u16, v0 message compilation matching
+  `@solana/kit`'s account ordering byte-for-byte, wire
+  serialization/decoding). Cross-checked against fixtures generated with
+  the official Solana TypeScript stack
 - `X402.Extensions.PaymentIdentifier.RedisCache` — a Redis-backed
   `X402.Extensions.PaymentIdentifier.Cache` adapter for clustered
   deployments (ROADMAP P1.3b), over the **new optional `redix` dependency**.
