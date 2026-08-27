@@ -21,11 +21,10 @@ defmodule X402.EIP3009 do
   they are unavailable; the library itself compiles without them.
   """
 
+  alias X402.EIP712
   alias X402.Signer
   alias X402.Utils
-  alias X402.Wallet
 
-  @eip712_domain_type "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
   @transfer_with_authorization_type "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
 
   @typed_data_types %{
@@ -58,18 +57,9 @@ defmodule X402.EIP3009 do
   ]
 
   @typedoc """
-  An EIP-712 domain map with `:name`, `:version`, `:chain_id`, and
-  `:verifying_contract` keys.
-
-  Functions accepting a domain also take the wire-style keys
-  (`"name"`, `"version"`, `"chainId"`, `"verifyingContract"`).
+  An EIP-712 domain map — see `t:X402.EIP712.domain/0`.
   """
-  @type domain :: %{
-          name: String.t(),
-          version: String.t(),
-          chain_id: non_neg_integer(),
-          verifying_contract: String.t()
-        }
+  @type domain :: EIP712.domain()
 
   @typedoc """
   A `TransferWithAuthorization` authorization in wire shape: string keys
@@ -80,18 +70,9 @@ defmodule X402.EIP3009 do
   @typedoc "The scheme `payload` map for a signed EIP-3009 payment."
   @type payload :: %{optional(String.t()) => String.t() | authorization()}
 
-  @type domain_error ::
-          :invalid_requirements
-          | {:missing_extra, String.t()}
-          | {:unsupported_transfer_method, term()}
-          | :unsupported_network
+  @type domain_error :: EIP712.domain_error() | {:unsupported_transfer_method, term()}
 
-  @type encode_error ::
-          :missing_dependency
-          | :invalid_address
-          | :invalid_amount
-          | :invalid_bytes32
-          | {:missing_field, String.t()}
+  @type encode_error :: EIP712.encode_error()
 
   @doc since: "0.6.0"
   @doc """
@@ -167,16 +148,10 @@ defmodule X402.EIP3009 do
   @spec domain(map()) :: {:ok, domain()} | {:error, domain_error()}
   def domain(requirements) when is_map(requirements) do
     extra = Utils.map_value(requirements, {"extra", :extra}) || %{}
-    network = Utils.map_value(requirements, {"network", :network})
-    asset = Utils.map_value(requirements, {"asset", :asset})
 
     with :ok <- ensure_map(extra),
-         :ok <- ensure_transfer_method(extra),
-         {:ok, name} <- fetch_extra(extra, {"name", :name}),
-         {:ok, version} <- fetch_extra(extra, {"version", :version}),
-         {:ok, chain_id} <- chain_id_from_caip2(network),
-         :ok <- ensure_binary(asset) do
-      {:ok, %{name: name, version: version, chain_id: chain_id, verifying_contract: asset}}
+         :ok <- ensure_transfer_method(extra) do
+      EIP712.domain(requirements)
     end
   end
 
@@ -248,10 +223,8 @@ defmodule X402.EIP3009 do
   """
   @spec eip712_digest(map(), map()) :: {:ok, <<_::256>>} | {:error, encode_error()}
   def eip712_digest(domain, authorization) when is_map(domain) and is_map(authorization) do
-    with {:ok, keccak_module} <- keccak_module(),
-         {:ok, domain_separator} <- domain_separator(domain, keccak_module),
-         {:ok, struct_hash} <- struct_hash(authorization, keccak_module) do
-      {:ok, keccak_module.hash_256(<<0x19, 0x01>> <> domain_separator <> struct_hash)}
+    with {:ok, struct_hash} <- struct_hash(authorization) do
+      EIP712.digest(domain, struct_hash)
     end
   end
 
@@ -322,6 +295,8 @@ defmodule X402.EIP3009 do
   @doc """
   Extracts the chain id from an `eip155:<chainId>` CAIP-2 network identifier.
 
+  See `X402.EIP712.chain_id_from_caip2/1`.
+
   ## Examples
 
       iex> X402.EIP3009.chain_id_from_caip2("eip155:84532")
@@ -331,18 +306,13 @@ defmodule X402.EIP3009 do
       {:error, :unsupported_network}
   """
   @spec chain_id_from_caip2(term()) :: {:ok, non_neg_integer()} | {:error, :unsupported_network}
-  def chain_id_from_caip2("eip155:" <> chain_id) do
-    case Integer.parse(chain_id) do
-      {parsed, ""} when parsed >= 0 -> {:ok, parsed}
-      _parsed -> {:error, :unsupported_network}
-    end
-  end
-
-  def chain_id_from_caip2(_network), do: {:error, :unsupported_network}
+  defdelegate chain_id_from_caip2(network), to: EIP712
 
   @doc since: "0.6.0"
   @doc """
   ABI-encodes a `0x`-prefixed EVM address into a 32-byte word.
+
+  See `X402.EIP712.encode_address/1`.
 
   ## Examples
 
@@ -354,23 +324,13 @@ defmodule X402.EIP3009 do
       {:error, :invalid_address}
   """
   @spec encode_address(term()) :: {:ok, <<_::256>>} | {:error, :invalid_address}
-  def encode_address(address) when is_binary(address) do
-    case Wallet.valid_evm?(address) do
-      true ->
-        "0x" <> hex = address
-        {:ok, bytes} = Base.decode16(hex, case: :mixed)
-        {:ok, <<0::unsigned-big-integer-size(96), bytes::binary>>}
-
-      false ->
-        {:error, :invalid_address}
-    end
-  end
-
-  def encode_address(_address), do: {:error, :invalid_address}
+  defdelegate encode_address(address), to: EIP712
 
   @doc since: "0.6.0"
   @doc """
   ABI-encodes a non-negative integer (or decimal string) into a 32-byte word.
+
+  See `X402.EIP712.encode_uint256/1`.
 
   ## Examples
 
@@ -381,21 +341,13 @@ defmodule X402.EIP3009 do
       {:error, :invalid_amount}
   """
   @spec encode_uint256(term()) :: {:ok, <<_::256>>} | {:error, :invalid_amount}
-  def encode_uint256(integer) when is_integer(integer) and integer >= 0,
-    do: {:ok, <<integer::unsigned-big-integer-size(256)>>}
-
-  def encode_uint256(string) when is_binary(string) do
-    case Integer.parse(string) do
-      {integer, ""} when integer >= 0 -> encode_uint256(integer)
-      _parsed -> {:error, :invalid_amount}
-    end
-  end
-
-  def encode_uint256(_value), do: {:error, :invalid_amount}
+  defdelegate encode_uint256(value), to: EIP712
 
   @doc since: "0.6.0"
   @doc """
   Decodes a `0x`-prefixed hex string into a 32-byte binary.
+
+  See `X402.EIP712.encode_bytes32/1`.
 
   ## Examples
 
@@ -407,60 +359,32 @@ defmodule X402.EIP3009 do
       {:error, :invalid_bytes32}
   """
   @spec encode_bytes32(term()) :: {:ok, <<_::256>>} | {:error, :invalid_bytes32}
-  def encode_bytes32("0x" <> hex) do
-    case Base.decode16(hex, case: :mixed) do
-      {:ok, bytes} when byte_size(bytes) == 32 -> {:ok, bytes}
-      _decoded -> {:error, :invalid_bytes32}
-    end
-  end
+  defdelegate encode_bytes32(value), to: EIP712
 
-  def encode_bytes32(_value), do: {:error, :invalid_bytes32}
+  # -- Struct hashing ---------------------------------------------------------
 
-  # -- Domain / struct hashing ------------------------------------------------
-
-  @spec domain_separator(map(), module()) :: {:ok, binary()} | {:error, encode_error()}
-  defp domain_separator(domain, keccak_module) do
-    with {:ok, name} <- fetch_field(domain, {"name", :name}),
-         {:ok, version} <- fetch_field(domain, {"version", :version}),
-         {:ok, chain_id} <- fetch_chain_id(domain),
-         {:ok, contract} <- fetch_field(domain, {"verifyingContract", :verifying_contract}),
-         {:ok, chain_id_word} <- encode_uint256(chain_id),
-         {:ok, contract_word} <- encode_address(contract) do
-      {:ok,
-       keccak_module.hash_256(
-         keccak_module.hash_256(@eip712_domain_type) <>
-           keccak_module.hash_256(name) <>
-           keccak_module.hash_256(version) <>
-           chain_id_word <>
-           contract_word
-       )}
-    end
-  end
-
-  @spec struct_hash(map(), module()) :: {:ok, binary()} | {:error, encode_error()}
-  defp struct_hash(authorization, keccak_module) do
+  @spec struct_hash(map()) :: {:ok, binary()} | {:error, encode_error()}
+  defp struct_hash(authorization) do
     with {:ok, from} <- fetch_field(authorization, {"from", :from}),
          {:ok, to} <- fetch_field(authorization, {"to", :to}),
          {:ok, value} <- fetch_field(authorization, {"value", :value}),
          {:ok, valid_after} <- fetch_field(authorization, {"validAfter", :valid_after}),
          {:ok, valid_before} <- fetch_field(authorization, {"validBefore", :valid_before}),
          {:ok, nonce} <- fetch_field(authorization, {"nonce", :nonce}),
-         {:ok, from_word} <- encode_address(from),
-         {:ok, to_word} <- encode_address(to),
-         {:ok, value_word} <- encode_uint256(value),
-         {:ok, valid_after_word} <- encode_uint256(valid_after),
-         {:ok, valid_before_word} <- encode_uint256(valid_before),
-         {:ok, nonce_word} <- encode_bytes32(nonce) do
-      {:ok,
-       keccak_module.hash_256(
-         keccak_module.hash_256(@transfer_with_authorization_type) <>
-           from_word <>
-           to_word <>
-           value_word <>
-           valid_after_word <>
-           valid_before_word <>
-           nonce_word
-       )}
+         {:ok, from_word} <- EIP712.encode_address(from),
+         {:ok, to_word} <- EIP712.encode_address(to),
+         {:ok, value_word} <- EIP712.encode_uint256(value),
+         {:ok, valid_after_word} <- EIP712.encode_uint256(valid_after),
+         {:ok, valid_before_word} <- EIP712.encode_uint256(valid_before),
+         {:ok, nonce_word} <- EIP712.encode_bytes32(nonce) do
+      EIP712.hash_struct(@transfer_with_authorization_type, [
+        from_word,
+        to_word,
+        value_word,
+        valid_after_word,
+        valid_before_word,
+        nonce_word
+      ])
     end
   end
 
@@ -497,30 +421,9 @@ defmodule X402.EIP3009 do
     end
   end
 
-  @spec fetch_chain_id(map()) :: {:ok, term()} | {:error, {:missing_field, String.t()}}
-  defp fetch_chain_id(domain) do
-    case Utils.map_value(domain, {"chainId", :chain_id}) do
-      nil -> {:error, {:missing_field, "chainId"}}
-      value -> {:ok, value}
-    end
-  end
-
-  @spec fetch_extra(map(), {String.t(), atom()}) ::
-          {:ok, String.t()} | {:error, {:missing_extra, String.t()}}
-  defp fetch_extra(extra, {string_key, _atom_key} = key) do
-    case Utils.map_value(extra, key) do
-      value when is_binary(value) and value != "" -> {:ok, value}
-      _value -> {:error, {:missing_extra, string_key}}
-    end
-  end
-
   @spec ensure_map(term()) :: :ok | {:error, :invalid_requirements}
   defp ensure_map(value) when is_map(value), do: :ok
   defp ensure_map(_value), do: {:error, :invalid_requirements}
-
-  @spec ensure_binary(term()) :: :ok | {:error, :invalid_requirements}
-  defp ensure_binary(value) when is_binary(value) and value != "", do: :ok
-  defp ensure_binary(_value), do: {:error, :invalid_requirements}
 
   @spec ensure_transfer_method(map()) :: :ok | {:error, {:unsupported_transfer_method, term()}}
   defp ensure_transfer_method(extra) do
@@ -592,7 +495,7 @@ defmodule X402.EIP3009 do
   defp crypto_modules do
     secp256k1_module = Module.concat(["ExSecp256k1"])
 
-    with {:ok, keccak_module} <- keccak_module(),
+    with {:ok, keccak_module} <- EIP712.keccak_module(),
          true <-
            Code.ensure_loaded?(secp256k1_module) and
              function_exported?(secp256k1_module, :create_public_key, 1) and
@@ -600,16 +503,6 @@ defmodule X402.EIP3009 do
       {:ok, secp256k1_module, keccak_module}
     else
       _unavailable -> {:error, :missing_dependency}
-    end
-  end
-
-  @spec keccak_module() :: {:ok, module()} | {:error, :missing_dependency}
-  defp keccak_module do
-    keccak_module = Module.concat(["ExKeccak"])
-
-    case Code.ensure_loaded?(keccak_module) and function_exported?(keccak_module, :hash_256, 1) do
-      true -> {:ok, keccak_module}
-      false -> {:error, :missing_dependency}
     end
   end
 end

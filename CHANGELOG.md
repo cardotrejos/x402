@@ -154,6 +154,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget/consent hook and enforces `https://` for non-loopback resources
 - `[:x402, :client, :select | :sign | :build | :request]` telemetry events
 - `guides/client.md` — "Paying for x402 Resources from Elixir"
+- `X402.EIP712` — shared EIP-712 hashing primitives (requirements-derived
+  domain, domain separator, `hash_struct/2`, `digest/2`, and the ABI word
+  encoders), extracted from `X402.EIP3009` which now delegates to it
+- `X402.Extensions.EIP2612GasSponsoring` — the `eip2612GasSponsoring`
+  gas-sponsoring extension (report §8 P2.4): server-side declaration
+  (`build_extension/0`) and echo validation (`extract_info/1` /
+  `validate_info/1`), plus client-side EIP-2612 `Permit` signing
+  (`sign_permit/3`, `put_info/2`, and `enricher/2` for
+  `X402.Client.build_payment/3`)
+- `X402.Extensions.ERC20ApprovalGasSponsoring` — the
+  `erc20ApprovalGasSponsoring` gas-sponsoring extension (report §8 P2.4)
+  for tokens without EIP-2612: server-side declaration and echo
+  validation, plus client-side assembly of the extension data around a
+  pre-signed `approve(Permit2, amount)` transaction (`build_info/1`,
+  `put_info/2`, and `enricher/1` for `X402.Client.build_payment/3`)
+- `X402.Client.build_payment/3` and `X402.Client.Finch.request/3`
+  `:extensions` option — client extension enrichers applied to the
+  assembled payload (how gas-sponsoring data is attached opt-in)
 
 ## [0.5.0] - 2026-08-26
 

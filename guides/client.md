@@ -107,6 +107,59 @@ alias X402.{Client, PaymentRequired}
 `Client.select_requirements/2` is also public if you want to inspect or
 choose the payment option yourself before signing.
 
+## Gas-sponsoring extensions
+
+Permit2-based payments need a one-time on-chain `approve(Permit2, ...)`
+from the payer's wallet — which costs gas the wallet may not have. Two x402
+extensions let the facilitator sponsor that approval; when a server
+advertises them in its `PAYMENT-REQUIRED` extensions, the client can attach
+the corresponding data through `build_payment/3`'s `:extensions` option
+(also accepted by `X402.Client.Finch.request/3`).
+
+**EIP-2612 tokens** (`X402.Extensions.EIP2612GasSponsoring`): the client
+signs an off-chain EIP-2612 `Permit` authorizing the canonical Permit2
+contract, and the facilitator submits it on-chain, paying the gas. The SDK
+signs the permit itself — you only supply the owner's current EIP-2612
+nonce (read from the token contract's `nonces(owner)`; the SDK has no
+chain access):
+
+```elixir
+alias X402.Extensions.EIP2612GasSponsoring
+
+{:ok, payload} =
+  X402.Client.build_payment(payment_required, signer,
+    extensions: [EIP2612GasSponsoring.enricher(signer, nonce: "0")]
+  )
+```
+
+**Plain ERC-20 tokens** (`X402.Extensions.ERC20ApprovalGasSponsoring`):
+tokens without EIP-2612 have no gasless approval, so the client signs — but
+does not broadcast — a normal `approve(Permit2, amount)` transaction, and
+the facilitator funds the wallet's gas if needed, broadcasts it, and
+settles atomically. Signing that transaction needs the wallet's live
+on-chain nonce and network fees, so it happens outside the SDK; the
+enricher wraps the pre-signed transaction in the extension data:
+
+```elixir
+alias X402.Extensions.ERC20ApprovalGasSponsoring
+
+{:ok, payload} =
+  X402.Client.build_payment(payment_required, signer,
+    extensions: [
+      ERC20ApprovalGasSponsoring.enricher(
+        from: wallet_address,
+        signed_transaction: signed_approve_tx_hex
+      )
+    ]
+  )
+```
+
+Both enrichers are no-ops when the server did not advertise the extension,
+and both preserve the server's echoed declaration — client data is only
+added alongside it, per the spec's append-only rule. Resource servers
+declare support with `build_extension/0` and validate a client's echoed
+data with `extract_info/1` and `validate_info/1` on either module.
+
 ## Custom signers
 
 `X402.Signer.LocalKey` holds a raw private key in memory — fine for testing

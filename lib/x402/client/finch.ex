@@ -92,6 +92,14 @@ defmodule X402.Client.Finch do
       default: 60,
       doc: "Clock-skew buffer for the authorization's `validAfter`, in seconds."
     ],
+    extensions: [
+      type: {:list, {:fun, 2}},
+      default: [],
+      doc: """
+      Client extension enrichers forwarded to
+      `X402.Client.build_payment/3` — see its `:extensions` option.
+      """
+    ],
     on_payment_required: [
       type: {:or, [{:fun, 1}, nil]},
       default: nil,
@@ -287,7 +295,15 @@ defmodule X402.Client.Finch do
 
   @spec build_opts(keyword()) :: keyword()
   defp build_opts(opts),
-    do: Keyword.take(opts, [:network, :scheme, :asset, :max_amount, :valid_after_buffer])
+    do:
+      Keyword.take(opts, [
+        :network,
+        :scheme,
+        :asset,
+        :max_amount,
+        :valid_after_buffer,
+        :extensions
+      ])
 
   @spec finalize(map()) :: response()
   defp finalize(response) do

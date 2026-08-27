@@ -64,6 +64,19 @@ defmodule X402.Client do
                            Seconds subtracted from the current time for the EVM
                            authorization's `validAfter` (clock-skew tolerance).
                            """
+                         ],
+                         extensions: [
+                           type: {:list, {:fun, 2}},
+                           default: [],
+                           doc: """
+                           Client extension enrichers applied, in order, to the
+                           assembled payload. Each function receives the payload
+                           and the original `PaymentRequired` map (`nil` when
+                           building from a bare requirements map) and returns
+                           `{:ok, payload}` or `{:error, reason}` — see
+                           `X402.Extensions.EIP2612GasSponsoring.enricher/2` and
+                           `X402.Extensions.ERC20ApprovalGasSponsoring.enricher/1`.
+                           """
                          ]
                        ]
 
@@ -158,7 +171,10 @@ defmodule X402.Client do
   The chosen requirements are echoed in full (including `extra`) as
   `accepted`, and server-advertised `extensions` are echoed unchanged,
   following the spec's append-only rule: the client must preserve every
-  advertised value and may only add to them.
+  advertised value and may only add to them. `:extensions` enrichers run
+  after assembly and may add extension data on top of the echo — for
+  example `X402.Extensions.EIP2612GasSponsoring.enricher/2` for
+  gas-sponsored Permit2 approvals.
 
   Signing dispatches on the scheme and network of the chosen requirements;
   this release supports `exact` on `eip155:*` networks (EIP-3009). Other
@@ -177,7 +193,9 @@ defmodule X402.Client do
       with {:ok, requirements, envelope} <-
              resolve_requirements(payment_required_or_requirements, opts),
            {:ok, scheme_payload} <- sign_for_kind(requirements, signer, opts) do
-        {:ok, assemble_payload(requirements, scheme_payload, envelope)}
+        requirements
+        |> assemble_payload(scheme_payload, envelope)
+        |> apply_extensions(envelope.payment_required, Keyword.fetch!(opts, :extensions))
       end
 
     case result do
@@ -295,7 +313,8 @@ defmodule X402.Client do
   # -- Payload assembly -------------------------------------------------------
 
   @spec resolve_requirements(term(), keyword()) ::
-          {:ok, map(), %{resource: term(), extensions: term()}} | {:error, select_error()}
+          {:ok, map(), %{resource: term(), extensions: term(), payment_required: map() | nil}}
+          | {:error, select_error()}
   defp resolve_requirements(%{} = payment_required_or_requirements, opts) do
     if payment_required?(payment_required_or_requirements) do
       with {:ok, requirements} <-
@@ -304,11 +323,13 @@ defmodule X402.Client do
          %{
            resource: Utils.map_value(payment_required_or_requirements, {"resource", :resource}),
            extensions:
-             Utils.map_value(payment_required_or_requirements, {"extensions", :extensions})
+             Utils.map_value(payment_required_or_requirements, {"extensions", :extensions}),
+           payment_required: payment_required_or_requirements
          }}
       end
     else
-      {:ok, payment_required_or_requirements, %{resource: nil, extensions: nil}}
+      {:ok, payment_required_or_requirements,
+       %{resource: nil, extensions: nil, payment_required: nil}}
     end
   end
 
@@ -351,7 +372,11 @@ defmodule X402.Client do
     end
   end
 
-  @spec assemble_payload(map(), map(), %{resource: term(), extensions: term()}) :: map()
+  @spec assemble_payload(map(), map(), %{
+          resource: term(),
+          extensions: term(),
+          payment_required: map() | nil
+        }) :: map()
   defp assemble_payload(requirements, scheme_payload, envelope) do
     %{
       "x402Version" => 2,
@@ -360,6 +385,23 @@ defmodule X402.Client do
     }
     |> maybe_put("resource", envelope.resource)
     |> maybe_put("extensions", envelope.extensions)
+  end
+
+  @spec apply_extensions(map(), map() | nil, [(map(), map() | nil -> term())]) ::
+          {:ok, map()} | {:error, term()}
+  defp apply_extensions(payload, _payment_required, []), do: {:ok, payload}
+
+  defp apply_extensions(payload, payment_required, [enricher | enrichers]) do
+    case enricher.(payload, payment_required) do
+      {:ok, enriched} when is_map(enriched) ->
+        apply_extensions(enriched, payment_required, enrichers)
+
+      {:error, reason} ->
+        {:error, reason}
+
+      other ->
+        {:error, {:invalid_extension_result, other}}
+    end
   end
 
   @spec maybe_put(map(), String.t(), term()) :: map()

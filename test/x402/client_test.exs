@@ -263,6 +263,100 @@ defmodule X402.ClientTest do
     end
   end
 
+  describe "build_payment/3 :extensions" do
+    test "applies enrichers in order with the original payment_required" do
+      test_pid = self()
+
+      first = fn payload, payment_required ->
+        send(test_pid, {:first, payment_required})
+        {:ok, Map.put(payload, "first", true)}
+      end
+
+      second = fn payload, _payment_required ->
+        assert payload["first"] == true
+        {:ok, Map.put(payload, "second", true)}
+      end
+
+      assert {:ok, payload} =
+               Client.build_payment(@payment_required, signer(), extensions: [first, second])
+
+      assert payload["first"] == true
+      assert payload["second"] == true
+      assert_received {:first, @payment_required}
+    end
+
+    test "passes nil as payment_required for bare requirements" do
+      test_pid = self()
+
+      enricher = fn payload, payment_required ->
+        send(test_pid, {:enriched, payment_required})
+        {:ok, payload}
+      end
+
+      assert {:ok, _payload} =
+               Client.build_payment(@evm_requirements, signer(), extensions: [enricher])
+
+      assert_received {:enriched, nil}
+    end
+
+    test "propagates enricher errors and rejects invalid returns" do
+      failing = fn _payload, _payment_required -> {:error, :nope} end
+
+      assert Client.build_payment(@payment_required, signer(), extensions: [failing]) ==
+               {:error, :nope}
+
+      invalid = fn _payload, _payment_required -> :what end
+
+      assert Client.build_payment(@payment_required, signer(), extensions: [invalid]) ==
+               {:error, {:invalid_extension_result, :what}}
+    end
+
+    test "produces a valid eip2612GasSponsoring extension end to end" do
+      alias X402.Extensions.EIP2612GasSponsoring
+
+      signer = signer()
+
+      payment_required =
+        Map.put(@payment_required, "extensions", %{
+          "eip2612GasSponsoring" => EIP2612GasSponsoring.build_extension()
+        })
+
+      assert {:ok, payload} =
+               Client.build_payment(payment_required, signer,
+                 extensions: [EIP2612GasSponsoring.enricher(signer, nonce: "0")]
+               )
+
+      # the scheme payload and echo are untouched
+      assert PaymentRequirements.validate(payload["accepted"]) == :ok
+      assert %{"signature" => _, "authorization" => _} = payload["payload"]
+
+      extension = payload["extensions"]["eip2612GasSponsoring"]
+      assert extension["schema"] == EIP2612GasSponsoring.schema()
+
+      assert {:ok, info} = EIP2612GasSponsoring.extract_info(payload)
+      assert EIP2612GasSponsoring.validate_info(info) == :ok
+      assert info["from"] == signer.address
+      assert info["asset"] == @contract
+
+      # header round-trip keeps the extension intact
+      {:ok, header} = Client.encode_payment(payload)
+      assert PaymentSignature.decode(header) == {:ok, payload}
+    end
+
+    test "eip2612 enricher is a no-op when the server does not advertise it" do
+      alias X402.Extensions.EIP2612GasSponsoring
+
+      signer = signer()
+
+      assert {:ok, payload} =
+               Client.build_payment(@payment_required, signer,
+                 extensions: [EIP2612GasSponsoring.enricher(signer, nonce: "0")]
+               )
+
+      assert payload["extensions"] == %{}
+    end
+  end
+
   describe "encode_payment/1" do
     test "returns invalid_json for unencodable payloads" do
       assert Client.encode_payment(%{"pid" => self()}) == {:error, :invalid_json}
