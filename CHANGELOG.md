@@ -68,6 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Facilitator auth implementations now receive the real request method
   (`:get` for the new endpoints) in `request_info`, so CDP JWTs bind
   `GET host path` in their `uris` claim
+- `X402.Extensions.Bazaar` discovery client — `list_resources/0..2` queries a
+  facilitator's `GET /discovery/resources` and parses every discovered entry
+  into a well-typed map (resource URL, `accepts` PaymentRequirements list,
+  `lastUpdated`, metadata, extensions), fail-closed on structurally invalid
+  entries; `parse_resource/1` for per-entry parsing; and pure filter helpers
+  `filter_by_network/2`, `filter_by_scheme/2`, and `filter_by_max_price/2`
 
 ### Changed
 

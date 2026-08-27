@@ -399,4 +399,179 @@ defmodule X402.Extensions.BazaarTest do
       end
     end
   end
+
+  describe "discovery client" do
+    @valid_item %{
+      "resource" => "https://api.example.com/premium-data",
+      "type" => "http",
+      "x402Version" => 2,
+      "accepts" => [
+        %{
+          "scheme" => "exact",
+          "network" => "eip155:8453",
+          "amount" => "10000",
+          "asset" => "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+          "payTo" => "0x1111111111111111111111111111111111111111"
+        }
+      ],
+      "lastUpdated" => 1_703_123_456,
+      "description" => "Premium market data",
+      "mimeType" => "application/json",
+      "metadata" => %{"category" => "finance"}
+    }
+
+    test "list_resources/2 returns typed resources from the facilitator" do
+      minimal_item = %{
+        "resource" => "https://api.example.com/mcp-tool",
+        "type" => "mcp",
+        "x402Version" => 2,
+        "accepts" => [%{"scheme" => "upto", "network" => "solana:mainnet"}],
+        "lastUpdated" => "2026-08-26T00:00:00Z"
+      }
+
+      facilitator =
+        start_discovery_facilitator(fn conn ->
+          conn = Plug.Conn.fetch_query_params(conn)
+          assert conn.query_params == %{"network" => "eip155:8453", "limit" => "2"}
+
+          Plug.Conn.resp(
+            conn,
+            200,
+            Jason.encode!(%{
+              "x402Version" => 2,
+              "items" => [@valid_item, minimal_item],
+              "pagination" => %{"limit" => 2, "offset" => 0, "total" => 2}
+            })
+          )
+        end)
+
+      assert {:ok,
+              %{
+                x402_version: 2,
+                items: [full, minimal],
+                pagination: %{limit: 2, offset: 0, total: 2}
+              }} = Bazaar.list_resources(facilitator, network: "eip155:8453", limit: 2)
+
+      assert %{
+               resource: "https://api.example.com/premium-data",
+               type: "http",
+               x402_version: 2,
+               last_updated: 1_703_123_456,
+               description: "Premium market data",
+               mime_type: "application/json",
+               metadata: %{"category" => "finance"},
+               extensions: nil
+             } = full
+
+      assert [%{"scheme" => "exact", "amount" => "10000"}] = full.accepts
+
+      assert %{
+               resource: "https://api.example.com/mcp-tool",
+               type: "mcp",
+               last_updated: "2026-08-26T00:00:00Z",
+               description: nil,
+               mime_type: nil,
+               metadata: nil,
+               extensions: nil
+             } = minimal
+    end
+
+    test "list_resources/2 fails closed on a structurally invalid entry" do
+      invalid_item = Map.delete(@valid_item, "resource")
+
+      facilitator =
+        start_discovery_facilitator(fn conn ->
+          Plug.Conn.resp(
+            conn,
+            200,
+            Jason.encode!(%{"items" => [@valid_item, invalid_item]})
+          )
+        end)
+
+      assert {:error,
+              %X402.Facilitator.Error{
+                type: :malformed_facilitator_response,
+                reason: {:invalid_resource, 1, {:missing_field, "resource"}},
+                retryable: false
+              }} = Bazaar.list_resources(facilitator)
+    end
+
+    test "list_resources/2 propagates facilitator transport and validation errors" do
+      facilitator =
+        start_discovery_facilitator(fn conn ->
+          Plug.Conn.resp(conn, 503, Jason.encode!(%{"error" => "unavailable"}))
+        end)
+
+      assert {:error, %X402.Facilitator.Error{type: :http_error, status: 503}} =
+               Bazaar.list_resources(facilitator)
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Bazaar.list_resources(facilitator, limit: 0)
+    end
+
+    test "parse_resource/1 rejects mistyped optional fields" do
+      assert {:error, {:invalid_field, "metadata"}} =
+               Bazaar.parse_resource(%{@valid_item | "metadata" => "finance"})
+
+      assert {:error, {:invalid_field, "description"}} =
+               Bazaar.parse_resource(%{@valid_item | "description" => 42})
+
+      assert {:error, {:invalid_field, "lastUpdated"}} =
+               Bazaar.parse_resource(%{@valid_item | "lastUpdated" => %{}})
+
+      assert {:error, {:invalid_resource_entry, "nope"}} = Bazaar.parse_resource("nope")
+    end
+
+    test "filter helpers match any accepted payment option" do
+      multi_network = %{
+        resource: "https://multi.example",
+        accepts: [
+          %{"scheme" => "exact", "network" => "eip155:8453", "amount" => "999999"},
+          %{"scheme" => "upto", "network" => "solana:mainnet", "amount" => "100"}
+        ]
+      }
+
+      legacy_amount = %{
+        resource: "https://legacy.example",
+        accepts: [%{"scheme" => "exact", "network" => "eip155:1", "maxAmountRequired" => "500"}]
+      }
+
+      priceless = %{
+        resource: "https://priceless.example",
+        accepts: [%{"scheme" => "exact", "network" => "eip155:1", "amount" => "not-a-number"}]
+      }
+
+      resources = [multi_network, legacy_amount, priceless]
+
+      assert [^multi_network] = Bazaar.filter_by_network(resources, "solana:mainnet")
+      assert [^multi_network] = Bazaar.filter_by_scheme(resources, "upto")
+
+      assert [^multi_network, ^legacy_amount] = Bazaar.filter_by_max_price(resources, "500")
+      assert [^multi_network, ^legacy_amount] = Bazaar.filter_by_max_price(resources, 500)
+      assert [^multi_network] = Bazaar.filter_by_max_price(resources, 250)
+      assert [] = Bazaar.filter_by_max_price(resources, "50")
+    end
+
+    test "filter_by_max_price/2 raises on an unparsable maximum" do
+      assert_raise ArgumentError, ~r/max_price/, fn ->
+        Bazaar.filter_by_max_price([], "not-a-price")
+      end
+    end
+
+    defp start_discovery_facilitator(handler) do
+      suffix = System.unique_integer([:positive, :monotonic])
+      finch = String.to_atom("bazaar_finch_#{suffix}")
+      name = String.to_atom("bazaar_facilitator_#{suffix}")
+
+      bypass = Bypass.open()
+      Bypass.stub(bypass, "GET", "/discovery/resources", handler)
+
+      start_supervised!(Supervisor.child_spec({Finch, name: finch}, id: finch))
+
+      start_supervised!(
+        {X402.Facilitator,
+         name: name, finch: finch, url: "http://localhost:#{bypass.port}", max_retries: 0}
+      )
+    end
+  end
 end
