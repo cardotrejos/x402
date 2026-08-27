@@ -225,6 +225,92 @@ defmodule X402.Plug.PaymentGateTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Route matching against path aliases — regression tests for the
+  # GHSA-3j63-5h8p-gf7c bug class (route bypass via alternate spellings of a
+  # protected path). Matching runs on decoded conn.path_info segments so the
+  # gate agrees with what the downstream router serves.
+  # ---------------------------------------------------------------------------
+
+  describe "route matching against encoded path aliases" do
+    test "gates routes mounted behind a forwarded prefix (script_name)" do
+      # Plug/Phoenix `forward "/api", ...` pops the matched prefix from
+      # path_info into script_name before inner plugs run. Routes configured
+      # as full paths must still match, or forwarded mounts fail open.
+      conn = %{
+        conn(:get, "/api/resource")
+        | script_name: ["api"],
+          path_info: ["resource"]
+      }
+
+      assert run_request(conn, routes: [@route], facilitator: self()).status == 402
+    end
+
+    test "gates a leading-double-slash alias of a protected path" do
+      # Cowboy builds path_info by dropping empty segments, so "//api/resource"
+      # reaches the router as the protected resource while request_path keeps
+      # the raw spelling. Simulate the adapter output directly — Plug.Test
+      # cannot parse a scheme-relative "//" target.
+      conn = %{
+        conn(:get, "/api/resource")
+        | request_path: "//api/resource",
+          path_info: ["api", "resource"]
+      }
+
+      assert run_request(conn, routes: [@route], facilitator: self()).status == 402
+    end
+
+    test "gates a mid-path double-slash alias of a protected path" do
+      conn = %{
+        conn(:get, "/api/resource")
+        | request_path: "/api//resource",
+          path_info: ["api", "resource"]
+      }
+
+      assert run_request(conn, routes: [@route], facilitator: self()).status == 402
+    end
+
+    test "gates a percent-encoded alias of a protected path" do
+      conn = run_request(conn(:get, "/api/re%73ource"), routes: [@route], facilitator: self())
+
+      assert conn.status == 402
+      assert get_resp_header(conn, "payment-required") != []
+    end
+
+    test "gates an encoded-slash alias of a protected path" do
+      conn = run_request(conn(:get, "/api%2Fresource"), routes: [@route], facilitator: self())
+
+      assert conn.status == 402
+    end
+
+    test "gates percent-encoded aliases under glob routes" do
+      route = Map.put(@route, :path, "/api/*")
+      conn = run_request(conn(:get, "/api/%76%31/items"), routes: [route], facilitator: self())
+
+      assert conn.status == 402
+    end
+
+    test "matches malformed percent sequences verbatim without crashing" do
+      passthrough =
+        run_request(conn(:get, "/api/re%zzource"), routes: [@route], facilitator: self())
+
+      assert passthrough.status == 200
+
+      gated_route = Map.put(@route, :path, "/api/re%zzource")
+
+      gated =
+        run_request(conn(:get, "/api/re%zzource"), routes: [gated_route], facilitator: self())
+
+      assert gated.status == 402
+    end
+
+    test "does not gate paths that decode to a different resource" do
+      conn = run_request(conn(:get, "/api/re%73ourceX"), routes: [@route], facilitator: self())
+
+      assert conn.status == 200
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # PaymentRequired (402 signaling) — §5.1 + HTTP transport
   # ---------------------------------------------------------------------------
 
