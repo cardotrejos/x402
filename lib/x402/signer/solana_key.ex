@@ -95,11 +95,26 @@ defmodule X402.Signer.SolanaKey do
     end
   end
 
+  # Base58 is tried FIRST: typical Base58 secrets (44/88 characters —
+  # Phantom exports, solana-keygen) are also valid Base64 lengths, so a
+  # Base64-first decode "succeeds" with 33/66 garbage bytes and the real
+  # Base58 form is never tried. Only decodes yielding a valid key size are
+  # accepted from either alphabet; ambiguous strings resolve as Base58, the
+  # Solana convention.
   @spec decode_key(binary()) :: {:ok, binary()} | :error
   defp decode_key(encoded) do
-    case Base.decode64(encoded) do
+    case decode_sized(&Base58.decode/1, encoded) do
       {:ok, raw} -> {:ok, raw}
-      :error -> Base58.decode(encoded)
+      :error -> decode_sized(&Base.decode64/1, encoded)
+    end
+  end
+
+  @spec decode_sized((binary() -> {:ok, binary()} | :error), binary()) ::
+          {:ok, binary()} | :error
+  defp decode_sized(decoder, encoded) do
+    case decoder.(encoded) do
+      {:ok, raw} when byte_size(raw) in [32, 64] -> {:ok, raw}
+      _other -> :error
     end
   end
 

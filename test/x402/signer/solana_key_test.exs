@@ -29,6 +29,19 @@ defmodule X402.Signer.SolanaKeyTest do
                {:error, :invalid_private_key}
     end
 
+    test "Base58 keys whose text is also valid Base64 decode as Base58" do
+      # 44- and 88-character Base58 strings are valid Base64 lengths too; a
+      # Base64-first decode yields 33/66 garbage bytes and rejects real
+      # Phantom / solana-keygen imports (review finding).
+      base58_seed = Base58.encode(@seed)
+      assert rem(byte_size(base58_seed), 4) == 0 or byte_size(base58_seed) in [43, 44]
+      assert {:ok, %{address: @address}} = SolanaKey.new(base58_seed)
+
+      {public, _} = :crypto.generate_key(:eddsa, :ed25519, @seed)
+      base58_keypair = Base58.encode(@seed <> public)
+      assert {:ok, %{address: @address}} = SolanaKey.new(base58_keypair)
+    end
+
     test "accepts Base58 and Base64 encodings" do
       {public, _private} = :crypto.generate_key(:eddsa, :ed25519, @seed)
 
