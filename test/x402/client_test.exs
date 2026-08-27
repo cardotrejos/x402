@@ -211,13 +211,38 @@ defmodule X402.ClientTest do
     end
 
     test "returns unsupported_kind for schemes and networks it cannot sign" do
-      upto = Map.put(@evm_requirements, "scheme", "upto")
+      cash = Map.put(@evm_requirements, "scheme", "cash")
 
-      assert Client.build_payment(upto, signer()) ==
-               {:error, {:unsupported_kind, "upto", "eip155:84532"}}
+      assert Client.build_payment(cash, signer()) ==
+               {:error, {:unsupported_kind, "cash", "eip155:84532"}}
 
       assert Client.build_payment(@solana_requirements, signer()) ==
                {:error, {:unsupported_kind, "exact", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"}}
+    end
+
+    test "signs upto requirements via Permit2 when extra carries facilitatorAddress" do
+      upto =
+        @evm_requirements
+        |> Map.put("scheme", "upto")
+        |> put_in(
+          ["extra", "facilitatorAddress"],
+          "0x2222222222222222222222222222222222222222"
+        )
+
+      assert {:ok, payload} = Client.build_payment(upto, signer())
+      assert payload["accepted"] == upto
+
+      assert %{"signature" => "0x" <> _, "permit2Authorization" => authorization} =
+               payload["payload"]
+
+      assert authorization["permitted"]["amount"] == upto["amount"]
+
+      assert authorization["witness"]["facilitator"] ==
+               "0x2222222222222222222222222222222222222222"
+
+      # Without the facilitator address, the upto scheme cannot sign.
+      assert Client.build_payment(Map.put(upto, "extra", %{}), signer()) ==
+               {:error, {:missing_extra, "facilitatorAddress"}}
     end
 
     test "propagates signing errors for bare requirements" do

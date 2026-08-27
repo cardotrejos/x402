@@ -2,28 +2,38 @@ defmodule X402.Scheme.UptoEVM do
   @moduledoc """
   Built-in `X402.Scheme` for `upto` payments on EVM (`eip155:*`) networks.
 
-  Server-side only in this release: `c:X402.Scheme.validate_payload/3`
-  validates that the payment value the client signed does not exceed the
-  advertised maximum (the requirements' `amount`, with `maxPrice` and
-  `maxAmountRequired` fallbacks), recognizing the Permit2
-  (`permit2Authorization.permitted.amount`), `maxAmount`, `value`, and
-  EIP-3009 `authorization.value` payload shapes. Failures are
-  `{:error, {:invalid_upto_payment, reason}}` — see `t:validation_error/0`.
+  Implements both roles:
+
+  * **Client** — signs a Permit2 `PermitWitnessTransferFrom` through
+    `X402.Permit2`, producing the
+    `%{"signature" => ..., "permit2Authorization" => ...}` scheme payload.
+    The signed `permitted.amount` is the advertised **maximum**; the
+    server settles for the actual usage, up to that ceiling. An entry is
+    signable when its network is EVM (`eip155:*`) and its `extra` carries
+    the `facilitatorAddress` the witness must bind (facilitators announce
+    it via `GET /supported` — `X402.Facilitator.supported/1`); signing
+    without it fails with `{:error, {:missing_extra, "facilitatorAddress"}}`.
+  * **Server** — `c:X402.Scheme.validate_payload/3` validates that the
+    payment value the client signed does not exceed the advertised maximum
+    (the requirements' `amount`, with `maxPrice` and `maxAmountRequired`
+    fallbacks), recognizing the Permit2
+    (`permit2Authorization.permitted.amount`), `maxAmount`, `value`, and
+    EIP-3009 `authorization.value` payload shapes. Failures are
+    `{:error, {:invalid_upto_payment, reason}}` — see
+    `t:validation_error/0`.
 
   Pre-checks reuse the shared EIP-3009 authorization checks
   (`X402.Scheme.EVM.authorization_precheck/3` — payTo binding and validity
   window) without the exact-amount equality: for `upto`, the signed value
-  is a ceiling, not the settled amount.
-
-  `c:X402.Scheme.sign/3` is intentionally not implemented — `X402.Client`
-  cannot yet sign `upto` payments, so `upto` requirements return
-  `{:error, {:unsupported_kind, "upto", network}}` from
-  `X402.Client.build_payment/3`.
+  is a ceiling, not the settled amount. Permit2 payloads carry no
+  `payload.authorization` map and pass through to the facilitator.
   """
 
   @behaviour X402.Scheme
 
+  alias X402.Permit2
   alias X402.Scheme.EVM
+  alias X402.Signer
   alias X402.Utils
 
   @typedoc "Reasons an `upto` payment fails ceiling validation."
@@ -59,6 +69,47 @@ defmodule X402.Scheme.UptoEVM do
   @impl X402.Scheme
   @spec networks() :: [String.t()]
   def networks, do: ["eip155:*"]
+
+  @doc since: "0.6.0"
+  @doc """
+  Whether the client can sign this requirements entry.
+
+  Requires an EVM (`eip155:*`) network the Permit2 domain can be derived
+  from and a `facilitatorAddress` in `extra` for the witness binding.
+
+  ## Examples
+
+      iex> X402.Scheme.UptoEVM.signable?(%{
+      ...>   "network" => "eip155:84532",
+      ...>   "extra" => %{"facilitatorAddress" => "0x2222222222222222222222222222222222222222"}
+      ...> })
+      true
+
+      iex> X402.Scheme.UptoEVM.signable?(%{"network" => "eip155:84532", "extra" => %{}})
+      false
+  """
+  @impl X402.Scheme
+  @spec signable?(map()) :: boolean()
+  def signable?(requirements) when is_map(requirements) do
+    match?({:ok, _domain}, Permit2.upto_domain(requirements)) and
+      match?({:ok, _address}, Permit2.facilitator_address(requirements))
+  end
+
+  def signable?(_requirements), do: false
+
+  @doc since: "0.6.0"
+  @doc """
+  Signs the Permit2 `upto` scheme payload via `X402.Permit2.sign_upto/2`.
+
+  The client's build options are ignored — the authorization is valid
+  immediately (`witness.validAfter` `"0"`) and expires after the
+  requirements' `maxTimeoutSeconds`, mirroring the reference SDKs.
+  """
+  @impl X402.Scheme
+  @spec sign(map(), Signer.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def sign(requirements, signer, _opts) do
+    Permit2.sign_upto(requirements, signer)
+  end
 
   @doc since: "0.6.0"
   @doc """

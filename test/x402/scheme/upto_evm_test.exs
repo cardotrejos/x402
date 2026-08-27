@@ -4,6 +4,7 @@ defmodule X402.Scheme.UptoEVMTest do
   doctest X402.Scheme.UptoEVM
 
   alias X402.Scheme.UptoEVM
+  alias X402.Signer.LocalKey
 
   @requirements %{
     "scheme" => "upto",
@@ -21,8 +22,45 @@ defmodule X402.Scheme.UptoEVMTest do
       assert UptoEVM.networks() == ["eip155:*"]
     end
 
-    test "does not implement the client sign callback" do
-      refute function_exported?(UptoEVM, :sign, 3)
+    test "implements the client sign callback" do
+      assert function_exported?(UptoEVM, :sign, 3)
+    end
+  end
+
+  describe "signable?/1" do
+    test "requires an EVM network and extra.facilitatorAddress" do
+      signable = %{
+        "network" => "eip155:84532",
+        "extra" => %{"facilitatorAddress" => "0x2222222222222222222222222222222222222222"}
+      }
+
+      assert UptoEVM.signable?(signable)
+      refute UptoEVM.signable?(put_in(signable, ["extra"], %{}))
+      refute UptoEVM.signable?(Map.put(signable, "network", "solana:mainnet"))
+      refute UptoEVM.signable?("nope")
+    end
+  end
+
+  describe "sign/3" do
+    test "signs the Permit2 upto payload through X402.Permit2" do
+      {:ok, signer} = LocalKey.new("0x" <> String.duplicate("11", 32))
+
+      requirements = %{
+        "scheme" => "upto",
+        "network" => "eip155:84532",
+        "amount" => "10000",
+        "asset" => "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        "payTo" => "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+        "maxTimeoutSeconds" => 60,
+        "extra" => %{"facilitatorAddress" => "0x2222222222222222222222222222222222222222"}
+      }
+
+      assert {:ok, payload} = UptoEVM.sign(requirements, signer, valid_after_buffer: 60)
+      assert %{"signature" => "0x" <> _, "permit2Authorization" => authorization} = payload
+      assert authorization["permitted"]["amount"] == "10000"
+
+      assert UptoEVM.sign(put_in(requirements, ["extra"], %{}), signer, []) ==
+               {:error, {:missing_extra, "facilitatorAddress"}}
     end
   end
 

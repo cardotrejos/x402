@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Client-side `upto` payments via Permit2** (ecosystem report §8 P2.2):
+  the new `X402.Permit2` module builds and signs the upto-EVM scheme's
+  Permit2 `PermitWitnessTransferFrom` — `permitted.amount` is the
+  advertised **maximum** (the server settles for actual usage up to it),
+  the spender is the canonical `x402UptoPermit2Proxy`
+  (`0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002`), and the witness struct
+  `Witness(address to,address facilitator,uint256 validAfter)` binds the
+  requirements' `payTo` and `extra.facilitatorAddress` so only the
+  announced facilitator can settle. Signing hashes against the canonical
+  version-less Permit2 EIP-712 domain (name `"Permit2"`, chain id from
+  the CAIP-2 network, verifying contract
+  `0x000000000022D473030F116dDEE9F6B43aC78BA3`);
+  `X402.EIP712.domain_separator/1` now supports such version-less
+  domains. `X402.Scheme.UptoEVM` implements `sign/3` and `signable?/1`
+  (an `eip155:*` network plus `extra.facilitatorAddress`, as delivered
+  by the facilitator's `GET /supported`), so
+  `X402.Client.build_payment/3` and `X402.Client.Finch.request/3` pay
+  `upto` requirements out of the box; entries without a facilitator
+  address are never selected, and signing one returns
+  `{:error, {:missing_extra, "facilitatorAddress"}}`. See the new
+  Metered `upto` payments section in the client guide
 - `X402.Extensions.PaymentIdentifier.RedisCache` — a Redis-backed
   `X402.Extensions.PaymentIdentifier.Cache` adapter for clustered
   deployments (ROADMAP P1.3b), over the **new optional `redix` dependency**.

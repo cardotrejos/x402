@@ -79,6 +79,25 @@ defmodule X402.EIP712Test do
       assert EIP712.domain_separator(%{@domain | verifying_contract: "0xnope"}) ==
                {:error, :invalid_address}
     end
+
+    test "hashes the three-field EIP712Domain type for version-less domains" do
+      domain = %{name: "Permit2", chain_id: 84_532, verifying_contract: @contract}
+
+      "0x" <> contract_hex = @contract
+      contract_word = <<0::96, Base.decode16!(contract_hex, case: :mixed)::binary>>
+
+      expected =
+        ExKeccak.hash_256(
+          ExKeccak.hash_256("EIP712Domain(string name,uint256 chainId,address verifyingContract)") <>
+            ExKeccak.hash_256("Permit2") <> <<84_532::256>> <> contract_word
+        )
+
+      assert EIP712.domain_separator(domain) == {:ok, expected}
+
+      # A versioned domain hashes differently.
+      assert {:ok, versioned} = EIP712.domain_separator(Map.put(domain, :version, "1"))
+      refute versioned == expected
+    end
   end
 
   describe "hash_struct/2 and digest/2" do

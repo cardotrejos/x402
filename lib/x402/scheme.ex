@@ -15,9 +15,8 @@ defmodule X402.Scheme do
 
   The built-in schemes are `X402.Scheme.ExactEVM` (`exact` on `eip155:*`
   networks via EIP-3009) and `X402.Scheme.UptoEVM` (`upto` on `eip155:*`
-  networks, server-side only). Resolution — including wildcard CAIP-2
-  matching and exact-match precedence — is handled by
-  `X402.Scheme.Registry`.
+  networks via Permit2). Resolution — including wildcard CAIP-2 matching
+  and exact-match precedence — is handled by `X402.Scheme.Registry`.
 
   ## Callbacks and the roles they serve
 
@@ -32,8 +31,8 @@ defmodule X402.Scheme do
 
   Only `c:scheme/0` and `c:networks/0` are required. A scheme module
   implements the callbacks for the roles it plays: a client-only scheme can
-  omit `c:validate_payload/3` and `c:precheck/3`; a server-only scheme (like
-  `X402.Scheme.UptoEVM`) can omit `c:sign/3`. Missing optional callbacks are
+  omit `c:validate_payload/3` and `c:precheck/3`; a server-only scheme can
+  omit `c:sign/3`. Missing optional callbacks are
   neutral — signing falls back to the `{:unsupported_kind, scheme, network}`
   error, while validation and pre-checks pass through with `:ok` (the
   facilitator remains the authority).
@@ -228,7 +227,7 @@ defmodule X402.Scheme do
       true
 
       iex> X402.Scheme.signs?(X402.Scheme.UptoEVM)
-      false
+      true
   """
   @spec signs?(t()) :: boolean()
   def signs?(module), do: Code.ensure_loaded?(module) and function_exported?(module, :sign, 3)
@@ -239,7 +238,10 @@ defmodule X402.Scheme do
 
   ## Examples
 
-      iex> X402.Scheme.signable?(X402.Scheme.UptoEVM, %{})
+      iex> X402.Scheme.signable?(X402.Scheme.UptoEVM, %{
+      ...>   "network" => "eip155:84532",
+      ...>   "extra" => %{"facilitatorAddress" => "0x2222222222222222222222222222222222222222"}
+      ...> })
       true
 
       iex> X402.Scheme.signable?(X402.Scheme.ExactEVM, %{})
