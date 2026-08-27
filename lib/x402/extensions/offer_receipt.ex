@@ -520,7 +520,7 @@ defmodule X402.Extensions.OfferReceipt do
   """
   @spec verify_offer(envelope(), keyword()) :: {:ok, verification()} | {:error, verify_error()}
   def verify_offer(envelope, opts \\ []) when is_map(envelope) and is_list(opts) do
-    verify(envelope, opts, &offer_digest/1)
+    verify(envelope, opts, :offer)
   end
 
   @doc since: "0.6.0"
@@ -534,7 +534,7 @@ defmodule X402.Extensions.OfferReceipt do
   """
   @spec verify_receipt(envelope(), keyword()) :: {:ok, verification()} | {:error, verify_error()}
   def verify_receipt(envelope, opts \\ []) when is_map(envelope) and is_list(opts) do
-    verify(envelope, opts, &receipt_digest/1)
+    verify(envelope, opts, :receipt)
   end
 
   @doc since: "0.6.0"
@@ -812,18 +812,18 @@ defmodule X402.Extensions.OfferReceipt do
   # Shared verification
   # ---------------------------------------------------------------------------
 
-  @spec verify(envelope(), keyword(), (payload() -> {:ok, <<_::256>>} | {:error, term()})) ::
+  @spec verify(envelope(), keyword(), :offer | :receipt) ::
           {:ok, verification()} | {:error, verify_error()}
-  defp verify(envelope, opts, digest_fun) do
+  defp verify(envelope, opts, kind) do
     opts = NimbleOptions.validate!(opts, @verify_opts_schema)
 
     case envelope do
       %{"format" => "eip712", "payload" => payload, "signature" => signature}
       when is_map(payload) and is_binary(signature) ->
-        verify_eip712(payload, signature, opts, digest_fun)
+        verify_eip712(payload, signature, opts, kind)
 
       %{"format" => "jws", "signature" => jws} when is_binary(jws) ->
-        verify_jws(jws, opts)
+        verify_jws(jws, opts, kind)
 
       %{"format" => format} when format in ["eip712", "jws"] ->
         {:error, :invalid_envelope}
@@ -836,19 +836,47 @@ defmodule X402.Extensions.OfferReceipt do
     end
   end
 
-  @spec verify_eip712(payload(), String.t(), keyword(), fun()) ::
+  @spec kind_digest(:offer | :receipt, payload()) :: {:ok, <<_::256>>} | {:error, term()}
+  defp kind_digest(:offer, payload), do: offer_digest(payload)
+  defp kind_digest(:receipt, payload), do: receipt_digest(payload)
+
+  # Kind confusion guard: an offer payload must never verify as a receipt (or
+  # vice versa). EIP-712 is type-bound through distinct domains, but the JWS
+  # envelope signs the payload bytes with no type binding, so both branches
+  # validate the payload against the expected kind's schema before accepting.
+  @spec kind_validate(:offer | :receipt, payload()) :: :ok | {:error, term()}
+  defp kind_validate(:offer, payload), do: validate_offer_payload(payload)
+  defp kind_validate(:receipt, payload), do: validate_receipt_payload(payload)
+
+  @spec verify_eip712(payload(), String.t(), keyword(), :offer | :receipt) ::
           {:ok, verification()} | {:error, verify_error()}
-  defp verify_eip712(payload, signature, opts, digest_fun) do
+  defp verify_eip712(payload, signature, opts, kind) do
     with :ok <- ensure_payload_version(payload),
-         {:ok, digest} <- digest_fun.(payload),
+         :ok <- kind_validate(kind, payload),
+         {:ok, digest} <- kind_digest(kind, payload),
          {:ok, signer} <- EIP3009.recover_signer(digest, signature),
          :ok <- check_expected_signer(signer, Keyword.get(opts, :expected_signer)) do
-      {:ok, %{format: "eip712", signer: signer, payload: payload}}
+      # Only the canonical fields enter the struct hash — returning the
+      # transmitted map verbatim would let unsigned extra keys masquerade as
+      # signed data, so the verified payload is stripped to the signed fields.
+      {:ok, %{format: "eip712", signer: signer, payload: signed_payload(kind, payload)}}
     end
   end
 
-  @spec verify_jws(String.t(), keyword()) :: {:ok, verification()} | {:error, verify_error()}
-  defp verify_jws(jws, opts) do
+  @spec signed_payload(:offer | :receipt, payload()) :: payload()
+  defp signed_payload(kind, payload) do
+    fields =
+      case kind do
+        :offer -> offer_hash_fields()
+        :receipt -> receipt_hash_fields()
+      end
+
+    Map.take(payload, Enum.map(fields, fn {key, _kind, _default} -> key end))
+  end
+
+  @spec verify_jws(String.t(), keyword(), :offer | :receipt) ::
+          {:ok, verification()} | {:error, verify_error()}
+  defp verify_jws(jws, opts, kind) do
     case Keyword.get(opts, :public_key) do
       nil ->
         {:error, :missing_public_key}
@@ -857,7 +885,8 @@ defmodule X402.Extensions.OfferReceipt do
         with {:ok, %{header: header, payload: payload}} <-
                JWS.verify(jws, public_key, algs: Keyword.fetch!(opts, :algs)),
              :ok <- ensure_map_payload(payload),
-             :ok <- ensure_payload_version(payload) do
+             :ok <- ensure_payload_version(payload),
+             :ok <- kind_validate(kind, payload) do
           {:ok, %{format: "jws", header: header, payload: payload}}
         end
     end

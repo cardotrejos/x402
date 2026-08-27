@@ -214,6 +214,17 @@ defmodule X402.Extensions.OfferReceiptTest do
       assert String.match?(offer["signature"], ~r/^0x[0-9a-f]{130}$/)
     end
 
+    test "verified payloads strip unsigned extra keys" do
+      # Only the canonical fields enter the struct hash — an extra key added
+      # after signing must not come back looking signed.
+      assert {:ok, offer} = OfferReceipt.sign_offer(offer_payload(), signer())
+
+      inflated = put_in(offer, ["payload", "unsignedNote"], "added in transit")
+
+      assert {:ok, %{payload: verified}} = OfferReceipt.verify_offer(inflated)
+      refute Map.has_key?(verified, "unsignedNote")
+    end
+
     test "an absent validUntil is signed and transmitted as 0 (§4.3)" do
       payload = Map.delete(offer_payload(), "validUntil")
       assert {:ok, offer} = OfferReceipt.sign_offer(payload, signer())
@@ -370,6 +381,25 @@ defmodule X402.Extensions.OfferReceiptTest do
                OfferReceipt.verify_receipt(receipt, public_key: public)
 
       assert verified == payload
+    end
+
+    test "a signed offer JWS never verifies as a receipt (kind confusion)", %{ed: {public, seed}} do
+      # A public offer JWS is signed by the same key that signs receipts — if
+      # verify_receipt accepted it, an attacker could present the published
+      # offer as forged settlement evidence.
+      assert {:ok, offer} =
+               OfferReceipt.sign_offer_jws(offer_payload(), alg: "EdDSA", kid: @kid, key: seed)
+
+      assert {:error, _kind_mismatch} = OfferReceipt.verify_receipt(offer, public_key: public)
+
+      assert {:ok, receipt} =
+               OfferReceipt.sign_receipt_jws(receipt_payload(),
+                 alg: "EdDSA",
+                 kid: @kid,
+                 key: seed
+               )
+
+      assert {:error, _kind_mismatch2} = OfferReceipt.verify_offer(receipt, public_key: public)
     end
 
     test "optional fields stay omitted in JWS payloads", %{ed: {public, seed}} do
