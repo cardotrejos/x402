@@ -73,8 +73,13 @@ defmodule X402.Facilitator do
     ],
     receive_timeout_ms: [
       type: :non_neg_integer,
-      default: 5_000,
-      doc: "HTTP receive timeout in milliseconds."
+      default: 90_000,
+      doc:
+        "HTTP receive timeout in milliseconds. Defaults to 90s so it comfortably " <>
+          "exceeds the self-hosted engine's default 60s `:receipt_timeout_ms` " <>
+          "(`X402.Facilitator.Engine`); a shorter client timeout would give up " <>
+          "mid-settlement and retry, risking a double broadcast. Lower it only if " <>
+          "the remote facilitator's own settlement wait is smaller."
     ],
     auth: [
       type: {:custom, __MODULE__, :validate_auth, []},

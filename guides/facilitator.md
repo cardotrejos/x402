@@ -58,6 +58,15 @@ Point any x402 resource server at it — including this SDK's own
 `X402.Facilitator.Engine.verify/3` and `settle/3` directly from your own
 transport, skipping HTTP entirely.
 
+If you drive this engine through the SDK's `X402.Facilitator` client, keep
+the client's `:receive_timeout_ms` (default: `90_000`) comfortably above
+the engine's `:receipt_timeout_ms` (default: `60_000`). A shorter client
+timeout gives up mid-settlement, and the client's built-in retry can
+issue a second `POST /settle` while the first transaction is still in
+flight — the payer's authorization is already broadcast, so the retry
+races the confirmation and may look like a settlement failure to the
+caller.
+
 A complete runnable project lives in `examples/facilitator/`.
 
 ## What verify checks

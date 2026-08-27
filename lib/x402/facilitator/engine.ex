@@ -473,17 +473,87 @@ defmodule X402.Facilitator.Engine do
     with {:ok, inner_signature} <- inner_signature(payload),
          {:ok, calldata} <- build_calldata(payload, inner_signature, signature_type),
          {:ok, from} <- Signer.address(engine.signer),
-         {:ok, chain_id} <- chain_id(requirements),
-         {:ok, params} <- transaction_params(engine, from, asset(requirements), calldata),
-         {:ok, raw} <- sign_transaction(engine, chain_id, params, asset(requirements), calldata) do
-      broadcast_and_await(engine, raw, network, payer)
+         {:ok, chain_id} <- chain_id(requirements) do
+      asset = asset(requirements)
+      outcome = sign_and_broadcast(engine, from, chain_id, asset, calldata)
+      handle_broadcast(engine, outcome, network, payer)
     else
-      {:settle_failed, reason_string} ->
-        {:settled, failure_response(reason_string, "", network, payer)}
-
-      {:error, reason} ->
-        {:error, reason}
+      {:error, reason} -> {:error, reason}
     end
+  end
+
+  @typep broadcast_outcome ::
+           {:sent, String.t()}
+           | :jsonrpc_rejected
+           | {:transport_failed, binary(), term()}
+           | {:invalid_response, term()}
+           | {:settle_failed, String.t()}
+           | {:error, term()}
+
+  # Nonce-critical section: fetching the pending nonce, signing the EIP-1559
+  # transaction, and broadcasting it must be serialized per fee-payer address,
+  # or two concurrent settles would sign different transactions with the same
+  # nonce and one would be rejected as `unexpected_settle_error` (or the
+  # broadcasts would race to replace each other). The lock is released as
+  # soon as the node accepts the broadcast — receipt polling does not
+  # consume a nonce and can run concurrently.
+  @spec sign_and_broadcast(t(), String.t(), non_neg_integer(), String.t(), binary()) ::
+          broadcast_outcome()
+  defp sign_and_broadcast(engine, from, chain_id, asset, calldata) do
+    with_fee_payer_lock(from, fn ->
+      with {:ok, params} <- transaction_params(engine, from, asset, calldata),
+           {:ok, raw} <- sign_transaction(engine, chain_id, params, asset, calldata) do
+        broadcast(engine, raw)
+      end
+    end)
+  end
+
+  @spec broadcast(t(), binary()) :: broadcast_outcome()
+  defp broadcast(engine, raw) do
+    case RPC.request(engine.rpc, "eth_sendRawTransaction", [hex(raw)]) do
+      {:ok, transaction_hash} when is_binary(transaction_hash) ->
+        {:sent, transaction_hash}
+
+      {:ok, other} ->
+        {:invalid_response, other}
+
+      {:error, {:jsonrpc_error, _error}} ->
+        :jsonrpc_rejected
+
+      # A transport failure mid-broadcast is ambiguous — the node may have
+      # accepted the transaction. Kept out of the lock's return path so the
+      # locally computed hash resolution happens without holding the lock.
+      {:error, reason} ->
+        {:transport_failed, raw, reason}
+    end
+  end
+
+  @spec handle_broadcast(t(), broadcast_outcome(), String.t(), String.t() | nil) ::
+          settle_result()
+  defp handle_broadcast(engine, {:sent, transaction_hash}, network, payer),
+    do: await_receipt(engine, transaction_hash, network, payer)
+
+  defp handle_broadcast(_engine, :jsonrpc_rejected, network, payer),
+    do: {:settled, failure_response("unexpected_settle_error", "", network, payer)}
+
+  defp handle_broadcast(_engine, {:transport_failed, raw, reason}, network, payer),
+    do: pending_after_transport_failure(raw, network, payer, reason)
+
+  defp handle_broadcast(_engine, {:invalid_response, other}, _network, _payer),
+    do: {:error, {:rpc_error, {:invalid_response, other}}}
+
+  defp handle_broadcast(_engine, {:settle_failed, reason_string}, network, payer),
+    do: {:settled, failure_response(reason_string, "", network, payer)}
+
+  defp handle_broadcast(_engine, {:error, reason}, _network, _payer),
+    do: {:error, reason}
+
+  # `:global.trans/3` blocks until the lock is acquired (infinite retries)
+  # and is released automatically if the caller crashes; scoped to `[node()]`
+  # because the nonce sequence is node-local.
+  @spec with_fee_payer_lock(String.t(), (-> broadcast_outcome())) :: broadcast_outcome()
+  defp with_fee_payer_lock(from, fun) do
+    :global.trans({{__MODULE__, :settle_nonce, String.downcase(from)}, self()}, fun, [node()])
   end
 
   @spec inner_signature(map()) :: {:ok, binary()} | {:error, term()}
@@ -627,27 +697,6 @@ defmodule X402.Facilitator.Engine do
       {:ok, raw}
     else
       {:error, reason} -> {:error, {:settle_error, reason}}
-    end
-  end
-
-  @spec broadcast_and_await(t(), binary(), String.t(), String.t() | nil) :: settle_result()
-  defp broadcast_and_await(engine, raw, network, payer) do
-    case RPC.request(engine.rpc, "eth_sendRawTransaction", [hex(raw)]) do
-      {:ok, transaction_hash} when is_binary(transaction_hash) ->
-        await_receipt(engine, transaction_hash, network, payer)
-
-      {:ok, other} ->
-        {:error, {:rpc_error, {:invalid_response, other}}}
-
-      {:error, {:jsonrpc_error, _error}} ->
-        {:settled, failure_response("unexpected_settle_error", "", network, payer)}
-
-      {:error, reason} ->
-        # A transport failure mid-broadcast is ambiguous — the node may have
-        # accepted the transaction. Return the spec's non-terminal
-        # settlement_pending with the locally computed hash so the caller
-        # can reconcile on chain.
-        pending_after_transport_failure(raw, network, payer, reason)
     end
   end
 
