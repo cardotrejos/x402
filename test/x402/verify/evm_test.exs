@@ -816,6 +816,42 @@ defmodule X402.Verify.EVMTest do
                        [%{"to" => @smart_wallet, "data" => "0x1626ba7e" <> _args} | _block]}
     end
 
+    test "simulates a 65-byte ERC-1271 signature through the bytes overload", context do
+      # A smart wallet's signature can be exactly 65 bytes; the (v, r, s)
+      # overload would run on-chain ECDSA and wrongly reject it. Overload
+      # selection must follow the verified signature TYPE, not byte length.
+      rpc =
+        stub_rpc(context, %{
+          code: %{String.downcase(@asset) => "0x6001", @smart_wallet => "0x6001"}
+        })
+
+      requirements = requirements()
+
+      payload =
+        unsigned_payload(requirements, @smart_wallet, "0x" <> String.duplicate("22", 65))
+
+      assert {:ok, %{signature_type: :erc1271}} =
+               EVM.verify(payload, requirements, level: :full, rpc: rpc)
+
+      assert_received {:rpc, "eth_call", [%{"data" => "0xcf092995" <> _args} | _block]}
+      refute_received {:rpc, "eth_call", [%{"data" => "0xe3ee160e" <> _args} | _block2]}
+    end
+
+    test "rejects uint256-overflowing timing values instead of crashing" do
+      requirements = requirements()
+      payload = contract_payload(requirements)
+
+      overflowing =
+        put_in(
+          payload,
+          ["payload", "authorization", "validBefore"],
+          Integer.to_string(Integer.pow(2, 256))
+        )
+
+      assert {:error, {:invalid, _reason}} =
+               EVM.verify(overflowing, requirements, level: :structural)
+    end
+
     test "rejects a wallet returning a non-magic value", context do
       rpc =
         stub_rpc(context, %{

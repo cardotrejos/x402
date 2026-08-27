@@ -172,6 +172,7 @@ defmodule X402.MixProject do
           X402.MCP,
           X402.MCP.Server,
           X402.MCP.Client
+        ],
         "Local Verification": [
           X402.Verify.EVM,
           X402.RPC,

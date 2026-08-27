@@ -493,11 +493,17 @@ defmodule X402.Verify.EVM do
   end
 
   @spec parse_non_neg_integer(term()) :: {:ok, non_neg_integer()} | :error
-  defp parse_non_neg_integer(value) when is_integer(value) and value >= 0, do: {:ok, value}
+  # uint256 fields: values at or above 2^256 cannot be ABI-encoded and would
+  # crash word encoding downstream — reject them here.
+  @uint256_limit Integer.pow(2, 256)
+
+  defp parse_non_neg_integer(value)
+       when is_integer(value) and value >= 0 and value < @uint256_limit,
+       do: {:ok, value}
 
   defp parse_non_neg_integer(value) when is_binary(value) do
     case Integer.parse(value) do
-      {parsed, ""} when parsed >= 0 -> {:ok, parsed}
+      {parsed, ""} when parsed >= 0 and parsed < @uint256_limit -> {:ok, parsed}
       _parsed -> :error
     end
   end
@@ -796,16 +802,17 @@ defmodule X402.Verify.EVM do
   defp maybe_simulate(rpc, ctx, parsed, :erc6492_counterfactual, opts),
     do: simulate_counterfactual(rpc, ctx, parsed, opts)
 
-  defp maybe_simulate(rpc, ctx, parsed, _signature_type, opts) do
+  defp maybe_simulate(rpc, ctx, parsed, signature_type, opts) do
     case Keyword.fetch!(opts, :simulate) do
-      true -> simulate_transfer(rpc, ctx, parsed)
+      true -> simulate_transfer(rpc, ctx, parsed, signature_type)
       false -> :ok
     end
   end
 
-  @spec simulate_transfer(RPC.t(), map(), ERC6492.parsed()) :: :ok | {:error, error()}
-  defp simulate_transfer(rpc, ctx, parsed) do
-    with {:ok, calldata} <- transfer_calldata(ctx, parsed.inner_signature) do
+  @spec simulate_transfer(RPC.t(), map(), ERC6492.parsed(), signature_type()) ::
+          :ok | {:error, error()}
+  defp simulate_transfer(rpc, ctx, parsed, signature_type) do
+    with {:ok, calldata} <- transfer_calldata(ctx, parsed.inner_signature, signature_type) do
       case RPC.call(rpc, %{"to" => ctx.asset, "data" => hex(calldata)}) do
         {:ok, _return} -> :ok
         {:error, {:jsonrpc_error, error}} -> handle_simulation_revert(rpc, ctx, error)
@@ -822,7 +829,8 @@ defmodule X402.Verify.EVM do
   @spec simulate_counterfactual(RPC.t(), map(), ERC6492.parsed(), keyword()) ::
           :ok | {:error, error()}
   defp simulate_counterfactual(rpc, ctx, parsed, opts) do
-    with {:ok, transfer} <- transfer_calldata(ctx, parsed.inner_signature) do
+    with {:ok, transfer} <-
+           transfer_calldata(ctx, parsed.inner_signature, :erc6492_counterfactual) do
       calldata =
         aggregate3_calldata([
           {parsed.factory, parsed.factory_calldata},
@@ -1001,27 +1009,33 @@ defmodule X402.Verify.EVM do
     word
   end
 
-  @spec transfer_calldata(map(), binary()) ::
+  @spec transfer_calldata(map(), binary(), signature_type()) ::
           {:ok, binary()} | {:error, {:invalid, :invalid_signature}}
-  defp transfer_calldata(ctx, inner_signature) do
+  # The overload is selected by the VERIFIED signature type, never by byte
+  # length: a smart wallet's ERC-1271 signature can be exactly 65 bytes, and
+  # the (v, r, s) overload performs on-chain ECDSA, which would wrongly
+  # reject it. Only EOA signatures take the ECDSA overload; contract
+  # signatures always go through the bytes variant, whose token-side
+  # SignatureChecker routes by account code.
+  defp transfer_calldata(ctx, <<r::binary-size(32), s::binary-size(32), v>>, :eoa) do
     base = authorization_words(ctx)
 
-    case inner_signature do
-      <<r::binary-size(32), s::binary-size(32), v>> ->
-        {:ok,
-         @selector_transfer_vrs <>
-           base <> <<normalize_v(v)::unsigned-big-integer-size(256)>> <> r <> s}
-
-      signature when byte_size(signature) > 0 ->
-        {:ok,
-         @selector_transfer_bytes <>
-           base <>
-           <<7 * 32::unsigned-big-integer-size(256)>> <> encode_dynamic_bytes(signature)}
-
-      _signature ->
-        {:error, {:invalid, :invalid_signature}}
-    end
+    {:ok,
+     @selector_transfer_vrs <>
+       base <> <<normalize_v(v)::unsigned-big-integer-size(256)>> <> r <> s}
   end
+
+  defp transfer_calldata(ctx, signature, _signature_type) when byte_size(signature) > 0 do
+    base = authorization_words(ctx)
+
+    {:ok,
+     @selector_transfer_bytes <>
+       base <>
+       <<7 * 32::unsigned-big-integer-size(256)>> <> encode_dynamic_bytes(signature)}
+  end
+
+  defp transfer_calldata(_ctx, _signature, _signature_type),
+    do: {:error, {:invalid, :invalid_signature}}
 
   @spec authorization_words(map()) :: binary()
   defp authorization_words(ctx) do
