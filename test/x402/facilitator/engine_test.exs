@@ -101,6 +101,13 @@ defmodule X402.Facilitator.EngineTest do
       assert {:error, %NimbleOptions.ValidationError{}} =
                Engine.new(rpc: :nope, signer: facilitator_signer(), networks: [@network])
     end
+
+    test "rejects structs that do not implement X402.Signer", %{finch: finch} do
+      {:ok, rpc} = RPC.new(rpc_url: "https://sepolia.base.org", finch: finch)
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Engine.new(rpc: rpc, signer: %URI{}, networks: [@network])
+    end
   end
 
   # -- supported/1 ------------------------------------------------------------
@@ -400,6 +407,52 @@ defmodule X402.Facilitator.EngineTest do
       refute_received {:rpc, "eth_sendRawTransaction", _params}
     end
 
+    test "a transport failure on broadcast returns settlement_pending with the local hash",
+         context do
+      engine = engine(context, stub: %{send_raw: :http_error})
+      requirements = requirements()
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "settlement_pending",
+                "transaction" => transaction_hash
+              }} = Engine.settle(engine, signed_payload(requirements), requirements)
+
+      # The hash is computed locally: keccak-256 of the raw transaction that
+      # was on the wire when the transport failed.
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex]}
+      raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+      assert transaction_hash == "0x" <> Base.encode16(ExKeccak.hash_256(raw), case: :lower)
+    end
+
+    test "a non-binary broadcast result is an infrastructure error", context do
+      engine = engine(context, stub: %{send_raw: {:ok, 42}})
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:invalid_response, 42}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "an unreachable RPC is an infrastructure error", context do
+      engine = engine(context)
+      requirements = requirements()
+      payload = signed_payload(requirements)
+      Bypass.down(context.bypass)
+
+      assert {:error, {:rpc_error, _reason}} = Engine.settle(engine, payload, requirements)
+    end
+
+    test "an empty fee history falls back to eth_gasPrice", context do
+      engine = engine(context, stub: %{fee_history: {:ok, []}})
+      requirements = requirements()
+
+      assert {:ok, %{"success" => true}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      assert_received {:rpc, "eth_gasPrice", []}
+    end
+
     test "simulate_in_settle runs the eth_call simulation during re-verify", context do
       engine = engine(context, simulate_in_settle: true, stub: %{simulate: {:revert, "nope"}})
       requirements = requirements()
@@ -451,6 +504,51 @@ defmodule X402.Facilitator.EngineTest do
 
     def after_verify(context, _metadata),
       do: {:cont, %{context | result: Map.put(context.result, "note", "audited")}}
+  end
+
+  defmodule RaisingHooks do
+    @behaviour X402.Hooks
+
+    defdelegate after_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate on_verify_failure(context, metadata), to: X402.Hooks.Default
+    defdelegate before_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate after_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate on_settle_failure(context, metadata), to: X402.Hooks.Default
+
+    def before_verify(_context, _metadata), do: raise("hook boom")
+  end
+
+  defmodule InvalidReturnHooks do
+    @behaviour X402.Hooks
+
+    defdelegate before_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate on_verify_failure(context, metadata), to: X402.Hooks.Default
+    defdelegate before_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate after_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate on_settle_failure(context, metadata), to: X402.Hooks.Default
+
+    def after_verify(_context, _metadata), do: :nonsense
+  end
+
+  defmodule NilResultHooks do
+    @behaviour X402.Hooks
+
+    defdelegate before_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate on_verify_failure(context, metadata), to: X402.Hooks.Default
+    defdelegate before_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate after_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate on_settle_failure(context, metadata), to: X402.Hooks.Default
+
+    def after_verify(context, _metadata), do: {:cont, %{context | result: nil}}
+  end
+
+  defmodule NoAddressSigner do
+    @behaviour X402.Signer
+
+    defstruct []
+
+    def address(_signer), do: {:error, :no_address}
+    def sign_eip712(_signer, _digest, _typed_data), do: {:error, :no_key}
   end
 
   describe "hooks" do
@@ -509,6 +607,53 @@ defmodule X402.Facilitator.EngineTest do
 
       assert {:ok, %{"isValid" => true, "note" => "audited"}} =
                Engine.verify(engine, signed_payload(requirements), requirements)
+    end
+
+    test "after_verify leaving no result keeps the original response", context do
+      engine = engine(context, hooks: NilResultHooks)
+      requirements = requirements()
+
+      assert {:ok, %{"isValid" => true, "payer" => @payer}} =
+               Engine.verify(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a raising hook is an infrastructure error", context do
+      engine = engine(context, hooks: RaisingHooks)
+      requirements = requirements()
+
+      assert {:error, {:hook_callback_failed, :before_verify, {:exception, %RuntimeError{}}}} =
+               Engine.verify(engine, signed_payload(requirements), requirements)
+    end
+
+    test "an invalid hook return is an infrastructure error", context do
+      engine = engine(context, hooks: InvalidReturnHooks)
+      requirements = requirements()
+
+      assert {:error, {:hook_invalid_return, :after_verify, :nonsense}} =
+               Engine.verify(engine, signed_payload(requirements), requirements)
+    end
+
+    test "supported omits signers when the signer has no address", context do
+      engine = engine(context, signer: %NoAddressSigner{})
+
+      assert %{"signers" => %{}} = Engine.supported(engine)
+    end
+
+    test "on_verify_failure can recover an infrastructure error", context do
+      engine = engine(context, hooks: RecoverHooks)
+      requirements = requirements()
+      payload = signed_payload(requirements)
+      Bypass.down(context.bypass)
+
+      assert Engine.verify(engine, payload, requirements) ==
+               {:ok, %{"isValid" => true, "payer" => "0xrecovered"}}
+    end
+
+    test "responses omit the payer when the payload has none", context do
+      engine = engine(context)
+
+      assert Engine.verify(engine, %{"x402Version" => 2}, requirements(%{"scheme" => "upto"})) ==
+               {:ok, %{"isValid" => false, "invalidReason" => "unsupported_scheme"}}
     end
   end
 

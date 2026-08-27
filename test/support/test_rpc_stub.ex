@@ -34,20 +34,35 @@ defmodule X402.TestRPCStub do
 
     Bypass.stub(bypass, "POST", "/", fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
-
-      response =
-        case Jason.decode!(body) do
-          requests when is_list(requests) -> Enum.map(requests, &handle_rpc(&1, config, test_pid))
-          request -> handle_rpc(request, config, test_pid)
-        end
-
-      conn
-      |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.resp(200, Jason.encode!(response))
+      respond(conn, Jason.decode!(body), config, test_pid)
     end)
 
     {:ok, rpc} = RPC.new(rpc_url: "http://localhost:#{bypass.port}", finch: finch)
     rpc
+  end
+
+  # send_raw: :http_error simulates a transport-level broadcast failure
+  # (the node may or may not have accepted the transaction).
+  defp respond(
+         conn,
+         %{"method" => "eth_sendRawTransaction"} = request,
+         %{send_raw: :http_error},
+         test_pid
+       ) do
+    send(test_pid, {:rpc, "eth_sendRawTransaction", request["params"]})
+    Plug.Conn.resp(conn, 500, "boom")
+  end
+
+  defp respond(conn, decoded, config, test_pid) do
+    response =
+      case decoded do
+        requests when is_list(requests) -> Enum.map(requests, &handle_rpc(&1, config, test_pid))
+        request -> handle_rpc(request, config, test_pid)
+      end
+
+    conn
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> Plug.Conn.resp(200, Jason.encode!(response))
   end
 
   defp handle_rpc(%{"id" => id, "method" => method, "params" => params}, config, test_pid) do
