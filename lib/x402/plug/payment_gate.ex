@@ -29,10 +29,30 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     [x402 v2 specification](https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md)
     and
     [HTTP transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/http.md).
+
+    ## Replay protection
+
+    When `:payment_identifier_cache` is configured, the gate claims the SHA-256
+    hash of the raw `PAYMENT-SIGNATURE` header through the
+    `X402.Extensions.PaymentIdentifier.Cache` behaviour before settling.
+    Duplicate proofs are rejected with **402** and the claim is released when
+    the protected handler responds with a status >= 400 or settlement fails,
+    so clients may retry a payment whose resource was never delivered.
+
+    > #### Clustered deployments can serve one payment twice {: .warning}
+    >
+    > The default `X402.Extensions.PaymentIdentifier.ETSCache` adapter is
+    > **per-node**: every node in a cluster keeps its own claim table, so a
+    > replayed proof load-balanced onto two nodes runs the protected handler on
+    > each of them even though only one settlement can ultimately succeed. If
+    > you deploy more than one node, configure a shared-store adapter instead —
+    > see the "Writing a distributed adapter" section in
+    > `X402.Extensions.PaymentIdentifier.Cache` for a Redis sketch.
     """
 
     @behaviour Plug
 
+    alias X402.Extensions.PaymentIdentifier.Cache
     alias X402.Extensions.PaymentIdentifier.ETSCache
     alias X402.Facilitator
     alias X402.Facilitator.Error
@@ -218,13 +238,19 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         doc: "Lifecycle hook module implementing `X402.Hooks`."
       ],
       payment_identifier_cache: [
-        type: {:or, [:atom, :pid, :any]},
+        type: {:custom, __MODULE__, :validate_payment_identifier_cache, []},
         default: nil,
         doc: """
-        Optional `ETSCache` server pid/name used for idempotency. When set,
-        the plug performs an atomic claim (via `put_new`) on the payment proof
-        hash before settling, preventing concurrent requests from double-settling
-        the same payment.
+        Optional idempotency cache used for replay protection. Accepts either
+        an `ETSCache` server pid/name (the default adapter), or a
+        `{module, cache}` adapter tuple where `module` implements
+        `X402.Extensions.PaymentIdentifier.Cache` and `cache` is passed to its
+        callbacks (for example `{MyApp.RedisPaymentCache, MyApp.Redis}`).
+        When set, the plug performs an atomic claim (via the adapter's
+        `put_new/3`) on the payment proof hash before settling, preventing
+        concurrent requests from double-settling the same payment. The default
+        ETS adapter is per-node — see the "Replay protection" section above
+        for the clustering hazard.
         """
       ],
       routes: [
@@ -252,7 +278,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @type options :: %{
             facilitator: Facilitator.server(),
             hooks: module(),
-            payment_identifier_cache: ETSCache.server() | nil,
+            payment_identifier_cache: Cache.adapter() | nil,
             routes: [compiled_route()],
             local_prechecks: boolean()
           }
@@ -287,7 +313,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @type settlement_context :: %{
             facilitator: Facilitator.server(),
             hooks: module(),
-            payment_identifier_cache: ETSCache.server() | nil,
+            payment_identifier_cache: Cache.adapter() | nil,
             payment_id: String.t(),
             payment_payload: map(),
             requirements: map(),
@@ -311,6 +337,36 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     def validate_atomic_amount(_value), do: {:error, "expected a digit-only atomic-unit amount"}
+
+    @doc false
+    @spec validate_payment_identifier_cache(term()) ::
+            {:ok, Cache.adapter() | nil} | {:error, String.t()}
+    def validate_payment_identifier_cache(nil), do: {:ok, nil}
+
+    # {:global, name} and {:via, registry, term} are unambiguous GenServer
+    # names, never adapter tuples — route them to the default ETSCache adapter
+    # like a bare pid/name.
+    def validate_payment_identifier_cache({:global, _name} = server),
+      do: {:ok, {ETSCache, server}}
+
+    def validate_payment_identifier_cache({:via, registry, _term} = server)
+        when is_atom(registry),
+        do: {:ok, {ETSCache, server}}
+
+    def validate_payment_identifier_cache({module, _cache} = adapter) when is_atom(module) do
+      case Cache.validate_adapter(adapter) do
+        :ok ->
+          {:ok, adapter}
+
+        {:error, message} ->
+          {:error,
+           message <>
+             "; to address a remote ETSCache as {name, node}, wrap it explicitly: " <>
+             "{X402.Extensions.PaymentIdentifier.ETSCache, {name, node}}"}
+      end
+    end
+
+    def validate_payment_identifier_cache(server), do: {:ok, {ETSCache, server}}
 
     @doc false
     @spec validate_route(term()) :: {:ok, map()} | {:error, String.t()}
@@ -758,17 +814,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec claim_payment(ETSCache.server() | nil, String.t()) ::
-            :ok | {:error, :already_exists}
+    @spec claim_payment(Cache.adapter() | nil, String.t()) :: Cache.put_new_result()
     defp claim_payment(nil, _payment_id), do: :ok
 
-    defp claim_payment(cache, payment_id) do
-      ETSCache.put_new(cache, payment_id, :verified)
+    defp claim_payment(adapter, payment_id) do
+      Cache.put_new(adapter, payment_id, :verified)
     end
 
-    @spec release_claim(ETSCache.server() | nil, String.t()) :: :ok | {:error, term()}
+    @spec release_claim(Cache.adapter() | nil, String.t()) :: Cache.write_result()
     defp release_claim(nil, _payment_id), do: :ok
-    defp release_claim(cache, payment_id), do: ETSCache.delete(cache, payment_id)
+    defp release_claim(adapter, payment_id), do: Cache.delete(adapter, payment_id)
 
     @spec facilitator_verify(Facilitator.server(), map(), map(), module()) ::
             Facilitator.response()

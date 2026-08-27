@@ -4,6 +4,15 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
 
   Entries expire after `:ttl_ms` (default: 1 hour). Expired entries are removed
   by an internal periodic cleanup loop.
+
+  > #### Per-node only {: .warning}
+  >
+  > The ETS table lives on the local node. In a clustered BEAM deployment each
+  > node keeps its own independent table, so this adapter cannot prevent the
+  > same payment proof from being served once per node. See the
+  > "Clustered deployments" section in
+  > `X402.Extensions.PaymentIdentifier.Cache` for a shared-store adapter
+  > sketch.
   """
 
   use GenServer
@@ -139,9 +148,15 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   Returns `:ok` if the entry was inserted, or `{:error, :already_exists}` if
   a non-expired entry for `payment_id` is already present. This is used to
   prevent concurrent requests from double-settling the same payment proof.
+
+  When the table is at `:max_size` and purging expired entries does not free a
+  slot, returns `{:error, :cache_full}` instead of evicting a live claim —
+  evicting live claims would let cheap junk claims drop legitimate replay
+  locks. Size `:max_size` for your expected claim TTL × request rate.
   """
+  @impl Cache
   @spec put_new(server(), Cache.key(), Cache.value()) ::
-          :ok | {:error, :already_exists | :invalid_cache_value}
+          :ok | {:error, :already_exists | :cache_full | :invalid_cache_value}
   def put_new(cache, payment_id, value) when is_binary(payment_id) do
     case valid_value?(value) do
       true -> GenServer.call(cache, {:put_new, payment_id, value})
@@ -239,18 +254,31 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
       _ -> :ok
     end
 
-    # Enforce max_size — unlike `put`, the original put_new had no capacity
-    # check, allowing the cache to grow without bound under concurrent load.
-    if :ets.info(state.table, :size) >= state.max_size and
-         not :ets.member(state.table, payment_id) do
-      evict_soonest_expiry(state.table)
+    # Enforce max_size WITHOUT ever evicting a live entry. A claim protects a
+    # payment that is in flight or already settled; admitting a new claim by
+    # dropping another payer's live claim would let cheap junk claims (unique
+    # headers that later fail facilitator verification) evict legitimate
+    # replay locks and reopen double-delivery. Purge expired entries; if the
+    # table is still full, refuse the claim — the gate fails closed on this
+    # error, degrading to denial of new paid requests rather than replay.
+    if at_capacity?(state, payment_id) do
+      delete_expired_entries(state.table, now)
     end
 
-    # ets.insert_new is atomic — only one concurrent process wins the race.
-    case :ets.insert_new(state.table, {payment_id, value, expires_at_ms}) do
-      true -> {:reply, :ok, state}
-      false -> {:reply, {:error, :already_exists}, state}
-    end
+    reply =
+      cond do
+        at_capacity?(state, payment_id) ->
+          {:error, :cache_full}
+
+        # ets.insert_new is atomic — only one concurrent process wins the race.
+        :ets.insert_new(state.table, {payment_id, value, expires_at_ms}) ->
+          :ok
+
+        true ->
+          {:error, :already_exists}
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:delete, payment_id}, _from, state) do
@@ -270,6 +298,12 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   @spec schedule_cleanup(pos_integer()) :: reference()
   defp schedule_cleanup(cleanup_interval_ms) do
     Process.send_after(self(), :cleanup, cleanup_interval_ms)
+  end
+
+  @spec at_capacity?(state(), term()) :: boolean()
+  defp at_capacity?(state, payment_id) do
+    :ets.info(state.table, :size) >= state.max_size and
+      not :ets.member(state.table, payment_id)
   end
 
   @spec evict_soonest_expiry(:ets.tid() | atom()) :: true
