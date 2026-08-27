@@ -3,7 +3,8 @@ defmodule X402.Scheme.Registry do
   Resolves (scheme, network) pairs to `X402.Scheme` modules.
 
   The default mapping is seeded with the built-in schemes —
-  `X402.Scheme.ExactEVM` (`"exact"` on `"eip155:*"`) and
+  `X402.Scheme.ExactEVM` (`"exact"` on `"eip155:*"`),
+  `X402.Scheme.ExactSVM` (`"exact"` on `"solana:*"`), and
   `X402.Scheme.UptoEVM` (`"upto"` on `"eip155:*"`). There is no global
   registration and no application environment: callers pass additional
   scheme modules explicitly (the `:schemes` option on
@@ -38,10 +39,10 @@ defmodule X402.Scheme.Registry do
       {:ok, X402.Scheme.UptoEVM}
 
       iex> X402.Scheme.Registry.resolve("exact", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp")
-      :error
+      {:ok, X402.Scheme.ExactSVM}
   """
 
-  @builtins [X402.Scheme.ExactEVM, X402.Scheme.UptoEVM]
+  @builtins [X402.Scheme.ExactEVM, X402.Scheme.ExactSVM, X402.Scheme.UptoEVM]
 
   @doc since: "0.6.0"
   @doc """
@@ -50,7 +51,7 @@ defmodule X402.Scheme.Registry do
   ## Examples
 
       iex> X402.Scheme.Registry.builtins()
-      [X402.Scheme.ExactEVM, X402.Scheme.UptoEVM]
+      [X402.Scheme.ExactEVM, X402.Scheme.ExactSVM, X402.Scheme.UptoEVM]
   """
   @spec builtins() :: [module()]
   def builtins, do: @builtins

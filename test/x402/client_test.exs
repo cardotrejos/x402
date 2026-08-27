@@ -216,8 +216,15 @@ defmodule X402.ClientTest do
       assert Client.build_payment(cash, signer()) ==
                {:error, {:unsupported_kind, "cash", "eip155:84532"}}
 
+      bitcoin = Map.put(@evm_requirements, "network", "bip122:000000000019d6689c085ae165831e93")
+
+      assert Client.build_payment(bitcoin, signer()) ==
+               {:error, {:unsupported_kind, "exact", "bip122:000000000019d6689c085ae165831e93"}}
+    end
+
+    test "solana requirements without extra.feePayer fail signing" do
       assert Client.build_payment(@solana_requirements, signer()) ==
-               {:error, {:unsupported_kind, "exact", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"}}
+               {:error, :missing_fee_payer}
     end
 
     test "signs upto requirements via Permit2 when extra carries facilitatorAddress" do

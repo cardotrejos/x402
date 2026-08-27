@@ -23,12 +23,14 @@ defmodule X402.Plug.PaymentGateTest do
   import Plug.Conn
   import Plug.Test
 
+  alias X402.Client
   alias X402.Extensions.PaymentIdentifier.ETSCache
   alias X402.Facilitator
   alias X402.PaymentIdentifierCacheMock, as: CacheMock
   alias X402.PaymentRequired
   alias X402.PaymentResponse
   alias X402.Plug.PaymentGate
+  alias X402.Signer.SolanaKey
 
   setup :verify_on_exit!
 
@@ -781,7 +783,11 @@ defmodule X402.Plug.PaymentGateTest do
       price: "5000",
       network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
       asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      pay_to: "CKPKJWNdJEqa81x7CkZ14BVPiY6y16Sxs7owznqtWYp5"
+      pay_to: "CKPKJWNdJEqa81x7CkZ14BVPiY6y16Sxs7owznqtWYp5",
+      extra: %{
+        "feePayer" => "9hSR6S7WPtxmTojgo6GG3k4yDPecgJY292j7xrsUGWBu",
+        "recentBlockhash" => "EZ3rST5dvHmbanh75jc4PuLfV96vp9fEYBVeNk4FfM1k"
+      }
     }
 
     @multi_route %{
@@ -821,14 +827,20 @@ defmodule X402.Plug.PaymentGateTest do
     test "selects the matching accept among multiple options" do
       facilitator = start_mock_facilitator()
 
-      solana_payload =
-        valid_payment_payload()
-        |> put_in(["accepted", "scheme"], "exact")
-        |> put_in(["accepted", "network"], @solana_accept.network)
-        |> put_in(["accepted", "amount"], @solana_accept.price)
-        |> put_in(["accepted", "asset"], @solana_accept.asset)
-        |> put_in(["accepted", "payTo"], @solana_accept.pay_to)
-        |> put_in(["payload"], %{"transaction" => "base64-encoded-solana-transaction"})
+      # Full client flow: the 402's PAYMENT-REQUIRED is decoded, the client
+      # selects the SVM entry (the EVM entry lacks its EIP-712 domain and is
+      # not signable), builds a real partially signed Solana transaction, and
+      # the gate's structural validation and static-path pre-checks let it
+      # through to the Bypass-backed facilitator.
+      payment_required =
+        conn(:get, "/api/resource")
+        |> run_request(routes: [@multi_route], facilitator: facilitator)
+        |> decode_payment_required!()
+
+      {:ok, solana_signer} = SolanaKey.new(:crypto.strong_rand_bytes(32))
+      {:ok, solana_payload} = Client.build_payment(payment_required, solana_signer)
+
+      assert solana_payload["accepted"]["network"] == @solana_accept.network
 
       conn =
         conn(:get, "/api/resource")
@@ -836,10 +848,15 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@multi_route], facilitator: facilitator)
 
       assert conn.status == 200
-      assert_receive {:verify_called, _payload, requirements}
+      assert_receive {:verify_called, payload, requirements}
       assert requirements["network"] == @solana_accept.network
       assert requirements["amount"] == @solana_accept.price
       assert requirements["payTo"] == @solana_accept.pay_to
+      assert requirements["extra"]["feePayer"] == @solana_accept.extra["feePayer"]
+
+      # The facilitator receives the client's partially signed transaction.
+      assert payload["payload"]["transaction"] == solana_payload["payload"]["transaction"]
+      assert {:ok, _wire} = Base.decode64(payload["payload"]["transaction"])
     end
 
     test "rejects when accepted matches none of the multi-accept options" do

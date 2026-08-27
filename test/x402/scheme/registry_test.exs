@@ -50,8 +50,12 @@ defmodule X402.Scheme.RegistryTest do
   end
 
   describe "builtins/0" do
-    test "seeds exact and upto on EVM" do
-      assert Registry.builtins() == [X402.Scheme.ExactEVM, X402.Scheme.UptoEVM]
+    test "seeds exact on EVM and SVM plus upto on EVM" do
+      assert Registry.builtins() == [
+               X402.Scheme.ExactEVM,
+               X402.Scheme.ExactSVM,
+               X402.Scheme.UptoEVM
+             ]
     end
   end
 
@@ -62,10 +66,17 @@ defmodule X402.Scheme.RegistryTest do
       assert Registry.resolve("upto", "eip155:8453") == {:ok, X402.Scheme.UptoEVM}
     end
 
+    test "resolves exact on any solana network" do
+      assert Registry.resolve("exact", "solana:mainnet") == {:ok, X402.Scheme.ExactSVM}
+
+      assert Registry.resolve("exact", "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1") ==
+               {:ok, X402.Scheme.ExactSVM}
+    end
+
     test "does not resolve unregistered kinds" do
-      assert Registry.resolve("exact", "solana:mainnet") == :error
       assert Registry.resolve("cash", "eip155:1") == :error
       assert Registry.resolve("upto", "solana:mainnet") == :error
+      assert Registry.resolve("exact", "bip122:000000000019d6689c085ae165831e93") == :error
     end
 
     test "does not resolve non-binary scheme or network" do

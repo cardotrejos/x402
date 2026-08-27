@@ -11,10 +11,12 @@ defmodule X402.Client do
 
   Signing dispatches through `X402.Scheme.Registry`: out of the box this
   client signs the `exact` scheme on EVM (`eip155:*`) networks via EIP-3009
-  (`X402.Scheme.ExactEVM`) and the `upto` scheme on EVM networks via
-  Permit2 (`X402.Scheme.UptoEVM`); other scheme/network combinations
-  return `{:error, {:unsupported_kind, scheme, network}}` unless a
-  matching `X402.Scheme` module is passed with the `:schemes` option.
+  (`X402.Scheme.ExactEVM`), on Solana (`solana:*`) networks via a
+  partially signed v0 transaction (`X402.Scheme.ExactSVM`), and the
+  `upto` scheme on EVM networks via Permit2 (`X402.Scheme.UptoEVM`);
+  other scheme/network combinations return
+  `{:error, {:unsupported_kind, scheme, network}}` unless a matching
+  `X402.Scheme` module is passed with the `:schemes` option.
 
   ## Example
 
@@ -89,6 +91,39 @@ defmodule X402.Client do
                            `{:ok, payload}` or `{:error, reason}` — see
                            `X402.Extensions.EIP2612GasSponsoring.enricher/2` and
                            `X402.Extensions.ERC20ApprovalGasSponsoring.enricher/1`.
+                           """
+                         ],
+                         svm_blockhash: [
+                           type: :string,
+                           doc: """
+                           Base58 recent blockhash for SVM (Solana) payments,
+                           used when the server's `extra.recentBlockhash` hint
+                           is absent — see `X402.Scheme.ExactSVM`.
+                           """
+                         ],
+                         svm_blockhash_fetcher: [
+                           type: {:fun, 1},
+                           doc: """
+                           1-arity fun receiving the CAIP-2 network and
+                           returning `{:ok, blockhash}` for SVM payments (for
+                           example a wrapper around an RPC client's
+                           `getLatestBlockhash`).
+                           """
+                         ],
+                         svm_decimals: [
+                           type: :non_neg_integer,
+                           doc: """
+                           The SVM asset's decimals for `TransferChecked`,
+                           for mints outside `X402.Scheme.ExactSVM`'s
+                           known-asset table.
+                           """
+                         ],
+                         svm_token_program: [
+                           type: :string,
+                           doc: """
+                           The SVM asset's owning token program (SPL Token or
+                           Token-2022 address), for mints outside
+                           `X402.Scheme.ExactSVM`'s known-asset table.
                            """
                          ]
                        ]
@@ -196,13 +231,14 @@ defmodule X402.Client do
   gas-sponsored Permit2 approvals.
 
   Signing dispatches on the scheme and network of the chosen requirements
-  through `X402.Scheme.Registry`; out of the box this supports `exact`
-  (EIP-3009) and `upto` (Permit2) on `eip155:*` networks. Other
-  combinations return
+  through `X402.Scheme.Registry`; out of the box this supports `exact` on
+  `eip155:*` networks (EIP-3009) and on `solana:*` networks (partially
+  signed v0 transactions), plus `upto` on `eip155:*` networks (Permit2).
+  Other combinations return
   `{:error, {:unsupported_kind, scheme, network}}` unless a matching
   module is passed with the `:schemes` option. Scheme modules receive the
-  validated build options, so options like `:valid_after_buffer` reach
-  `c:X402.Scheme.sign/3`.
+  validated build options, so options like `:valid_after_buffer` (EVM) and
+  `:svm_blockhash` (SVM) reach `c:X402.Scheme.sign/3`.
 
   ## Options
 
