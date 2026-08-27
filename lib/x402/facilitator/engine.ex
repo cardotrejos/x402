@@ -29,7 +29,7 @@ defmodule X402.Facilitator.Engine do
   The facilitator's signing key pays gas, so what it signs is structurally
   constrained: settlement transactions are always built by this module with
   `to` set to the verified requirements' `asset`, `value` `0`, and calldata
-  produced exclusively by `X402.EIP3009.transfer_calldata/2` from the
+  produced exclusively by `X402.EIP3009.transfer_calldata/3` from the
   authorization fields the signature verification just proved — the engine
   has no code path that signs caller-supplied calldata. Consequently
   ERC-6492 *counterfactual* payments (which would require broadcasting
@@ -366,7 +366,9 @@ defmodule X402.Facilitator.Engine do
   # -- Verify -----------------------------------------------------------------
 
   @typep protocol_result ::
-           {:valid, wire_response()} | {:invalid, wire_response()} | {:error, term()}
+           {:valid, wire_response(), EVM.signature_type()}
+           | {:invalid, wire_response()}
+           | {:error, term()}
 
   @spec verify_result(t(), map(), map(), boolean()) :: protocol_result()
   defp verify_result(engine, payload, requirements, simulate) do
@@ -394,8 +396,8 @@ defmodule X402.Facilitator.Engine do
     ]
 
     case EVM.verify(payload, requirements, opts) do
-      {:ok, %{payer: verified_payer}} ->
-        {:valid, put_payer(%{"isValid" => true}, verified_payer)}
+      {:ok, %{payer: verified_payer, signature_type: signature_type}} ->
+        {:valid, put_payer(%{"isValid" => true}, verified_payer), signature_type}
 
       {:error, {:invalid, reason}} ->
         {:invalid, invalid_response(EVM.reason_string(reason), payer(payload))}
@@ -421,7 +423,7 @@ defmodule X402.Facilitator.Engine do
 
   @spec handle_verify_result(protocol_result(), t(), Context.t(), Hooks.metadata()) ::
           {:ok, wire_response()} | {:error, term()}
-  defp handle_verify_result({:valid, response}, engine, context, metadata) do
+  defp handle_verify_result({:valid, response, _signature_type}, engine, context, metadata) do
     finalize_success(engine.hooks, :after_verify, context, response, metadata)
   end
 
@@ -449,8 +451,8 @@ defmodule X402.Facilitator.Engine do
     payer = payer(payload)
 
     case verify_result(engine, payload, requirements, engine.simulate_in_settle) do
-      {:valid, _response} ->
-        execute_settlement(engine, payload, requirements, network, payer)
+      {:valid, _response, signature_type} ->
+        execute_settlement(engine, payload, requirements, network, payer, signature_type)
 
       {:invalid, response} ->
         {:settled, failure_response(response["invalidReason"], "", network, payer)}
@@ -460,14 +462,16 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec execute_settlement(t(), map(), map(), String.t(), String.t() | nil) :: settle_result()
-  defp execute_settlement(engine, payload, requirements, network, payer) do
+  @spec execute_settlement(t(), map(), map(), String.t(), String.t() | nil, EVM.signature_type()) ::
+          settle_result()
+  defp execute_settlement(engine, payload, requirements, network, payer, signature_type) do
     # Fee-payer safety: `to` is the verified requirements' asset, `value` is
     # 0, and the calldata comes exclusively from the shared EIP-3009 builder
     # over the authorization the re-verify just proved — the engine never
-    # signs caller-supplied calldata.
+    # signs caller-supplied calldata. The overload follows the VERIFIED
+    # signature type (an ERC-1271 signature can be 65 bytes too).
     with {:ok, inner_signature} <- inner_signature(payload),
-         {:ok, calldata} <- build_calldata(payload, inner_signature),
+         {:ok, calldata} <- build_calldata(payload, inner_signature, signature_type),
          {:ok, from} <- Signer.address(engine.signer),
          {:ok, chain_id} <- chain_id(requirements),
          {:ok, params} <- transaction_params(engine, from, asset(requirements), calldata),
@@ -496,12 +500,13 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec build_calldata(map(), binary()) :: {:ok, binary()} | {:error, term()}
-  defp build_calldata(payload, inner_signature) do
+  @spec build_calldata(map(), binary(), EVM.signature_type()) ::
+          {:ok, binary()} | {:error, term()}
+  defp build_calldata(payload, inner_signature, signature_type) do
     authorization =
       Utils.nested_map_value(payload, [{"payload", :payload}, {"authorization", :authorization}])
 
-    case EIP3009.transfer_calldata(authorization || %{}, inner_signature) do
+    case EIP3009.transfer_calldata(authorization || %{}, inner_signature, signature_type) do
       {:ok, calldata} -> {:ok, calldata}
       {:error, reason} -> {:error, {:settle_error, reason}}
     end
