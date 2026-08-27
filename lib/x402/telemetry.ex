@@ -18,13 +18,16 @@ defmodule X402.Telemetry do
   - `[:x402, :client, :sign]`
   - `[:x402, :client, :build]`
   - `[:x402, :client, :request]`
+  - `[:x402, :rpc, :request]`
+  - `[:x402, :verify, :evm]`
 
   Metadata always includes `:status` (`:ok` or `:error`) and may include
   additional operation-specific fields such as `:reason`, `:header`, or
   `:fields`.
   """
 
-  @type module_name :: :payment_required | :payment_signature | :payment_response | :client
+  @type module_name ::
+          :payment_required | :payment_signature | :payment_response | :client | :rpc | :verify
   @type operation ::
           :encode
           | :decode
@@ -34,6 +37,7 @@ defmodule X402.Telemetry do
           | :sign
           | :build
           | :request
+          | :evm
   @type status :: :ok | :error
 
   @doc since: "0.1.0"
