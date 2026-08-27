@@ -275,6 +275,33 @@ defmodule X402.EIP712 do
 
   def encode_bytes32(_value), do: {:error, :invalid_bytes32}
 
+  @doc since: "0.6.0"
+  @doc """
+  ABI-encodes a dynamic `bytes` value: a 32-byte length word followed by the
+  bytes right-padded to a 32-byte boundary.
+
+  Used to build calldata for functions taking `bytes` arguments
+  (`isValidSignature`, the `bytes`-signature `transferWithAuthorization`
+  variant, `aggregate3`).
+
+  ## Examples
+
+      iex> X402.EIP712.encode_dynamic_bytes(<<0xAB>>)
+      <<1::unsigned-big-integer-size(256), 0xAB, 0::unsigned-big-integer-size(248)>>
+  """
+  @spec encode_dynamic_bytes(binary()) :: binary()
+  def encode_dynamic_bytes(bytes) when is_binary(bytes) do
+    <<byte_size(bytes)::unsigned-big-integer-size(256)>> <> pad_right(bytes)
+  end
+
+  @spec pad_right(binary()) :: binary()
+  defp pad_right(bytes) do
+    case rem(byte_size(bytes), 32) do
+      0 -> bytes
+      remainder -> bytes <> :binary.copy(<<0>>, 32 - remainder)
+    end
+  end
+
   # -- Optional dependency resolution ----------------------------------------
   #
   # The module is resolved at runtime via Module.concat so the library

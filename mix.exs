@@ -126,6 +126,7 @@ defmodule X402.MixProject do
         "guides/mcp.md": [title: "Paid MCP Tools"],
         "guides/paywall.md": [title: "Browser Paywall"],
         "guides/local-verification.md": [title: "Local Payment Verification"],
+        "guides/facilitator.md": [title: "Run Your Own Facilitator"],
         "guides/live-smoke-tests.md": [title: "Live Smoke Tests"]
       ],
       groups_for_extras: [
@@ -177,6 +178,12 @@ defmodule X402.MixProject do
           X402.Verify.EVM,
           X402.RPC,
           X402.ERC6492
+        ],
+        "Facilitator Server": [
+          X402.Facilitator.Engine,
+          X402.Plug.Facilitator,
+          X402.RLP,
+          X402.Transaction
         ],
         Utilities: [
           X402.Wallet

@@ -119,8 +119,6 @@ defmodule X402.Verify.EVM do
   @selector_is_valid_signature <<0x16, 0x26, 0xBA, 0x7E>>
   @selector_balance_of <<0x70, 0xA0, 0x82, 0x31>>
   @selector_authorization_state <<0xE9, 0x4A, 0x01, 0x02>>
-  @selector_transfer_vrs <<0xE3, 0xEE, 0x16, 0x0E>>
-  @selector_transfer_bytes <<0xCF, 0x09, 0x29, 0x95>>
   @selector_name <<0x06, 0xFD, 0xDE, 0x03>>
   @selector_version <<0x54, 0xFD, 0x4D, 0x50>>
   @selector_aggregate3 <<0x82, 0xAD, 0x56, 0xCB>>
@@ -745,7 +743,8 @@ defmodule X402.Verify.EVM do
   defp verify_erc1271(rpc, ctx, digest, inner_signature) do
     calldata =
       @selector_is_valid_signature <>
-        digest <> <<64::unsigned-big-integer-size(256)>> <> encode_dynamic_bytes(inner_signature)
+        digest <>
+        <<64::unsigned-big-integer-size(256)>> <> EIP712.encode_dynamic_bytes(inner_signature)
 
     case RPC.call(rpc, %{"to" => ctx.payer, "data" => hex(calldata)}) do
       {:ok, return_hex} ->
@@ -1009,55 +1008,20 @@ defmodule X402.Verify.EVM do
     word
   end
 
+  # The calldata is built by the shared EIP-3009 builder — the same code path
+  # X402.Facilitator.Engine signs at settlement, so simulation and settlement
+  # can never diverge. The overload is selected by the VERIFIED signature
+  # type, never byte length: a smart wallet's ERC-1271 signature can be
+  # exactly 65 bytes, and the (v, r, s) overload performs on-chain ECDSA,
+  # which would wrongly reject it.
   @spec transfer_calldata(map(), binary(), signature_type()) ::
           {:ok, binary()} | {:error, {:invalid, :invalid_signature}}
-  # The overload is selected by the VERIFIED signature type, never by byte
-  # length: a smart wallet's ERC-1271 signature can be exactly 65 bytes, and
-  # the (v, r, s) overload performs on-chain ECDSA, which would wrongly
-  # reject it. Only EOA signatures take the ECDSA overload; contract
-  # signatures always go through the bytes variant, whose token-side
-  # SignatureChecker routes by account code.
-  defp transfer_calldata(ctx, <<r::binary-size(32), s::binary-size(32), v>>, :eoa) do
-    base = authorization_words(ctx)
-
-    {:ok,
-     @selector_transfer_vrs <>
-       base <> <<normalize_v(v)::unsigned-big-integer-size(256)>> <> r <> s}
+  defp transfer_calldata(ctx, inner_signature, signature_type) do
+    case EIP3009.transfer_calldata(ctx.authorization, inner_signature, signature_type) do
+      {:ok, calldata} -> {:ok, calldata}
+      {:error, _reason} -> {:error, {:invalid, :invalid_signature}}
+    end
   end
-
-  defp transfer_calldata(ctx, signature, _signature_type) when byte_size(signature) > 0 do
-    base = authorization_words(ctx)
-
-    {:ok,
-     @selector_transfer_bytes <>
-       base <>
-       <<7 * 32::unsigned-big-integer-size(256)>> <> encode_dynamic_bytes(signature)}
-  end
-
-  defp transfer_calldata(_ctx, _signature, _signature_type),
-    do: {:error, {:invalid, :invalid_signature}}
-
-  @spec authorization_words(map()) :: binary()
-  defp authorization_words(ctx) do
-    authorization = ctx.authorization
-    {:ok, from} = EIP712.encode_address(Utils.map_value(authorization, {"from", :from}))
-    {:ok, to} = EIP712.encode_address(Utils.map_value(authorization, {"to", :to}))
-    {:ok, value} = EIP712.encode_uint256(ctx.value)
-
-    {:ok, valid_after} =
-      EIP712.encode_uint256(Utils.map_value(authorization, {"validAfter", :valid_after}))
-
-    {:ok, valid_before} =
-      EIP712.encode_uint256(Utils.map_value(authorization, {"validBefore", :valid_before}))
-
-    {:ok, nonce} = EIP712.encode_bytes32(ctx.nonce)
-
-    from <> to <> value <> valid_after <> valid_before <> nonce
-  end
-
-  @spec normalize_v(non_neg_integer()) :: non_neg_integer()
-  defp normalize_v(v) when v in [0, 1], do: v + 27
-  defp normalize_v(v), do: v
 
   # aggregate3(Call3[] calls) with Call3 = (address target, bool allowFailure,
   # bytes callData). Every sub-call is encoded with allowFailure = true so the
@@ -1084,7 +1048,7 @@ defmodule X402.Verify.EVM do
   defp encode_call3({target, calldata}) do
     address_word(target) <>
       <<1::unsigned-big-integer-size(256)>> <>
-      <<3 * 32::unsigned-big-integer-size(256)>> <> encode_dynamic_bytes(calldata)
+      <<3 * 32::unsigned-big-integer-size(256)>> <> EIP712.encode_dynamic_bytes(calldata)
   end
 
   # -- Return-data decoding ---------------------------------------------------
@@ -1197,17 +1161,4 @@ defmodule X402.Verify.EVM do
   end
 
   defp parse_quantity(_value), do: :error
-
-  @spec encode_dynamic_bytes(binary()) :: binary()
-  defp encode_dynamic_bytes(bytes) do
-    <<byte_size(bytes)::unsigned-big-integer-size(256)>> <> pad_right(bytes)
-  end
-
-  @spec pad_right(binary()) :: binary()
-  defp pad_right(bytes) do
-    case rem(byte_size(bytes), 32) do
-      0 -> bytes
-      remainder -> bytes <> :binary.copy(<<0>>, 32 - remainder)
-    end
-  end
 end

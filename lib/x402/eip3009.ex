@@ -361,10 +361,64 @@ defmodule X402.EIP3009 do
   @spec encode_bytes32(term()) :: {:ok, <<_::256>>} | {:error, :invalid_bytes32}
   defdelegate encode_bytes32(value), to: EIP712
 
+  @doc since: "0.6.0"
+  @doc group: :settlement
+  @doc """
+  Builds the `transferWithAuthorization` calldata for an authorization and
+  its raw signature bytes.
+
+  The overload is selected by the VERIFIED signature type, never by byte
+  length: only `:eoa` signatures take the `(v, r, s)` variant (selector
+  `0xe3ee160e`, with `v` normalized to `27`/`28` as EIP-3009 contracts
+  expect); contract signatures (`:erc1271`, `:erc6492_counterfactual`) —
+  which can also be exactly 65 bytes — always take the dynamic-`bytes`
+  variant (selector `0xcf092995`), whose token-side SignatureChecker
+  routes by account code. Shared by `X402.Verify.EVM`'s `eth_call` simulation and
+  `X402.Facilitator.Engine`'s settlement transaction — the calldata a
+  facilitator signs is always built here, from the verified authorization
+  fields, and nowhere else.
+
+  ## Examples
+
+      iex> authorization = %{
+      ...>   "from" => "0x1111111111111111111111111111111111111111",
+      ...>   "to" => "0x2222222222222222222222222222222222222222",
+      ...>   "value" => "10000",
+      ...>   "validAfter" => "0",
+      ...>   "validBefore" => "99999999999",
+      ...>   "nonce" => "0x" <> String.duplicate("ab", 32)
+      ...> }
+      iex> {:ok, calldata} = X402.EIP3009.transfer_calldata(authorization, <<1::520>>, :eoa)
+      iex> {binary_part(calldata, 0, 4), byte_size(calldata)}
+      {<<0xE3, 0xEE, 0x16, 0x0E>>, 4 + 9 * 32}
+      iex> {:ok, contract} = X402.EIP3009.transfer_calldata(authorization, <<1::520>>, :erc1271)
+      iex> binary_part(contract, 0, 4)
+      <<0xCF, 0x09, 0x29, 0x95>>
+
+      iex> X402.EIP3009.transfer_calldata(%{}, <<1::520>>, :eoa)
+      {:error, {:missing_field, "from"}}
+  """
+  @spec transfer_calldata(map(), binary(), :eoa | :erc1271 | :erc6492_counterfactual) ::
+          {:ok, binary()} | {:error, encode_error() | :invalid_signature}
+  def transfer_calldata(authorization, signature, signature_type)
+      when is_map(authorization) and is_binary(signature) and
+             signature_type in [:eoa, :erc1271, :erc6492_counterfactual] do
+    with {:ok, words} <- authorization_words(authorization) do
+      build_transfer_calldata(IO.iodata_to_binary(words), signature, signature_type)
+    end
+  end
+
   # -- Struct hashing ---------------------------------------------------------
 
   @spec struct_hash(map()) :: {:ok, binary()} | {:error, encode_error()}
   defp struct_hash(authorization) do
+    with {:ok, words} <- authorization_words(authorization) do
+      EIP712.hash_struct(@transfer_with_authorization_type, words)
+    end
+  end
+
+  @spec authorization_words(map()) :: {:ok, [<<_::256>>]} | {:error, encode_error()}
+  defp authorization_words(authorization) do
     with {:ok, from} <- fetch_field(authorization, {"from", :from}),
          {:ok, to} <- fetch_field(authorization, {"to", :to}),
          {:ok, value} <- fetch_field(authorization, {"value", :value}),
@@ -377,16 +431,45 @@ defmodule X402.EIP3009 do
          {:ok, valid_after_word} <- EIP712.encode_uint256(valid_after),
          {:ok, valid_before_word} <- EIP712.encode_uint256(valid_before),
          {:ok, nonce_word} <- EIP712.encode_bytes32(nonce) do
-      EIP712.hash_struct(@transfer_with_authorization_type, [
-        from_word,
-        to_word,
-        value_word,
-        valid_after_word,
-        valid_before_word,
-        nonce_word
-      ])
+      {:ok,
+       [
+         from_word,
+         to_word,
+         value_word,
+         valid_after_word,
+         valid_before_word,
+         nonce_word
+       ]}
     end
   end
+
+  # transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)
+  @selector_transfer_vrs <<0xE3, 0xEE, 0x16, 0x0E>>
+  # transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,bytes)
+  @selector_transfer_bytes <<0xCF, 0x09, 0x29, 0x95>>
+
+  @spec build_transfer_calldata(binary(), binary(), :eoa | :erc1271 | :erc6492_counterfactual) ::
+          {:ok, binary()} | {:error, :invalid_signature}
+  defp build_transfer_calldata(base, <<r::binary-size(32), s::binary-size(32), v>>, :eoa) do
+    {:ok,
+     @selector_transfer_vrs <>
+       base <> <<normalize_recovery_v(v)::unsigned-big-integer-size(256)>> <> r <> s}
+  end
+
+  defp build_transfer_calldata(base, signature, signature_type)
+       when byte_size(signature) > 0 and signature_type in [:erc1271, :erc6492_counterfactual] do
+    {:ok,
+     @selector_transfer_bytes <>
+       base <>
+       <<7 * 32::unsigned-big-integer-size(256)>> <> EIP712.encode_dynamic_bytes(signature)}
+  end
+
+  defp build_transfer_calldata(_base, _signature, _signature_type),
+    do: {:error, :invalid_signature}
+
+  @spec normalize_recovery_v(non_neg_integer()) :: non_neg_integer()
+  defp normalize_recovery_v(v) when v in [0, 1], do: v + 27
+  defp normalize_recovery_v(v), do: v
 
   @spec typed_data(map(), map()) :: Signer.typed_data()
   defp typed_data(domain, authorization) do
