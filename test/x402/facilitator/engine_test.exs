@@ -98,10 +98,28 @@ defmodule X402.Facilitator.EngineTest do
     {X402.Facilitator.PendingSettlementStore.ETS, name}
   end
 
-  defp pending_key(payload) do
+  # Mirrors the engine's pending-key derivation: the signature digest plus
+  # every field the reconcile fast path checks the receipt against.
+  defp pending_key(payload, requirements) do
     "0x" <> signature_hex = payload["payload"]["signature"]
     bytes = Base.decode16!(signature_hex, case: :mixed)
-    Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    authorization = payload["payload"]["authorization"]
+
+    fields =
+      [
+        authorization["from"],
+        authorization["to"],
+        authorization["value"],
+        authorization["validAfter"],
+        authorization["validBefore"],
+        authorization["nonce"],
+        requirements["asset"]
+      ]
+      |> Enum.map(&String.downcase(to_string(&1)))
+      |> Enum.intersperse("\n")
+
+    digest = :crypto.hash(:sha256, [:crypto.hash(:sha256, bytes), "\n", fields])
+    Base.encode16(digest, case: :lower)
   end
 
   # -- new/1 ------------------------------------------------------------------
@@ -917,7 +935,7 @@ defmodule X402.Facilitator.EngineTest do
 
       assert {:hit,
               %{transaction: @tx_hash, provenance: :node_acknowledged, raw_transaction: nil}} =
-               PendingSettlementStore.get(store, pending_key(payload))
+               PendingSettlementStore.get(store, pending_key(payload, requirements))
 
       # Consume the first attempt's broadcast so the retries can prove they
       # add none.
@@ -930,7 +948,7 @@ defmodule X402.Facilitator.EngineTest do
                Engine.settle(engine, payload, requirements)
 
       assert {:hit, %{transaction: @tx_hash}} =
-               PendingSettlementStore.get(store, pending_key(payload))
+               PendingSettlementStore.get(store, pending_key(payload, requirements))
 
       Agent.update(queue, fn _empty -> [%{"status" => "0x1"}] end)
 
@@ -941,7 +959,70 @@ defmodule X402.Facilitator.EngineTest do
       # confirmed entry stays deleted.
       refute_received {:rpc, "eth_sendRawTransaction", _params}
       refute_received {:rpc, "eth_estimateGas", _params2}
-      assert PendingSettlementStore.get(store, pending_key(payload)) == :miss
+      assert PendingSettlementStore.get(store, pending_key(payload, requirements)) == :miss
+    end
+
+    test "a mutated retry misses the pending entry instead of burning it", context do
+      store = pending_store(__MODULE__.MutationStore)
+      {:ok, queue} = Agent.start_link(fn -> [] end)
+
+      engine =
+        engine(context,
+          pending_settlement_store: store,
+          receipt_timeout_ms: 50,
+          receipt_interval_ms: 10,
+          stub: %{receipt_queue: queue}
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:ok, %{"errorReason" => "settlement_pending"}} =
+               Engine.settle(engine, payload, requirements)
+
+      assert_received {:rpc, "eth_sendRawTransaction", [_raw_hex]}
+
+      assert {:hit, _entry} =
+               PendingSettlementStore.get(store, pending_key(payload, requirements))
+
+      # Same signature bytes, tampered authorization value: the pending key
+      # binds every field the reconcile check depends on, so the forgery
+      # misses the store and falls through to re-verification, which rejects
+      # it — no broadcast, and the honest entry survives. (With a
+      # signature-only key it would hit the entry, burn it, and report the
+      # confirmed transfer as a terminal transfer-event mismatch.)
+      tampered_payload = put_in(payload, ["payload", "authorization", "value"], "1")
+
+      assert {:ok, %{"success" => false, "errorReason" => tampered_reason}} =
+               Engine.settle(engine, tampered_payload, requirements)
+
+      assert tampered_reason != "settlement_pending"
+      refute_received {:rpc, "eth_sendRawTransaction", _tampered_raw}
+
+      assert {:hit, _entry2} =
+               PendingSettlementStore.get(store, pending_key(payload, requirements))
+
+      # A tampered requirements asset (the one requirements field in the
+      # reconcile check) also misses the entry and fails re-verification.
+      tampered_requirements = requirements(%{"asset" => @pay_to})
+
+      assert {:ok, %{"success" => false, "errorReason" => asset_reason}} =
+               Engine.settle(engine, payload, tampered_requirements)
+
+      assert asset_reason != "settlement_pending"
+      refute_received {:rpc, "eth_sendRawTransaction", _asset_raw}
+
+      assert {:hit, _entry3} =
+               PendingSettlementStore.get(store, pending_key(payload, requirements))
+
+      # The honest retry still reconciles the recorded transaction.
+      Agent.update(queue, fn _empty -> [%{"status" => "0x1"}] end)
+
+      assert {:ok, %{"success" => true, "transaction" => @tx_hash}} =
+               Engine.settle(engine, payload, requirements)
+
+      refute_received {:rpc, "eth_sendRawTransaction", _honest_raw}
+      assert PendingSettlementStore.get(store, pending_key(payload, requirements)) == :miss
     end
 
     test "a transport failure records a local-hash entry that a retry re-awaits", context do
@@ -969,7 +1050,7 @@ defmodule X402.Facilitator.EngineTest do
       assert local_hash == "0x" <> Base.encode16(ExKeccak.hash_256(raw), case: :lower)
 
       assert {:hit, %{transaction: ^local_hash, provenance: :local_hash, raw_transaction: ^raw}} =
-               PendingSettlementStore.get(store, pending_key(payload))
+               PendingSettlementStore.get(store, pending_key(payload, requirements))
 
       # The retry re-awaits the recorded hash — it never rebroadcasts the
       # stored raw bytes.
@@ -1052,7 +1133,7 @@ defmodule X402.Facilitator.EngineTest do
                Engine.settle(engine, payload, drifted)
 
       refute_received {:rpc, "eth_sendRawTransaction", _params}
-      assert PendingSettlementStore.get(store, pending_key(payload)) == :miss
+      assert PendingSettlementStore.get(store, pending_key(payload, requirements)) == :miss
     end
 
     test "an unavailable store falls through to a normal broadcast instead of crashing",

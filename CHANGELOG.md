@@ -353,6 +353,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The dialyzer PLT filename now carries the OTP/Elixir versions
+  (`priv/plts/project-otp<release>-<version>.plt`), and the CI PLT cache no
+  longer falls back to other toolchains' entries — after a toolchain bump,
+  `mix dialyzer` builds a fresh PLT instead of slowly migrating the old
+  toolchain's file in place (the near-silent churn that read as a hang;
+  note the first run on a new OTP still spends several minutes building
+  the core PLTs)
 - Development and CI toolchain bumped to Elixir 1.20.4 / Erlang OTP 29.0.5;
   CI now tests both the supported floor (Elixir 1.19 / OTP 27) and the
   latest stack. The library still requires only `~> 1.19`. Bitstring

@@ -37,9 +37,13 @@ defmodule X402.MixProject do
       # Testing
       test_coverage: [tool: ExCoveralls, minimum_coverage: 95],
 
-      # Dialyzer
+      # Dialyzer. The PLT filename carries the OTP/Elixir versions: a
+      # toolchain bump then builds a fresh PLT instead of updating the old
+      # toolchain's file in place — a cross-OTP in-place update is the
+      # slow, silent churn that reads as "dialyzer hangs" after upgrades.
       dialyzer: [
-        plt_file: {:no_warn, "priv/plts/project.plt"},
+        plt_file:
+          {:no_warn, "priv/plts/project-otp#{System.otp_release()}-#{System.version()}.plt"},
         plt_add_apps: [:mix, :credo]
       ]
     ]

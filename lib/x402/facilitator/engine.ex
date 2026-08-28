@@ -591,7 +591,7 @@ defmodule X402.Facilitator.Engine do
     %{
       network: network(requirements, payload),
       payer: payer,
-      pending_key: pending_key(engine, payload),
+      pending_key: pending_key(engine, payload, requirements),
       # The expected Transfer event is built from the payload's signed
       # authorization — the fields the pending key's signature binds — never
       # from the caller-supplied requirements: the pending-store reconcile
@@ -627,20 +627,62 @@ defmodule X402.Facilitator.Engine do
   defp verify_simulate(%{simulate: true}), do: true
   defp verify_simulate(_engine), do: :counterfactual_only
 
-  # The reference SDKs key EVM pending entries by the EIP-3009 signature;
-  # hashing it keeps raw signature material out of adapter keys.
-  @spec pending_key(t(), map()) :: String.t() | nil
-  defp pending_key(%{pending_settlement_store: nil}, _payload), do: nil
+  # The reference SDKs key EVM pending entries by the EIP-3009 signature
+  # alone. That is not enough here: the reconcile fast path runs WITHOUT
+  # re-verification and checks the receipt's Transfer event against the
+  # retry's authorization fields and the requirements' asset — so the key
+  # must bind every one of those fields too. Otherwise anyone who saw the
+  # PAYMENT-SIGNATURE header could replay the same signature with a mutated
+  # authorization, hit the entry, burn it (delete-before-reconcile), and
+  # turn a confirmed transfer into a terminal mismatch. With the full
+  # binding, a mutated retry simply misses the store and falls through to
+  # the normal path, where re-verification rejects it and the honest
+  # retry's entry survives. Hashing keeps raw signature material out of
+  # adapter keys; the inner signature digest is a fixed 32 bytes, so
+  # variable-length signatures cannot alias the appended fields.
+  @spec pending_key(t(), map(), map()) :: String.t() | nil
+  defp pending_key(%{pending_settlement_store: nil}, _payload, _requirements), do: nil
 
-  defp pending_key(_engine, payload) do
+  defp pending_key(_engine, payload, requirements) do
     signature =
       Utils.nested_map_value(payload, [{"payload", :payload}, {"signature", :signature}])
 
-    case unhex(signature) do
-      {:ok, bytes} -> Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
-      :error -> nil
+    authorization = authorization(payload)
+
+    fields =
+      [
+        Utils.map_value(authorization, {"from", :from}),
+        Utils.map_value(authorization, {"to", :to}),
+        Utils.map_value(authorization, {"value", :value}),
+        Utils.map_value(authorization, {"validAfter", :validAfter}),
+        Utils.map_value(authorization, {"validBefore", :validBefore}),
+        Utils.map_value(authorization, {"nonce", :nonce}),
+        asset(requirements)
+      ]
+      |> Enum.map(&canonical_key_field/1)
+
+    with {:ok, bytes} <- unhex(signature),
+         false <- Enum.any?(fields, &is_nil/1) do
+      digest =
+        :crypto.hash(:sha256, [:crypto.hash(:sha256, bytes), "\n", Enum.intersperse(fields, "\n")])
+
+      Base.encode16(digest, case: :lower)
+    else
+      _missing_or_malformed -> nil
     end
   end
+
+  # Reconcile-relevant fields are hex or decimal strings on the wire;
+  # integers (permissive JSON producers) canonicalize to their decimal
+  # form, everything else makes the payment unkeyable (no store use — the
+  # normal path's re-verification owns rejecting it).
+  @spec canonical_key_field(term()) :: binary() | nil
+  defp canonical_key_field(value) when is_binary(value), do: String.downcase(value)
+
+  defp canonical_key_field(value) when is_integer(value) and value >= 0,
+    do: Integer.to_string(value)
+
+  defp canonical_key_field(_value), do: nil
 
   @spec reconcile_pending(t(), settle_context()) :: {:settled, wire_response()} | :miss
   defp reconcile_pending(%{pending_settlement_store: nil}, _ctx), do: :miss
