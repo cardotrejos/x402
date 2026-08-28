@@ -24,12 +24,14 @@ defmodule X402.Plug.PaymentGateTest do
   import Plug.Test
 
   alias X402.Client
+  alias X402.Extensions.PaymentIdentifier
   alias X402.Extensions.PaymentIdentifier.ETSCache
   alias X402.Facilitator
   alias X402.PaymentIdentifierCacheMock, as: CacheMock
   alias X402.PaymentRequired
   alias X402.PaymentResponse
   alias X402.Plug.PaymentGate
+  alias X402.RPC
   alias X402.Signer.SolanaKey
 
   setup :verify_on_exit!
@@ -2190,6 +2192,656 @@ defmodule X402.Plug.PaymentGateTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Inline local verification (:local_verification option)
+  # ---------------------------------------------------------------------------
+
+  @eip712_extra %{"name" => "USDC", "version" => "2"}
+
+  describe "local verification" do
+    test "init/1 normalizes a bare level atom into a keyword list" do
+      opts = PaymentGate.init(routes: [@route], local_verification: :structural)
+
+      assert opts.local_verification[:level] == :structural
+      assert opts.local_verification[:simulate] == true
+
+      assert %{local_verification: nil} = PaymentGate.init(routes: [@route])
+    end
+
+    test "init/1 requires :rpc for level :full" do
+      assert_raise NimbleOptions.ValidationError, ~r/requires :rpc/, fn ->
+        PaymentGate.init(routes: [@route], local_verification: :full)
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/requires :rpc/, fn ->
+        PaymentGate.init(routes: [@route], local_verification: [level: :full])
+      end
+    end
+
+    test "init/1 rejects unknown local_verification shapes" do
+      assert_raise NimbleOptions.ValidationError, ~r/verification level/, fn ->
+        PaymentGate.init(routes: [@route], local_verification: :bogus)
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/:level/, fn ->
+        PaymentGate.init(routes: [@route], local_verification: [simulate: false])
+      end
+    end
+
+    test ":structural passes a well-formed payment through to the facilitator" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :extra, @eip712_extra)
+
+      header =
+        valid_payment_payload()
+        |> put_in(["accepted", "extra"], @eip712_extra)
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [route], facilitator: facilitator, local_verification: :structural)
+
+      assert conn.status == 200
+      assert_receive {:verify_called, _payload, _requirements}
+      assert_receive {:settle_called, _payload, _requirements}
+    end
+
+    test ":structural rejection answers 402 like a facilitator rejection, without calling it" do
+      facilitator = start_mock_facilitator()
+
+      # @route advertises no EIP-712 domain (empty extra), which structural
+      # verification requires — a mismatch the cheap prechecks do not catch.
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(
+          routes: [@route],
+          facilitator: facilitator,
+          local_verification: :structural
+        )
+
+      assert conn.status == 402
+      assert decode_payment_required!(conn)["error"] == "facilitator rejected payment"
+      refute_received {:verify_called, _, _}
+    end
+
+    test ":signature rejects a signature that does not recover the payer" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :extra, @eip712_extra)
+
+      header =
+        valid_payment_payload()
+        |> put_in(["accepted", "extra"], @eip712_extra)
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [route], facilitator: facilitator, local_verification: :signature)
+
+      assert conn.status == 402
+      assert decode_payment_required!(conn)["error"] == "facilitator rejected payment"
+      refute_received {:verify_called, _, _}
+    end
+
+    test ":full fails closed with 500 when the RPC endpoint is unreachable" do
+      facilitator = start_mock_facilitator()
+      rpc_bypass = Bypass.open()
+      Bypass.down(rpc_bypass)
+
+      finch = String.to_atom("gate_rpc_finch_#{System.unique_integer([:positive, :monotonic])}")
+      start_supervised!(Supervisor.child_spec({Finch, name: finch}, id: finch))
+      {:ok, rpc} = RPC.new(rpc_url: "http://localhost:#{rpc_bypass.port}", finch: finch)
+
+      route = Map.put(@route, :extra, @eip712_extra)
+
+      header =
+        valid_payment_payload()
+        |> put_in(["accepted", "extra"], @eip712_extra)
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(
+          routes: [route],
+          facilitator: facilitator,
+          local_verification: [level: :full, rpc: rpc]
+        )
+
+      assert conn.status == 500
+      assert conn.resp_body == "{}"
+      refute_received {:verify_called, _, _}
+    end
+
+    test "skips local verification for non exact-EVM payments" do
+      facilitator = start_mock_facilitator()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_upto_payment_header(@amount))
+        |> run_request(
+          routes: [@upto_route],
+          facilitator: facilitator,
+          local_verification: :structural
+        )
+
+      assert conn.status == 200
+      assert_receive {:verify_called, _payload, _requirements}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Canonical replay keys
+  # ---------------------------------------------------------------------------
+
+  defmodule NoteScheme do
+    @moduledoc false
+    @behaviour X402.Scheme
+
+    @impl X402.Scheme
+    def scheme, do: "note"
+
+    @impl X402.Scheme
+    def networks, do: ["local:*"]
+  end
+
+  @note_route %{
+    method: :get,
+    path: "/note/resource",
+    scheme: "note",
+    price: "5000",
+    network: "local:test",
+    asset: "note",
+    pay_to: "till"
+  }
+
+  describe "canonical replay keys" do
+    test "rejects a re-encoded duplicate of the same authorization without a facilitator call" do
+      bypass = Bypass.open()
+      finch = String.to_atom("payment_gate_finch_#{System.unique_integer([:positive])}")
+
+      facilitator_name =
+        String.to_atom("payment_gate_facilitator_#{System.unique_integer([:positive])}")
+
+      start_supervised!({Finch, name: finch})
+
+      # expect_once fails the test if either endpoint is hit more than once,
+      # proving the re-encoded duplicate below causes zero facilitator calls.
+      Bypass.expect_once(bypass, "POST", "/verify", fn bypass_conn ->
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{"isValid" => true, "payer" => @receiver})
+        )
+      end)
+
+      Bypass.expect_once(bypass, "POST", "/settle", fn bypass_conn ->
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{
+            "success" => true,
+            "transaction" => "0xsettled",
+            "network" => @network,
+            "payer" => @receiver
+          })
+        )
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: facilitator_name,
+           finch: finch,
+           url: "http://localhost:#{bypass.port}",
+           max_retries: 0}
+        )
+
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      payload = valid_payment_payload()
+      header = encode_header(payload)
+      reencoded = payload |> Jason.encode!(pretty: true) |> Base.encode64()
+      assert reencoded != header
+
+      opts = [
+        routes: [@route],
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(opts)
+
+      assert first.status == 200
+
+      duplicate =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", reencoded)
+        |> run_request(opts)
+
+      assert duplicate.status == 402
+      assert decode_payment_required!(duplicate)["error"] == "payment already processed"
+    end
+
+    test "distinct authorization nonces settle independently" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+
+      opts = [
+        routes: [@route],
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      second_header =
+        valid_payment_payload()
+        |> put_in(["payload", "authorization", "nonce"], "0x" <> String.duplicate("ab", 32))
+        |> encode_header()
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(opts)
+
+      second =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", second_header)
+        |> run_request(opts)
+
+      assert first.status == 200
+      assert second.status == 200
+      assert_receive {:settle_called, _, _}
+      assert_receive {:settle_called, _, _}
+    end
+
+    test "upto replay keys derive from the signed permit nonce" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+
+      opts = [
+        routes: [@upto_route],
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      payload = valid_upto_payment_payload(@amount)
+      header = encode_header(payload)
+      reencoded = payload |> Jason.encode!(pretty: true) |> Base.encode64()
+      assert reencoded != header
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(opts)
+
+      assert first.status == 200
+      assert_receive {:verify_called, _, _}
+
+      duplicate =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", reencoded)
+        |> run_request(opts)
+
+      assert duplicate.status == 402
+      assert decode_payment_required!(duplicate)["error"] == "payment already processed"
+      refute_received {:verify_called, _, _}
+    end
+
+    test "svm replay keys derive from the signed message bytes" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      solana_route = %{method: :get, path: "/api/resource", accepts: [@solana_accept]}
+
+      payment_required =
+        conn(:get, "/api/resource")
+        |> run_request(routes: [solana_route], facilitator: facilitator)
+        |> decode_payment_required!()
+
+      {:ok, solana_signer} = SolanaKey.new(:crypto.strong_rand_bytes(32))
+      {:ok, solana_payload} = Client.build_payment(payment_required, solana_signer)
+
+      header = encode_header(solana_payload)
+      reencoded = solana_payload |> Jason.encode!(pretty: true) |> Base.encode64()
+      assert reencoded != header
+
+      opts = [
+        routes: [solana_route],
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(opts)
+
+      assert first.status == 200
+      assert_receive {:verify_called, _, _}
+
+      duplicate =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", reencoded)
+        |> run_request(opts)
+
+      assert duplicate.status == 402
+      assert decode_payment_required!(duplicate)["error"] == "payment already processed"
+      refute_received {:verify_called, _, _}
+    end
+
+    test "unknown schemes fall back to header-hash keying" do
+      facilitator =
+        start_mock_facilitator(
+          settle:
+            {:ok,
+             %{
+               status: 200,
+               body: %{
+                 "success" => true,
+                 "transaction" => "note-receipt-1",
+                 "network" => "local:test",
+                 "payer" => "payer-1"
+               }
+             }}
+        )
+
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+
+      opts = [
+        routes: [@note_route],
+        schemes: [NoteScheme],
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      payload = %{
+        "x402Version" => 2,
+        "resource" => %{
+          "url" => "http://www.example.com/note/resource",
+          "description" => "Payment required",
+          "mimeType" => "application/json"
+        },
+        "accepted" => %{
+          "scheme" => "note",
+          "network" => "local:test",
+          "amount" => "5000",
+          "asset" => "note",
+          "payTo" => "till",
+          "maxTimeoutSeconds" => 60,
+          "extra" => %{}
+        },
+        "payload" => %{"note" => "IOU 5000"},
+        "extensions" => %{}
+      }
+
+      header = encode_header(payload)
+      reencoded = payload |> Jason.encode!(pretty: true) |> Base.encode64()
+      assert reencoded != header
+
+      first =
+        conn(:get, "/note/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(opts)
+
+      assert first.status == 200
+
+      # Without a signed per-family identity the key is the raw-header
+      # hash, so a re-encoding of the same proof is NOT caught — pinned
+      # here as the documented fallback behavior.
+      resubmitted =
+        conn(:get, "/note/resource")
+        |> put_req_header("payment-signature", reencoded)
+        |> run_request(opts)
+
+      assert resubmitted.status == 200
+
+      # A byte-identical replay still is.
+      duplicate =
+        conn(:get, "/note/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(opts)
+
+      assert duplicate.status == 402
+      assert decode_payment_required!(duplicate)["error"] == "payment already processed"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Payment identifier extension surfacing
+  # ---------------------------------------------------------------------------
+
+  describe "payment identifier extension" do
+    test "assigns x402_payment_id and tags telemetry for a well-formed extension" do
+      facilitator = start_mock_facilitator()
+      handler_id = "payment-id-#{System.unique_integer([:positive, :monotonic])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :plug, :payment_verified],
+          fn _event, _measurements, metadata, _config ->
+            send(parent, {:verified_metadata, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      {:ok, encoded} = PaymentIdentifier.encode("pay-123")
+
+      header =
+        valid_payment_payload()
+        |> Map.put("extensions", %{"paymentIdentifier" => encoded})
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_payment_id] == "pay-123"
+      assert_receive {:verified_metadata, %{payment_id: "pay-123"}}
+    end
+
+    test "accepts the decoded map form of the extension" do
+      facilitator = start_mock_facilitator()
+
+      header =
+        valid_payment_payload()
+        |> Map.put("extensions", %{"paymentIdentifier" => %{"paymentId" => "pay-9"}})
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_payment_id] == "pay-9"
+    end
+
+    test "rejects a malformed extension with 400 before any facilitator call" do
+      facilitator = start_mock_facilitator()
+
+      for malformed <- ["%%% not base64 %%%", %{}, %{"paymentId" => ""}, 42] do
+        conn =
+          conn(:get, "/api/resource")
+          |> put_req_header(
+            "payment-signature",
+            valid_payment_payload()
+            |> Map.put("extensions", %{"paymentIdentifier" => malformed})
+            |> encode_header()
+          )
+          |> run_request(routes: [@route], facilitator: facilitator)
+
+        assert conn.status == 400
+
+        assert decode_payment_required!(conn)["error"] ==
+                 "invalid payment identifier extension"
+      end
+
+      refute_received {:verify_called, _, _}
+    end
+
+    test "absent extension leaves the assign unset" do
+      facilitator = start_mock_facilitator()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      refute Map.has_key?(conn.assigns, :x402_payment_id)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # settlement_pending settle retry
+  # ---------------------------------------------------------------------------
+
+  describe "settlement_pending settle retry" do
+    test "retries the settle once when settlement_pending carries a transaction hash" do
+      bypass = Bypass.open()
+
+      Bypass.stub(bypass, "POST", "/verify", fn bypass_conn ->
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{"isValid" => true, "payer" => @receiver})
+        )
+      end)
+
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      Bypass.expect(bypass, "POST", "/settle", fn bypass_conn ->
+        body =
+          case Agent.get_and_update(counter, fn count -> {count + 1, count + 1} end) do
+            1 ->
+              %{
+                "success" => false,
+                "errorReason" => "settlement_pending",
+                "transaction" => "0xpending",
+                "network" => @network
+              }
+
+            _later ->
+              %{
+                "success" => true,
+                "transaction" => "0xsettled",
+                "network" => @network,
+                "payer" => @receiver
+              }
+          end
+
+        Plug.Conn.resp(bypass_conn, 200, Jason.encode!(body))
+      end)
+
+      facilitator = start_facilitator(url: "http://localhost:#{bypass.port}")
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert decode_payment_response!(conn)["success"] == true
+      assert decode_payment_response!(conn)["transaction"] == "0xsettled"
+      assert Agent.get(counter, & &1) == 2
+    end
+
+    test "a second settlement_pending follows the normal failure path" do
+      bypass = Bypass.open()
+
+      Bypass.stub(bypass, "POST", "/verify", fn bypass_conn ->
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{"isValid" => true, "payer" => @receiver})
+        )
+      end)
+
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      Bypass.expect(bypass, "POST", "/settle", fn bypass_conn ->
+        Agent.update(counter, &(&1 + 1))
+
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{
+            "success" => false,
+            "errorReason" => "settlement_pending",
+            "transaction" => "0xpending",
+            "network" => @network
+          })
+        )
+      end)
+
+      facilitator = start_facilitator(url: "http://localhost:#{bypass.port}")
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 402
+      response = decode_payment_response!(conn)
+      assert response["success"] == false
+      assert response["errorReason"] == "settlement_pending"
+      assert Agent.get(counter, & &1) == 2
+    end
+
+    test "settlement_pending without a transaction hash is not retried" do
+      bypass = Bypass.open()
+
+      Bypass.stub(bypass, "POST", "/verify", fn bypass_conn ->
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{"isValid" => true, "payer" => @receiver})
+        )
+      end)
+
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      Bypass.expect(bypass, "POST", "/settle", fn bypass_conn ->
+        Agent.update(counter, &(&1 + 1))
+
+        Plug.Conn.resp(
+          bypass_conn,
+          200,
+          Jason.encode!(%{
+            "success" => false,
+            "errorReason" => "settlement_pending",
+            "transaction" => "",
+            "network" => @network
+          })
+        )
+      end)
+
+      facilitator = start_facilitator(url: "http://localhost:#{bypass.port}")
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 402
+      assert Agent.get(counter, & &1) == 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
 
@@ -2255,7 +2907,9 @@ defmodule X402.Plug.PaymentGateTest do
 
   defp valid_payment_header, do: encode_header(valid_payment_payload())
 
-  defp valid_upto_payment_header(value) do
+  defp valid_upto_payment_header(value), do: encode_header(valid_upto_payment_payload(value))
+
+  defp valid_upto_payment_payload(value) do
     valid_payment_payload()
     |> put_in(["accepted", "scheme"], "upto")
     |> put_in(
@@ -2272,7 +2926,6 @@ defmodule X402.Plug.PaymentGateTest do
         }
       }
     )
-    |> encode_header()
   end
 
   defp encode_header(payload) when is_map(payload) do
