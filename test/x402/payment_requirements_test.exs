@@ -68,6 +68,40 @@ defmodule X402.PaymentRequirementsTest do
            })
   end
 
+  test "treats a required object without extra as preserved" do
+    assert PaymentRequirements.match?(%{"scheme" => "exact"}, %{"scheme" => "exact"})
+
+    assert PaymentRequirements.match?(
+             %{"scheme" => "exact"},
+             %{"scheme" => "exact", "extra" => %{"name" => "USDC"}}
+           )
+  end
+
+  test "match?/2 returns false for non-map arguments" do
+    refute PaymentRequirements.match?(nil, %{"scheme" => "exact"})
+    refute PaymentRequirements.match?(%{"scheme" => "exact"}, "exact")
+  end
+
+  test "extensions_match?/2 returns false for non-map advertised extensions" do
+    refute PaymentRequirements.extensions_match?(nil, %{})
+    refute PaymentRequirements.extensions_match?("extensions", %{})
+  end
+
+  test "matches echoed extensions without an info wrapper as a subset" do
+    advertised = %{"plain" => %{"required" => true}}
+
+    assert PaymentRequirements.extensions_match?(advertised, %{
+             "plain" => %{"required" => true, "client" => "value"}
+           })
+
+    refute PaymentRequirements.extensions_match?(advertised, %{"plain" => %{}})
+  end
+
+  test "matches scalar extension values by equality" do
+    assert PaymentRequirements.extensions_match?(%{"flag" => "v1"}, %{"flag" => "v1"})
+    refute PaymentRequirements.extensions_match?(%{"flag" => "v1"}, %{"flag" => "v2"})
+  end
+
   test "validates echoed extensions and ignores unadvertised client extensions" do
     advertised = %{
       "one" => %{"info" => %{"required" => true}, "schema" => %{"type" => "object"}}

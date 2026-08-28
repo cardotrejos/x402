@@ -35,6 +35,24 @@ defmodule X402.PaymentRequiredTest do
       assert {:ok, ^payload} = PaymentRequired.decode(encoded)
     end
 
+    test "normalizes atom-keyed upto payloads while encoding" do
+      assert {:ok, encoded} = PaymentRequired.encode(%{scheme: :upto, maxAmountRequired: "100"})
+      assert {:ok, decoded} = PaymentRequired.decode(encoded)
+
+      assert decoded["scheme"] == "upto"
+      assert decoded["maxPrice"] == "100"
+      refute Map.has_key?(decoded, "maxAmountRequired")
+    end
+
+    test "passes non-map accepts entries through unchanged" do
+      payload = %{"accepts" => ["opaque", %{"scheme" => "upto", "maxAmountRequired" => "42"}]}
+
+      assert {:ok, encoded} = PaymentRequired.encode(payload)
+      assert {:ok, decoded} = PaymentRequired.decode(encoded)
+
+      assert decoded["accepts"] == ["opaque", %{"scheme" => "upto", "maxPrice" => "42"}]
+    end
+
     test "normalizes legacy upto payload key to maxPrice while encoding" do
       legacy_payload = %{"scheme" => "upto", "maxAmountRequired" => "100"}
 

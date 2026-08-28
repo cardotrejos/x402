@@ -26,7 +26,7 @@ defmodule X402.MixProject do
       docs: docs(),
 
       # Testing
-      test_coverage: [tool: ExCoveralls, minimum_coverage: 90],
+      test_coverage: [tool: ExCoveralls, minimum_coverage: 95],
 
       # Dialyzer
       dialyzer: [

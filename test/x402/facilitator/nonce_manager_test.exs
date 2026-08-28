@@ -119,4 +119,39 @@ defmodule X402.Facilitator.NonceManagerTest do
     assert {:ok, 9} = NonceManager.checkout(manager, "0xbbb", fn -> {:ok, 9} end)
     assert {:ok, 2} = NonceManager.checkout(manager, "0xaaa", fn -> {:ok, 0} end)
   end
+
+  test "start_link registers the manager under a name" do
+    name = :"nonce_manager_#{System.unique_integer([:positive, :monotonic])}"
+    start_supervised!({NonceManager, name: name})
+
+    assert {:ok, 3} = NonceManager.checkout(name, "0xfee", fn -> {:ok, 3} end)
+  end
+
+  test "complete and release on an untracked address are no-ops" do
+    manager = start_manager()
+
+    assert :ok = NonceManager.complete(manager, "0xfee", 3)
+    assert :ok = NonceManager.release(manager, "0xfee", 3)
+
+    # Nothing was stored — the first checkout still fetches from the node.
+    assert {:ok, 7} = NonceManager.checkout(manager, "0xfee", fn -> {:ok, 7} end)
+  end
+
+  test "reset with nothing in flight drops the address immediately" do
+    manager = start_manager()
+
+    assert {:ok, 5} = NonceManager.checkout(manager, "0xfee", fn -> {:ok, 5} end)
+    assert :ok = NonceManager.complete(manager, "0xfee", 5)
+    assert :ok = NonceManager.reset(manager, "0xfee")
+
+    # The tracked entry is gone — the next checkout re-fetches.
+    assert {:ok, 42} = NonceManager.checkout(manager, "0xfee", fn -> {:ok, 42} end)
+  end
+
+  test "fetch results that are not result tuples are rejected" do
+    manager = start_manager()
+
+    assert {:error, {:invalid_nonce, :bogus}} =
+             NonceManager.checkout(manager, "0xfee", fn -> :bogus end)
+  end
 end

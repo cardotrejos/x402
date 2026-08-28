@@ -678,6 +678,87 @@ defmodule X402.Facilitator.EngineTest do
     def sign_eip712(_signer, _digest, _typed_data), do: {:error, :no_key}
   end
 
+  defmodule FailingSigner do
+    @behaviour X402.Signer
+
+    defstruct []
+
+    def address(_signer), do: {:ok, "0x1563915e194d8cfba1943570603f7606a3115508"}
+    def sign_eip712(_signer, _digest, _typed_data), do: {:error, :signer_unavailable}
+  end
+
+  defmodule InvalidBeforeSettleHooks do
+    @behaviour X402.Hooks
+
+    defdelegate before_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate after_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate on_verify_failure(context, metadata), to: X402.Hooks.Default
+    defdelegate after_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate on_settle_failure(context, metadata), to: X402.Hooks.Default
+
+    def before_settle(_context, _metadata), do: :nonsense
+  end
+
+  defmodule ThrowingBeforeVerifyHooks do
+    @behaviour X402.Hooks
+
+    defdelegate after_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate on_verify_failure(context, metadata), to: X402.Hooks.Default
+    defdelegate before_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate after_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate on_settle_failure(context, metadata), to: X402.Hooks.Default
+
+    def before_verify(_context, _metadata), do: throw(:engine_boom)
+  end
+
+  defmodule TupleHaltHooks do
+    @behaviour X402.Hooks
+
+    defdelegate after_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate on_verify_failure(context, metadata), to: X402.Hooks.Default
+    defdelegate before_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate after_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate on_settle_failure(context, metadata), to: X402.Hooks.Default
+
+    def before_verify(_context, _metadata), do: {:halt, {:rate_limited, 42}}
+  end
+
+  defmodule RaisingAfterVerifyHooks do
+    @behaviour X402.Hooks
+
+    defdelegate before_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate on_verify_failure(context, metadata), to: X402.Hooks.Default
+    defdelegate before_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate after_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate on_settle_failure(context, metadata), to: X402.Hooks.Default
+
+    def after_verify(_context, _metadata), do: raise("after boom")
+  end
+
+  defmodule RaisingFailureHooks do
+    @behaviour X402.Hooks
+
+    defdelegate before_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate after_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate before_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate after_settle(context, metadata), to: X402.Hooks.Default
+
+    def on_verify_failure(_context, _metadata), do: raise("failure hook boom")
+    def on_settle_failure(_context, _metadata), do: raise("failure hook boom")
+  end
+
+  defmodule InvalidFailureReturnHooks do
+    @behaviour X402.Hooks
+
+    defdelegate before_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate after_verify(context, metadata), to: X402.Hooks.Default
+    defdelegate before_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate after_settle(context, metadata), to: X402.Hooks.Default
+    defdelegate on_settle_failure(context, metadata), to: X402.Hooks.Default
+
+    def on_verify_failure(_context, _metadata), do: :bogus
+  end
+
   describe "hooks" do
     test "before_verify halt becomes a rejected wire response", context do
       engine = engine(context, hooks: HaltHooks)
@@ -783,6 +864,294 @@ defmodule X402.Facilitator.EngineTest do
                {:ok, %{"isValid" => false, "invalidReason" => "unsupported_scheme"}}
     end
   end
+
+  describe "hook failure branches" do
+    test "an invalid before_settle return is an infrastructure error", context do
+      engine = engine(context, hooks: InvalidBeforeSettleHooks)
+      requirements = requirements()
+
+      assert {:error, {:hook_invalid_return, :before_settle, :nonsense}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      refute_received {:rpc, _method, _params}
+    end
+
+    test "a throwing hook is an infrastructure error", context do
+      engine = engine(context, hooks: ThrowingBeforeVerifyHooks)
+      requirements = requirements()
+
+      assert {:error, {:hook_callback_failed, :before_verify, {:throw, :engine_boom}}} =
+               Engine.verify(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a non-atom halt reason is stringified with inspect", context do
+      engine = engine(context, hooks: TupleHaltHooks)
+      requirements = requirements()
+
+      assert {:ok, %{"isValid" => false, "invalidReason" => "{:rate_limited, 42}"}} =
+               Engine.verify(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a raising after_verify on a successful verification is an infrastructure error",
+         context do
+      engine = engine(context, hooks: RaisingAfterVerifyHooks)
+      requirements = requirements()
+
+      assert {:error, {:hook_callback_failed, :after_verify, {:exception, %RuntimeError{}}}} =
+               Engine.verify(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a raising on_verify_failure on a rejected payment is an infrastructure error",
+         context do
+      engine = engine(context, hooks: RaisingFailureHooks)
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:error, {:hook_callback_failed, :on_verify_failure, {:exception, %RuntimeError{}}}} =
+               Engine.verify(engine, payload, requirements(%{"amount" => "20000"}))
+    end
+
+    test "a raising on_settle_failure on a failed settlement is an infrastructure error",
+         context do
+      engine = engine(context, hooks: RaisingFailureHooks)
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:error, {:hook_callback_failed, :on_settle_failure, {:exception, %RuntimeError{}}}} =
+               Engine.settle(engine, payload, requirements(%{"amount" => "20000"}))
+    end
+
+    test "a raising on_verify_failure on an infrastructure error keeps the hook error",
+         context do
+      engine = engine(context, hooks: RaisingFailureHooks)
+      requirements = requirements()
+      payload = signed_payload(requirements)
+      Bypass.down(context.bypass)
+
+      assert {:error, {:hook_callback_failed, :on_verify_failure, {:exception, %RuntimeError{}}}} =
+               Engine.verify(engine, payload, requirements)
+    end
+
+    test "an invalid on_verify_failure return is an infrastructure error", context do
+      engine = engine(context, hooks: InvalidFailureReturnHooks)
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:error, {:hook_invalid_return, :on_verify_failure, :bogus}} =
+               Engine.verify(engine, payload, requirements(%{"amount" => "20000"}))
+    end
+  end
+
+  describe "settle/3 with pathological node responses" do
+    test "a signer failure after the preflight is an infrastructure error", context do
+      engine = engine(context, signer: %FailingSigner{})
+      requirements = requirements()
+
+      assert {:error, {:settle_error, :signer_unavailable}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+
+    test "a transport failure on the settle preflight batch is an infrastructure error",
+         context do
+      engine = scripted_engine(context, fail_settle_batch: true)
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:http_error, 500}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a transport failure on the preflight batch with a nonce manager", context do
+      manager = start_supervised!({X402.Facilitator.NonceManager, []})
+
+      engine =
+        scripted_engine(context, fail_settle_batch: true, engine: [nonce_manager: manager])
+
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:http_error, 500}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a non-numeric gas estimate is an infrastructure error", context do
+      engine = scripted_engine(context, results: %{"eth_estimateGas" => "0x12zz"})
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:invalid_response, "0x12zz"}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "an unprefixed gas estimate is an infrastructure error", context do
+      engine = scripted_engine(context, results: %{"eth_estimateGas" => "60000"})
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:invalid_response, "60000"}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a non-numeric pending nonce is an infrastructure error", context do
+      engine = scripted_engine(context, results: %{"eth_getTransactionCount" => "0xzz"})
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:invalid_response, "0xzz"}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a node-side error on the pending nonce is an infrastructure error", context do
+      engine =
+        scripted_engine(context,
+          results: %{
+            "eth_getTransactionCount" => {:error, %{"code" => -32_000, "message" => "boom"}}
+          }
+        )
+
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:jsonrpc_error, _error}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a failing eth_gasPrice fallback is an infrastructure error", context do
+      engine =
+        scripted_engine(context,
+          results: %{
+            "eth_maxPriorityFeePerGas" =>
+              {:error, %{"code" => -32_601, "message" => "method not found"}},
+            "eth_gasPrice" => {:error, %{"code" => -32_601, "message" => "method not found"}}
+          }
+        )
+
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:jsonrpc_error, _error}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "with a nonce manager, a non-numeric fetched nonce is an infrastructure error",
+         context do
+      manager = start_supervised!({X402.Facilitator.NonceManager, []})
+
+      engine =
+        scripted_engine(context,
+          engine: [nonce_manager: manager],
+          results: %{"eth_getTransactionCount" => "0xzz"}
+        )
+
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:invalid_nonce, "0xzz"}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "with a nonce manager, an unprefixed fetched nonce is an infrastructure error",
+         context do
+      manager = start_supervised!({X402.Facilitator.NonceManager, []})
+
+      engine =
+        scripted_engine(context,
+          engine: [nonce_manager: manager],
+          results: %{"eth_getTransactionCount" => "17"}
+        )
+
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:invalid_nonce, "17"}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "with a nonce manager, a node-side nonce error is an infrastructure error", context do
+      manager = start_supervised!({X402.Facilitator.NonceManager, []})
+
+      engine =
+        scripted_engine(context,
+          engine: [nonce_manager: manager],
+          results: %{
+            "eth_getTransactionCount" => {:error, %{"code" => -32_000, "message" => "boom"}}
+          }
+        )
+
+      requirements = requirements()
+
+      assert {:error, {:rpc_error, {:jsonrpc_error, _error}}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+  end
+
+  # Scripted JSON-RPC stub with raw per-method result injection, for
+  # pathological node responses X402.TestRPCStub cannot produce (garbage hex
+  # quantities, node-side errors on specific methods, failing only the settle
+  # preflight batch). Overrides map a method name to a raw JSON-RPC result or
+  # to `{:error, error_object}`.
+  defp scripted_engine(context, opts) do
+    results = Keyword.get(opts, :results, %{})
+    fail_settle_batch? = Keyword.get(opts, :fail_settle_batch, false)
+
+    Bypass.stub(context.bypass, "POST", "/", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      decoded = Jason.decode!(body)
+
+      settle_batch? =
+        is_list(decoded) and Enum.any?(decoded, &(&1["method"] == "eth_estimateGas"))
+
+      if fail_settle_batch? and settle_batch? do
+        Plug.Conn.resp(conn, 500, "boom")
+      else
+        scripted_reply(conn, decoded, results)
+      end
+    end)
+
+    {:ok, rpc} = RPC.new(rpc_url: "http://localhost:#{context.bypass.port}", finch: context.finch)
+
+    {:ok, engine} =
+      [
+        rpc: rpc,
+        signer: facilitator_signer(),
+        networks: [@network],
+        receipt_timeout_ms: 500,
+        receipt_interval_ms: 10
+      ]
+      |> Keyword.merge(Keyword.get(opts, :engine, []))
+      |> Engine.new()
+
+    engine
+  end
+
+  defp scripted_reply(conn, decoded, results) do
+    responses = decoded |> List.wrap() |> Enum.map(&scripted_response(&1, results))
+    response = if is_list(decoded), do: responses, else: hd(responses)
+
+    conn
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> Plug.Conn.resp(200, Jason.encode!(response))
+  end
+
+  defp scripted_response(%{"id" => id, "method" => method, "params" => params}, results) do
+    case Map.get(results, method, scripted_default(method, params)) do
+      {:error, error} -> %{"jsonrpc" => "2.0", "id" => id, "error" => error}
+      result -> %{"jsonrpc" => "2.0", "id" => id, "result" => result}
+    end
+  end
+
+  defp scripted_default("eth_chainId", _params), do: "0x14a34"
+
+  defp scripted_default("eth_getCode", [address, _block]) do
+    case String.downcase(address) == String.downcase(@asset) do
+      true -> "0x6001"
+      false -> "0x"
+    end
+  end
+
+  defp scripted_default("eth_call", _params),
+    do: "0x" <> Base.encode16(<<1_000_000::unsigned-big-integer-size(256)>>, case: :lower)
+
+  defp scripted_default("eth_estimateGas", _params), do: "0xea60"
+  defp scripted_default("eth_maxPriorityFeePerGas", _params), do: "0xf4240"
+  defp scripted_default("eth_feeHistory", _params), do: %{"baseFeePerGas" => ["0x64", "0x78"]}
+  defp scripted_default("eth_gasPrice", _params), do: "0x1e8480"
+  defp scripted_default("eth_getTransactionCount", _params), do: "0x5"
+  defp scripted_default("eth_sendRawTransaction", _params), do: @tx_hash
+  defp scripted_default("eth_getTransactionReceipt", _params), do: %{"status" => "0x1"}
 
   defp pad_word(bytes) when byte_size(bytes) <= 32,
     do: :binary.copy(<<0>>, 32 - byte_size(bytes)) <> bytes

@@ -37,6 +37,52 @@ defmodule X402.Extensions.SIWX.Verifier.DefaultTest do
              ) == {:error, :invalid_signature}
     end
 
+    test "returns false when public key recovery fails" do
+      # r = 5 is not the x-coordinate of any secp256k1 point, so recovery
+      # fails for any message — surfaced as a non-matching signature.
+      unrecoverable = "0x" <> Base.encode16(<<5::256, 1::256, 27>>, case: :lower)
+
+      assert Default.verify_signature(
+               "hello",
+               unrecoverable,
+               "0x1111111111111111111111111111111111111111"
+             ) == {:ok, false}
+    end
+
+    test "accepts raw 0/1 recovery ids" do
+      message = "Sign in to access purchased content"
+      address = private_key_to_address(@private_key)
+      hash = message_hash(message)
+      {:ok, {compact_signature, recovery_id}} = ExSecp256k1.sign_compact(hash, @private_key)
+
+      raw = "0x" <> Base.encode16(compact_signature <> <<recovery_id>>, case: :lower)
+
+      assert Default.verify_signature(message, raw, address) == {:ok, true}
+    end
+
+    test "accepts EIP-155-style recovery ids (v >= 35)" do
+      message = "Sign in to access purchased content"
+      address = private_key_to_address(@private_key)
+      hash = message_hash(message)
+      {:ok, {compact_signature, recovery_id}} = ExSecp256k1.sign_compact(hash, @private_key)
+
+      # v = chain_id * 2 + 35 + recovery_id; chain_id 1 gives 37/38.
+      eip155 = "0x" <> Base.encode16(compact_signature <> <<recovery_id + 37>>, case: :lower)
+
+      assert Default.verify_signature(message, eip155, address) == {:ok, true}
+    end
+
+    test "rejects out-of-range recovery bytes" do
+      message = "Sign in to access purchased content"
+      address = private_key_to_address(@private_key)
+      hash = message_hash(message)
+      {:ok, {compact_signature, _recovery_id}} = ExSecp256k1.sign_compact(hash, @private_key)
+
+      bad_v = "0x" <> Base.encode16(compact_signature <> <<29>>, case: :lower)
+
+      assert Default.verify_signature(message, bad_v, address) == {:error, :invalid_signature}
+    end
+
     test "returns invalid_address for malformed addresses" do
       message = "hello"
       signature = sign_message(message, @private_key)

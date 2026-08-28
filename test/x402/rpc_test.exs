@@ -138,6 +138,23 @@ defmodule X402.RPCTest do
                RPC.request(rpc(context), "eth_chainId", [])
     end
 
+    test "returns invalid_response for params that cannot be JSON-encoded", context do
+      # Invalid UTF-8 params fail Jason encoding before any HTTP request.
+      assert {:error, {:invalid_response, %Jason.EncodeError{}}} =
+               RPC.request(rpc(context), "eth_call", [<<0xFF>>])
+    end
+
+    test "catches exits from the HTTP client and fails closed", context do
+      # Stopping Finch's pool supervisor (while keeping its registry alive)
+      # makes the next pool start exit with :noproc instead of returning an
+      # error tuple — the transport must catch it and fail closed.
+      finch_supervisor = Process.whereis(:"#{context.finch}.Supervisor")
+      :ok = Supervisor.terminate_child(finch_supervisor, :"#{context.finch}.PoolSupervisor")
+
+      assert {:error, {:transport_error, {:noproc, _call}}} =
+               RPC.request(rpc(context), "eth_chainId", [])
+    end
+
     test "emits telemetry on success and error", context do
       ref = make_ref()
       test_pid = self()

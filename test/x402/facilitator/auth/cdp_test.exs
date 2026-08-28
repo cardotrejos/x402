@@ -68,6 +68,35 @@ defmodule X402.Facilitator.Auth.CDPTest do
       assert {:error, :invalid_ec_private_key} =
                CDP.new(api_key_id: "key-123", api_key_secret: pem)
     end
+
+    test "errors on an EC PEM whose private scalar is all zeros" do
+      pem = ec_pem_with_scalar(<<0::size(32 * 8)>>)
+
+      assert {:error, :invalid_ec_private_key} =
+               CDP.new(api_key_id: "key-123", api_key_secret: pem)
+    end
+
+    test "errors on an EC PEM whose private scalar is wider than 32 bytes" do
+      pem = ec_pem_with_scalar(<<1, 0::size(32 * 8)>>)
+
+      assert {:error, :invalid_ec_private_key} =
+               CDP.new(api_key_id: "key-123", api_key_secret: pem)
+    end
+
+    test "left-pads a short EC private scalar to 32 bytes and signs with it" do
+      pem = ec_pem_with_scalar(<<0, 5>>)
+
+      assert {:ok, %CDP{key_format: :ecdsa_p256, key_material: key_material} = auth} =
+               CDP.new(api_key_id: "key-123", api_key_secret: pem)
+
+      assert key_material == <<0::size(31 * 8), 5>>
+
+      assert {:ok, [{"authorization", "Bearer " <> token} | _rest]} =
+               Auth.headers(auth, %{method: :post, host: "h", path: "/verify"})
+
+      [_header_part, _payload_part, signature_part] = String.split(token, ".")
+      assert byte_size(Base.url_decode64!(signature_part, padding: false)) == 64
+    end
   end
 
   describe "headers/2 with an Ed25519 key" do
@@ -167,5 +196,35 @@ defmodule X402.Facilitator.Auth.CDPTest do
 
       assert :crypto.verify(:ecdsa, :sha256, signing_input, der, [public_key, :secp256r1])
     end
+
+    test "signatures stay exactly 64 bytes across many signings", %{auth: auth} do
+      # A DER signature component occasionally comes back shorter than 32
+      # bytes (top byte zero, roughly 1 in 128 signatures); every such
+      # component must be left-padded into the fixed 64-byte r || s form.
+      # 1500 signatures make the short-component branch all but certain to
+      # be exercised.
+      for _index <- 1..1500 do
+        {:ok, headers} = Auth.headers(auth, %{method: :post, host: "h", path: "/verify"})
+        {_, "Bearer " <> token} = hd(headers)
+        [_header_part, _payload_part, signature_part] = String.split(token, ".")
+        assert byte_size(Base.url_decode64!(signature_part, padding: false)) == 64
+      end
+    end
+  end
+
+  # Builds an `EC PRIVATE KEY` PEM around an arbitrary private-scalar octet
+  # string (a fresh P-256 public point keeps the structure valid), so tests
+  # can exercise scalar normalization on shapes real keygens never emit.
+  defp ec_pem_with_scalar(scalar) when is_binary(scalar) do
+    {public_key, _private_key} = :crypto.generate_key(:ecdh, :secp256r1)
+
+    body =
+      <<2, 1, 1, 4, byte_size(scalar), scalar::binary, 160, 10, 6, 8, 42, 134, 72, 206, 61, 3, 1,
+        7, 161, 68, 3, 66, 0, public_key::binary>>
+
+    der = <<48, byte_size(body), body::binary>>
+
+    "-----BEGIN EC PRIVATE KEY-----\n" <>
+      Base.encode64(der, line_length: 64) <> "\n-----END EC PRIVATE KEY-----\n"
   end
 end

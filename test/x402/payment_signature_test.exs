@@ -198,6 +198,26 @@ defmodule X402.PaymentSignatureTest do
     end
   end
 
+  describe "validate/3" do
+    test "validates payloads with an explicit schemes option" do
+      payload = v2_payload("9000")
+
+      assert PaymentSignature.validate(payload, @v2_requirements, schemes: []) == {:ok, payload}
+    end
+
+    test "returns invalid_payload for non-list opts" do
+      assert PaymentSignature.validate(v2_payload("9000"), @v2_requirements, :bad) ==
+               {:error, :invalid_payload}
+    end
+  end
+
+  describe "decode_and_validate/3" do
+    test "returns invalid_payload for non-map requirements" do
+      assert PaymentSignature.decode_and_validate("value", :bad, []) ==
+               {:error, :invalid_payload}
+    end
+  end
+
   describe "decode_and_validate/1" do
     test "returns ok for valid encoded v2 payload" do
       payload = v2_payload("9000")

@@ -42,6 +42,14 @@ defmodule X402.Extensions.OfferReceipt.JWSTest do
     test "rejects non-JSON values" do
       assert {:error, {:unsupported_json_value, {:a, :b}}} = JWS.canonicalize(%{"x" => {:a, :b}})
     end
+
+    test "rejects object keys that are neither strings nor atoms" do
+      assert {:error, {:unsupported_json_value, 1}} = JWS.canonicalize(%{1 => "x"})
+    end
+
+    test "rejects object keys that are not valid UTF-8" do
+      assert {:error, {:unsupported_json_value, <<0xFF>>}} = JWS.canonicalize(%{<<0xFF>> => 1})
+    end
   end
 
   describe "sign/2 with EdDSA" do
@@ -184,6 +192,35 @@ defmodule X402.Extensions.OfferReceipt.JWSTest do
       assert {:error, :invalid_jws} = JWS.verify("only.two", <<0::256>>)
       assert {:error, :invalid_jws} = JWS.verify("a.b.c.d", <<0::256>>)
       assert {:error, :invalid_jws} = JWS.verify("!not-base64!.b.c", <<0::256>>)
+    end
+
+    test "rejects a non-string alg header value" do
+      header = Base.url_encode64(~s({"alg":42,"kid":"did:web:x"}), padding: false)
+      payload = Base.url_encode64(~s({"version":1}), padding: false)
+      signature = Base.url_encode64(<<0::512>>, padding: false)
+
+      assert {:error, {:unsupported_algorithm, 42}} =
+               JWS.verify(Enum.join([header, payload, signature], "."), <<0::256>>)
+    end
+
+    test "rejects a header that is not a JSON object" do
+      header = Base.url_encode64("[1]", padding: false)
+      payload = Base.url_encode64(~s({"version":1}), padding: false)
+      signature = Base.url_encode64(<<0::512>>, padding: false)
+
+      assert {:error, {:missing_header, "alg"}} =
+               JWS.verify(Enum.join([header, payload, signature], "."), <<0::256>>)
+    end
+
+    test "rejects an ES256K signature that is not 64 bytes" do
+      {public, private} = secp256k1_pair()
+      assert {:ok, jws} = JWS.sign(%{"version" => 1}, alg: "ES256K", kid: @kid, key: private)
+
+      [header, payload, _signature] = String.split(jws, ".")
+      short_signature = Base.url_encode64(<<1, 2, 3>>, padding: false)
+
+      assert {:error, :signature_mismatch} =
+               JWS.verify(Enum.join([header, payload, short_signature], "."), public)
     end
   end
 

@@ -85,6 +85,83 @@ defmodule X402.Extensions.SIWXTest do
 
       assert SIWX.decode(invalid_address_message) == {:error, {:invalid_field, :address}}
     end
+
+    test "rejects messages with an empty domain" do
+      {:ok, message} = SIWX.encode(valid_payload())
+
+      # The first line ends with the SIWE suffix but carries no domain.
+      empty_domain_message = String.replace(message, "example.com", "")
+
+      assert SIWX.decode(empty_domain_message) == {:error, {:invalid_field, :domain}}
+    end
+
+    test "rejects messages whose first line lacks the SIWE suffix" do
+      {:ok, message} = SIWX.encode(valid_payload())
+
+      # Dropping the leading space breaks the " wants you to sign in..." suffix.
+      no_suffix_message = String.replace(message, "example.com wants", "example.com-wants")
+
+      assert SIWX.decode(no_suffix_message) == {:error, :invalid_message}
+    end
+
+    test "rejects messages with an empty prefixed field value" do
+      {:ok, message} = SIWX.encode(valid_payload())
+
+      empty_uri_message =
+        String.replace(message, "URI: https://example.com/protected", "URI: ")
+
+      assert SIWX.decode(empty_uri_message) == {:error, {:invalid_field, :uri}}
+    end
+
+    test "rejects messages with a mislabeled field line" do
+      {:ok, message} = SIWX.encode(valid_payload())
+
+      mislabeled_message = String.replace(message, "Version: 1", "Ver: 1")
+
+      assert SIWX.decode(mislabeled_message) == {:error, :invalid_message}
+    end
+
+    test "rejects empty or malformed field values on encode" do
+      empty_address = Map.put(valid_payload(), :address, "")
+      assert SIWX.encode(empty_address) == {:error, {:invalid_field, :address}}
+
+      empty_statement = Map.put(valid_payload(), :statement, "")
+      assert SIWX.encode(empty_statement) == {:error, {:invalid_field, :statement}}
+
+      multiline_statement = Map.put(valid_payload(), :statement, "line one\nline two")
+      assert SIWX.encode(multiline_statement) == {:error, {:invalid_field, :statement}}
+
+      empty_uri = Map.put(valid_payload(), :uri, "")
+      assert SIWX.encode(empty_uri) == {:error, {:invalid_field, :uri}}
+
+      schemeless_uri = Map.put(valid_payload(), :uri, "not-a-uri")
+      assert SIWX.encode(schemeless_uri) == {:error, {:invalid_field, :uri}}
+
+      empty_nonce = Map.put(valid_payload(), :nonce, "")
+      assert SIWX.encode(empty_nonce) == {:error, {:invalid_field, :nonce}}
+
+      empty_issued_at = Map.put(valid_payload(), :issued_at, "")
+      assert SIWX.encode(empty_issued_at) == {:error, {:invalid_field, :issued_at}}
+
+      malformed_issued_at = Map.put(valid_payload(), :issued_at, "yesterday at noon")
+      assert SIWX.encode(malformed_issued_at) == {:error, {:invalid_field, :issued_at}}
+    end
+
+    test "accepts decimal-string chain ids and rejects non-positive ones" do
+      decimal_chain_id = Map.put(valid_payload(), :chain_id, "8453")
+      assert {:ok, message} = SIWX.encode(decimal_chain_id)
+      assert {:ok, decoded} = SIWX.decode(message)
+      assert decoded.chain_id == "eip155:8453"
+
+      zero_chain_id = Map.put(valid_payload(), :chain_id, 0)
+      assert SIWX.encode(zero_chain_id) == {:error, {:invalid_field, :chain_id}}
+
+      negative_chain_id = Map.put(valid_payload(), :chain_id, "-1")
+      assert SIWX.encode(negative_chain_id) == {:error, {:invalid_field, :chain_id}}
+
+      nil_chain_id = Map.put(valid_payload(), :chain_id, nil)
+      assert SIWX.encode(nil_chain_id) == {:error, {:invalid_field, :chain_id}}
+    end
   end
 
   describe "encode_header/1 and decode_header/1" do
@@ -101,6 +178,13 @@ defmodule X402.Extensions.SIWXTest do
       assert SIWX.encode_header(nil) == {:error, :invalid_payload}
       assert SIWX.encode_header(%{message: "only message"}) == {:error, :invalid_payload}
       assert SIWX.encode_header(%{message: "", signature: "0xabc"}) == {:error, :invalid_payload}
+    end
+
+    test "returns invalid_json when the payload cannot be JSON-encoded" do
+      invalid_utf8 = <<0xFF, 0xFE>>
+
+      assert SIWX.encode_header(%{message: invalid_utf8, signature: "0xabc"}) ==
+               {:error, :invalid_json}
     end
 
     test "returns decode errors for malformed headers" do
