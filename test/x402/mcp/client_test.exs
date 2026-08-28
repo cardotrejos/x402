@@ -264,6 +264,25 @@ defmodule X402.MCP.ClientTest do
                {:error, {:transport_error, :closed}}
     end
 
+    test "normalizes a payment-required JSON-RPC error on the retry to a tool result" do
+      rejected_retry =
+        {:error, %{"code" => 402, "message" => "still pay", "data" => @payment_required}}
+
+      call_fun = tracking_fun([payment_required_result(), rejected_retry])
+
+      # The rejected paid retry comes back as the payment-required tool
+      # result — never re-signed, never surfaced as a transport error.
+      assert {:ok, %{result: result, payment_response: nil, paid: true}} =
+               Client.call(@request, call_fun, signer: signer())
+
+      assert result["isError"] == true
+      assert result["structuredContent"] == @payment_required
+
+      assert_received {:tool_called, _first}
+      assert_received {:tool_called, _second}
+      refute_received {:tool_called, _third}
+    end
+
     test "rejects invalid tool results on the retry" do
       call_fun = tracking_fun([payment_required_result(), "nope"])
 

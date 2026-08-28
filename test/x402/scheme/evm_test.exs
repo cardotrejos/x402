@@ -137,5 +137,36 @@ defmodule X402.Scheme.EVMTest do
 
       assert EVM.authorization_precheck(payload(authorization), requirements()) == :ok
     end
+
+    test "skips the payTo check when either side is not a string" do
+      non_binary_to = valid_authorization(%{"to" => 42})
+      assert EVM.authorization_precheck(payload(non_binary_to), requirements()) == :ok
+
+      missing_pay_to = Map.delete(requirements(), "payTo")
+
+      assert EVM.authorization_precheck(payload(valid_authorization()), missing_pay_to) ==
+               :ok
+    end
+
+    test "accepts integer timing values" do
+      now = System.system_time(:second)
+
+      authorization =
+        valid_authorization(%{"validAfter" => now - 60, "validBefore" => now + 600})
+
+      assert EVM.authorization_precheck(payload(authorization), requirements()) == :ok
+
+      expired = valid_authorization(%{"validBefore" => now + 2})
+
+      assert EVM.authorization_precheck(payload(expired), requirements()) ==
+               {:error, {:precheck_failed, :authorization_expired}}
+    end
+
+    test "rejects timing values that are neither integers nor strings" do
+      authorization = valid_authorization(%{"validAfter" => 1.5})
+
+      assert EVM.authorization_precheck(payload(authorization), requirements()) ==
+               {:error, {:precheck_failed, :invalid_authorization_timing}}
+    end
   end
 end

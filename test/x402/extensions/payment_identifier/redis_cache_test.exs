@@ -228,13 +228,18 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCacheTest do
 
   describe "contract conformance (in-memory Redis semantics)" do
     # A fake command layer with real SET NX PX semantics: atomicity comes
-    # from serializing through the Agent, expiry from monotonic timestamps —
+    # from serializing through the Agent, expiry from a virtual clock the
+    # tests advance explicitly (wall-clock sleeps race CI scheduler jitter) —
     # mirroring the ETSCache behaviour tests without a live server.
     defmodule FakeRedis do
       @behaviour X402.Extensions.PaymentIdentifier.RedisCache.Command
 
       def start_link do
-        Agent.start_link(fn -> %{} end)
+        Agent.start_link(fn -> %{entries: %{}, clock: 0} end)
+      end
+
+      def advance(agent, ms) do
+        Agent.update(agent, fn state -> %{state | clock: state.clock + ms} end)
       end
 
       @impl true
@@ -259,23 +264,22 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCacheTest do
 
       def command(agent, ["DEL", key]) do
         Agent.get_and_update(agent, fn state ->
-          {{:ok, if(Map.has_key?(state, key), do: 1, else: 0)}, Map.delete(state, key)}
+          {{:ok, if(Map.has_key?(state.entries, key), do: 1, else: 0)},
+           %{state | entries: Map.delete(state.entries, key)}}
         end)
       end
 
       defp put_entry(state, key, value, ttl) do
-        expires_at = now_ms() + String.to_integer(ttl)
-        Map.put(state, key, {value, expires_at})
+        expires_at = state.clock + String.to_integer(ttl)
+        %{state | entries: Map.put(state.entries, key, {value, expires_at})}
       end
 
       defp live_value(state, key) do
-        case Map.get(state, key) do
-          {value, expires_at} -> if expires_at > now_ms(), do: value
+        case Map.get(state.entries, key) do
+          {value, expires_at} -> if expires_at > state.clock, do: value
           nil -> nil
         end
       end
-
-      defp now_ms, do: System.monotonic_time(:millisecond)
     end
 
     defp fake_cache(opts \\ []) do
@@ -317,7 +321,7 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCacheTest do
       cache = fake_cache(ttl_ms: 20)
 
       assert :ok = RedisCache.put_new(cache, "payment-1", :verified)
-      Process.sleep(40)
+      FakeRedis.advance(cache.conn, 40)
 
       assert :ok = RedisCache.put_new(cache, "payment-1", :verified)
     end
@@ -328,7 +332,7 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCacheTest do
       assert :ok = RedisCache.put(cache, "payment-1", {:rejected, :verification_failed})
       assert {:hit, {:rejected, :verification_failed}} = RedisCache.get(cache, "payment-1")
 
-      Process.sleep(50)
+      FakeRedis.advance(cache.conn, 50)
       assert :miss = RedisCache.get(cache, "payment-1")
     end
 
@@ -336,9 +340,9 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCacheTest do
       cache = fake_cache(ttl_ms: 60)
 
       assert :ok = RedisCache.put(cache, "payment-1", :verified)
-      Process.sleep(40)
+      FakeRedis.advance(cache.conn, 40)
       assert :ok = RedisCache.put(cache, "payment-1", :verified)
-      Process.sleep(40)
+      FakeRedis.advance(cache.conn, 40)
 
       # 80ms after the first write, but only 40ms after the reset.
       assert {:hit, :verified} = RedisCache.get(cache, "payment-1")

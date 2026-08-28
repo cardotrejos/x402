@@ -21,6 +21,73 @@ defmodule X402.MCP.ServerTest do
   alias X402.Extensions.PaymentIdentifier.ETSCache
   alias X402.MCP.Server
 
+  defmodule RewriteResultHooks do
+    @moduledoc false
+    # Rewrites the facilitator's verify/settle result with a shape taken from
+    # the test process dictionary — hooks run in the calling (test) process.
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+
+    def after_verify(%Context{} = context, _metadata) do
+      case Process.get(:rewrite_verify_result) do
+        nil -> {:cont, context}
+        result -> {:cont, %{context | result: result}}
+      end
+    end
+
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+
+    def after_settle(%Context{} = context, _metadata) do
+      case Process.get(:rewrite_settle_result) do
+        nil -> {:cont, context}
+        result -> {:cont, %{context | result: result}}
+      end
+    end
+
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule HaltVerifyHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{}, _metadata), do: {:halt, :nope}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule FailingCache do
+    @moduledoc false
+    # A Cache adapter whose claim always fails with an infrastructure error.
+    @behaviour X402.Extensions.PaymentIdentifier.Cache
+
+    @impl true
+    def get(_cache, _payment_id), do: :miss
+
+    @impl true
+    def put(_cache, _payment_id, _value), do: :ok
+
+    @impl true
+    def put_new(_cache, _payment_id, _value), do: {:error, :backend_unreachable}
+
+    @impl true
+    def delete(_cache, _payment_id), do: :ok
+  end
+
+  @internal_error %{
+    "isError" => true,
+    "content" => [%{"type" => "text", "text" => "Internal server error"}]
+  }
+
   @default_settle_body %{
     "success" => true,
     "transaction" => "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
@@ -368,6 +435,59 @@ defmodule X402.MCP.ServerTest do
       assert replay["structuredContent"]["error"] == "payment already processed"
     end
 
+    test "rejects payloads whose scheme payload is not a map" do
+      config = config(start_facilitator())
+      invalid = payment(%{"payload" => "not-a-map"})
+
+      result = Server.call(request(invalid), config, refute_handler())
+
+      assert result["isError"] == true
+      assert result["structuredContent"]["error"] == "invalid_payload"
+      refute_received {:verify_called, _payload, _requirements, _hooks}
+    end
+
+    test "rejects accepted values with invalid field types" do
+      config = config(start_facilitator())
+      # amount must be a string of atomic units; an integer is an invalid field.
+      invalid = payment(%{"accepted" => %{@requirements | "amount" => 10_000}})
+
+      result = Server.call(request(invalid), config, refute_handler())
+
+      assert result["isError"] == true
+      assert result["structuredContent"]["error"] == "invalid_payload"
+      refute_received {:verify_called, _payload, _requirements, _hooks}
+    end
+
+    test "rejects upto payments whose signed value exceeds the advertised ceiling" do
+      upto_accept = Map.put(@accept, :scheme, "upto")
+      config = config(start_facilitator(), accepts: [upto_accept])
+      upto_requirements = %{@requirements | "scheme" => "upto"}
+
+      over_ceiling =
+        payment(%{
+          "accepted" => upto_requirements,
+          "payload" => %{"signature" => "0xsignature", "authorization" => %{"value" => "20000"}}
+        })
+
+      result = Server.call(request(over_ceiling), config, refute_handler())
+
+      assert result["isError"] == true
+      assert result["structuredContent"]["error"] == "invalid_payload"
+      refute_received {:verify_called, _payload, _requirements, _hooks}
+    end
+
+    test "reports a generic message for unrecognized rejection reasons" do
+      # A halting before_verify hook surfaces a {:hook_halted, ...} reason the
+      # server has no specific message for.
+      config = config(start_facilitator(), hooks: HaltVerifyHooks)
+
+      result = Server.call(request(payment()), config, refute_handler())
+
+      assert result["isError"] == true
+      assert result["structuredContent"]["error"] == "payment processing failed"
+      refute_received {:verify_called, _payload, _requirements, _hooks}
+    end
+
     test "rejects extension echoes that drop advertised values" do
       extensions = %{"example" => %{"info" => %{"required" => true}}}
       config = config(start_facilitator(), extensions: extensions)
@@ -517,6 +637,64 @@ defmodule X402.MCP.ServerTest do
       result = Server.call(request(payment()), config, refute_handler())
 
       assert result["structuredContent"]["error"] == "facilitator rejected payment"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Facilitator response shapes (rewritten through hooks)
+  # ---------------------------------------------------------------------------
+
+  describe "unexpected facilitator response shapes" do
+    # after_verify/after_settle hooks may replace the operation result, so the
+    # server must fail closed on any shape a hook (or future transport) hands
+    # it: 2xx without a map body, a non-2xx status, or a map without a status.
+
+    test "treats a 2xx verify response without a map body as an internal error" do
+      Process.put(:rewrite_verify_result, %{status: 299, body: "not a map"})
+      config = config(start_facilitator(), hooks: RewriteResultHooks)
+
+      assert Server.call(request(payment()), config, refute_handler()) == @internal_error
+      refute_received :handler_called
+    end
+
+    test "treats a non-2xx verify status as an internal error" do
+      Process.put(:rewrite_verify_result, %{status: 404, body: %{}})
+      config = config(start_facilitator(), hooks: RewriteResultHooks)
+
+      assert Server.call(request(payment()), config, refute_handler()) == @internal_error
+      refute_received :handler_called
+    end
+
+    test "treats a verify response without a status as an internal error" do
+      Process.put(:rewrite_verify_result, %{"unexpected" => true})
+      config = config(start_facilitator(), hooks: RewriteResultHooks)
+
+      assert Server.call(request(payment()), config, refute_handler()) == @internal_error
+      refute_received :handler_called
+    end
+
+    test "treats a 2xx settle response without a map body as an internal error" do
+      Process.put(:rewrite_settle_result, %{status: 299, body: "not a map"})
+      config = config(start_facilitator(), hooks: RewriteResultHooks)
+
+      assert Server.call(request(payment()), config, ok_handler()) == @internal_error
+      assert_received {:handler_called, _request}
+    end
+
+    test "treats a non-2xx settle status as an internal error" do
+      Process.put(:rewrite_settle_result, %{status: 404, body: %{}})
+      config = config(start_facilitator(), hooks: RewriteResultHooks)
+
+      assert Server.call(request(payment()), config, ok_handler()) == @internal_error
+      assert_received {:handler_called, _request}
+    end
+
+    test "treats a settle response without a status as an internal error" do
+      Process.put(:rewrite_settle_result, %{"unexpected" => true})
+      config = config(start_facilitator(), hooks: RewriteResultHooks)
+
+      assert Server.call(request(payment()), config, ok_handler()) == @internal_error
+      assert_received {:handler_called, _request}
     end
   end
 
@@ -717,6 +895,60 @@ defmodule X402.MCP.ServerTest do
       assert_received {:settle_called, _payload, _requirements, _hooks}
       assert_received {:settle_called, _payload, _requirements, _hooks}
       assert second["structuredContent"]["error"] =~ "settlement failed"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Cache adapter validation and failures
+  # ---------------------------------------------------------------------------
+
+  describe "payment identifier cache adapters" do
+    test "a claim failure other than a duplicate fails closed as an internal error" do
+      config =
+        config(start_facilitator(), payment_identifier_cache: {FailingCache, :backend})
+
+      assert Server.call(request(payment()), config, refute_handler()) == @internal_error
+
+      # The payment verified but the claim could not be taken — the handler
+      # must not run and no settlement is attempted.
+      assert_received {:verify_called, _payload, _requirements, _hooks}
+      refute_received :handler_called
+      refute_received {:settle_called, _payload, _requirements, _hooks}
+    end
+
+    test "validate_payment_identifier_cache/1 wraps GenServer names in the ETS adapter" do
+      assert Server.validate_payment_identifier_cache(nil) == {:ok, nil}
+
+      assert Server.validate_payment_identifier_cache({:global, :cache_name}) ==
+               {:ok, {ETSCache, {:global, :cache_name}}}
+
+      assert Server.validate_payment_identifier_cache({:via, Registry, {MyRegistry, :cache}}) ==
+               {:ok, {ETSCache, {:via, Registry, {MyRegistry, :cache}}}}
+
+      assert Server.validate_payment_identifier_cache(:plain_name) ==
+               {:ok, {ETSCache, :plain_name}}
+    end
+
+    test "validate_payment_identifier_cache/1 accepts adapter tuples that implement Cache" do
+      assert Server.validate_payment_identifier_cache({FailingCache, :backend}) ==
+               {:ok, {FailingCache, :backend}}
+
+      assert Server.validate_payment_identifier_cache({ETSCache, :cache_name}) ==
+               {:ok, {ETSCache, :cache_name}}
+    end
+
+    test "validate_payment_identifier_cache/1 rejects tuples that do not implement Cache" do
+      assert {:error, message} = Server.validate_payment_identifier_cache({Enum, :backend})
+      assert message =~ "X402.Extensions.PaymentIdentifier.Cache"
+      assert message =~ "{X402.Extensions.PaymentIdentifier.ETSCache, {name, node}}"
+
+      assert_raise NimbleOptions.ValidationError, ~r/remote ETSCache/, fn ->
+        Server.init(
+          tool: "premium_search",
+          accepts: [@accept],
+          payment_identifier_cache: {Enum, :backend}
+        )
+      end
     end
   end
 

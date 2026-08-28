@@ -147,6 +147,128 @@ defmodule X402.FacilitatorTest do
     def headers(_auth, _request_info), do: {:error, :no_headers_available}
   end
 
+  defmodule RecordingAuth do
+    @moduledoc false
+    @behaviour X402.Facilitator.Auth
+
+    defstruct []
+
+    @impl true
+    def new(_opts), do: {:ok, %__MODULE__{}}
+
+    # Operations run in the calling process, so self() is the test process.
+    @impl true
+    def headers(_auth, request_info) do
+      send(self(), {:auth_request_info, request_info})
+      {:error, :recorded}
+    end
+  end
+
+  defmodule InvalidBeforeVerifyHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    def before_verify(%Context{} = _context, _metadata), do: :garbage
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule RaisingAfterVerifyHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = _context, _metadata), do: raise("after boom")
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule NilResultAfterVerifyHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+
+    def after_verify(%Context{} = context, _metadata),
+      do: {:cont, %Context{context | result: nil}}
+
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule BadResultAfterVerifyHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+
+    def after_verify(%Context{} = context, _metadata),
+      do: {:cont, %Context{context | result: :nope}}
+
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule BadRecoverHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def on_verify_failure(%Context{} = _context, _metadata), do: {:recover, :not_a_map}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule InvalidFailureReturnHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def on_verify_failure(%Context{} = _context, _metadata), do: :bogus
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule RaisingFailureHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def on_verify_failure(%Context{} = _context, _metadata), do: raise("failure hook boom")
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule NilErrorFailureHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+
+    def on_verify_failure(%Context{} = context, _metadata),
+      do: {:cont, %Context{context | error: nil}}
+
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
   setup :setup_bypass
   setup :setup_finch
 
@@ -1234,6 +1356,359 @@ defmodule X402.FacilitatorTest do
 
       assert {:ok, %{items: []}} = Facilitator.list_resources(facilitator, limit: 5)
     end
+  end
+
+  describe "hook edge cases" do
+    test "an invalid before_verify return halts without an HTTP request", %{
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           hooks: InvalidBeforeVerifyHooks}
+        )
+
+      capture_log(fn ->
+        assert {:error, {:hook_invalid_return, :before_verify, :garbage}} =
+                 Facilitator.verify(facilitator, %{}, %{})
+      end)
+    end
+
+    test "a raising after_verify on a successful response is an infrastructure error", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "POST", "/verify", fn conn ->
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           hooks: RaisingAfterVerifyHooks}
+        )
+
+      capture_log(fn ->
+        assert {:error,
+                {:hook_callback_failed, :after_verify,
+                 {:exception, %RuntimeError{message: "after boom"}}}} =
+                 Facilitator.verify(facilitator, %{}, %{})
+      end)
+    end
+
+    test "an after_verify that clears the result keeps the original response", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "POST", "/verify", fn conn ->
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           hooks: NilResultAfterVerifyHooks}
+        )
+
+      assert {:ok, %{status: 200, body: %{"verified" => true}}} =
+               Facilitator.verify(facilitator, %{}, %{})
+    end
+
+    test "an after_verify that replaces the result with a non-map is an error", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "POST", "/verify", fn conn ->
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"verified" => true}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           hooks: BadResultAfterVerifyHooks}
+        )
+
+      capture_log(fn ->
+        assert {:error, {:hook_invalid_return, :after_verify, {:invalid_result, :nope}}} =
+                 Facilitator.verify(facilitator, %{}, %{})
+      end)
+    end
+
+    test "a non-map recovery from on_verify_failure is an error", %{
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           hooks: BadRecoverHooks}
+        )
+
+      capture_log(fn ->
+        assert {:error,
+                {:hook_invalid_return, :on_verify_failure, {:invalid_recovery_result, :not_a_map}}} =
+                 Facilitator.verify(
+                   facilitator,
+                   %{"value" => "11"},
+                   %{"scheme" => "upto", "maxPrice" => "10"}
+                 )
+      end)
+    end
+
+    test "an invalid on_verify_failure return is an error", %{
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           hooks: InvalidFailureReturnHooks}
+        )
+
+      capture_log(fn ->
+        assert {:error, {:hook_invalid_return, :on_verify_failure, :bogus}} =
+                 Facilitator.verify(
+                   facilitator,
+                   %{"value" => "11"},
+                   %{"scheme" => "upto", "maxPrice" => "10"}
+                 )
+      end)
+    end
+
+    test "a raising on_verify_failure is an error", %{
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           hooks: RaisingFailureHooks}
+        )
+
+      capture_log(fn ->
+        assert {:error,
+                {:hook_callback_failed, :on_verify_failure,
+                 {:exception, %RuntimeError{message: "failure hook boom"}}}} =
+                 Facilitator.verify(
+                   facilitator,
+                   %{"value" => "11"},
+                   %{"scheme" => "upto", "maxPrice" => "10"}
+                 )
+      end)
+    end
+
+    test "an on_verify_failure that clears the error falls back to the original", %{
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           hooks: NilErrorFailureHooks}
+        )
+
+      capture_log(fn ->
+        assert {:error, {:invalid_upto_payment, :payment_value_exceeds_max_price}} =
+                 Facilitator.verify(
+                   facilitator,
+                   %{"value" => "11"},
+                   %{"scheme" => "upto", "maxPrice" => "10"}
+                 )
+      end)
+    end
+  end
+
+  describe "upto validation edge cases" do
+    setup %{finch: finch, facilitator_url: facilitator_url} do
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      {:ok, facilitator: facilitator}
+    end
+
+    test "verify requires a max price", %{facilitator: facilitator} do
+      capture_log(fn ->
+        assert {:error, {:invalid_upto_payment, :missing_max_price}} =
+                 Facilitator.verify(facilitator, %{"value" => "5"}, %{"scheme" => "upto"})
+      end)
+    end
+
+    test "verify rejects an unparseable max price", %{facilitator: facilitator} do
+      capture_log(fn ->
+        assert {:error, {:invalid_upto_payment, :invalid_max_price}} =
+                 Facilitator.verify(
+                   facilitator,
+                   %{"value" => "5"},
+                   %{"scheme" => "upto", "maxPrice" => "abc"}
+                 )
+      end)
+    end
+
+    test "verify requires a payment value", %{facilitator: facilitator} do
+      capture_log(fn ->
+        assert {:error, {:invalid_upto_payment, :missing_payment_value}} =
+                 Facilitator.verify(facilitator, %{}, %{"scheme" => "upto", "maxPrice" => "10"})
+      end)
+    end
+
+    test "verify rejects an unparseable payment value", %{facilitator: facilitator} do
+      capture_log(fn ->
+        assert {:error, {:invalid_upto_payment, :invalid_payment_value}} =
+                 Facilitator.verify(
+                   facilitator,
+                   %{"value" => "abc"},
+                   %{"scheme" => "upto", "maxPrice" => "10"}
+                 )
+      end)
+    end
+
+    test "settle rejects an unparseable settlement amount", %{facilitator: facilitator} do
+      capture_log(fn ->
+        assert {:error, {:invalid_upto_payment, :invalid_settlement_amount}} =
+                 Facilitator.settle(
+                   facilitator,
+                   %{"value" => "5"},
+                   %{"scheme" => "upto", "amount" => "abc"}
+                 )
+      end)
+    end
+
+    test "settle rejects a settlement amount above the authorized amount", %{
+      facilitator: facilitator
+    } do
+      capture_log(fn ->
+        assert {:error, {:invalid_upto_payment, :settlement_amount_exceeds_authorized_amount}} =
+                 Facilitator.settle(
+                   facilitator,
+                   %{"value" => "10"},
+                   %{"scheme" => "upto", "amount" => "20"}
+                 )
+      end)
+    end
+  end
+
+  describe "auth request info derivation" do
+    test "a URL without a host binds auth to an empty host", %{finch: finch} do
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"), finch: finch, url: "not-a-url", auth: RecordingAuth}
+        )
+
+      capture_log(fn ->
+        assert {:error, %Error{type: :auth_failed, reason: :recorded}} =
+                 Facilitator.verify(facilitator, %{}, %{})
+      end)
+
+      assert_received {:auth_request_info, %{method: :post, host: ""}}
+    end
+
+    test "a URL without a scheme keeps the explicit port in the host", %{finch: finch} do
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: "//localhost:9080",
+           auth: RecordingAuth}
+        )
+
+      capture_log(fn ->
+        assert {:error, %Error{type: :auth_failed, reason: :recorded}} =
+                 Facilitator.verify(facilitator, %{}, %{})
+      end)
+
+      assert_received {:auth_request_info, %{host: "localhost:9080"}}
+    end
+
+    test "a scheme without a known port binds auth to the bare host", %{finch: finch} do
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: "zzz://localhost",
+           auth: RecordingAuth}
+        )
+
+      capture_log(fn ->
+        assert {:error, %Error{type: :auth_failed, reason: :recorded}} =
+                 Facilitator.verify(facilitator, %{}, %{})
+      end)
+
+      assert_received {:auth_request_info, %{host: "localhost"}}
+    end
+  end
+
+  test "start_link rejects auth values that are neither modules nor tuples" do
+    assert {:error, %NimbleOptions.ValidationError{}} =
+             Facilitator.start_link(finch: :finch, auth: "not-an-auth")
+  end
+
+  test "init/1 stops on auth options that fail to build" do
+    assert {:stop, {:invalid_auth, :invalid_secret_format}} =
+             Facilitator.init(
+               auth: {X402.Facilitator.Auth.CDP, api_key_id: "key", api_key_secret: "not-base64"}
+             )
+  end
+
+  test "supported/1 fails closed on a kind with a non-map extra", %{
+    bypass: bypass,
+    finch: finch,
+    facilitator_url: facilitator_url
+  } do
+    Bypass.expect(bypass, "GET", "/supported", fn conn ->
+      Plug.Conn.resp(
+        conn,
+        200,
+        Jason.encode!(%{
+          "kinds" => [
+            %{"x402Version" => 2, "scheme" => "exact", "network" => "eip155:1", "extra" => "bad"}
+          ]
+        })
+      )
+    end)
+
+    facilitator =
+      start_supervised!(
+        {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+      )
+
+    capture_log(fn ->
+      assert {:error,
+              %Error{type: :malformed_facilitator_response, reason: {:invalid_kind, _kind}}} =
+               Facilitator.supported(facilitator)
+    end)
   end
 
   test "hook context struct includes payload and requirements" do

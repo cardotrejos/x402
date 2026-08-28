@@ -129,6 +129,35 @@ defmodule X402.Paywall.DefaultTest do
       assert html =~ "Solana"
     end
 
+    test "degrades to defaults when resource and accepts are missing" do
+      assert {:ok, html} = Default.render(%{"x402Version" => 2}, @conn_info)
+
+      assert html =~ "<title>Payment required</title>"
+      assert html =~ "No payment options were advertised."
+    end
+
+    test "skips non-map options and renders unusual field types safely" do
+      weird_option = %{
+        "scheme" => "exact",
+        "amount" => 10_000,
+        "asset" => "0xasset",
+        "payTo" => ["multisig", 2]
+      }
+
+      payload = payment_required(%{"accepts" => ["not-a-map", weird_option]})
+
+      assert {:ok, html} = Default.render(payload, @conn_info)
+
+      # The non-map entry renders no option section; only the map entry keeps
+      # its position in the numbering.
+      assert html =~ "Option 2"
+      refute html =~ "Option 1"
+
+      assert html =~ "Unknown network"
+      assert html =~ "10000"
+      assert html =~ "[&quot;multisig&quot;, 2]"
+    end
+
     test "renders a note when no options are advertised" do
       assert {:ok, html} = Default.render(payment_required(%{"accepts" => []}), @conn_info)
       assert html =~ "No payment options were advertised."

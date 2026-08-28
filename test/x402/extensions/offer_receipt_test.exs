@@ -393,6 +393,21 @@ defmodule X402.Extensions.OfferReceiptTest do
       assert verified == payload
     end
 
+    test "rejects a verified JWS whose payload is not a JSON object", %{ed: {public, seed}} do
+      # A validly signed JWS over a JSON array: the signature checks out,
+      # but the payload cannot be an offer or receipt.
+      header = Base.url_encode64(~s({"alg":"EdDSA","kid":"#{@kid}"}), padding: false)
+      payload = Base.url_encode64("[1]", padding: false)
+      signing_input = header <> "." <> payload
+      signature = :crypto.sign(:eddsa, :none, signing_input, [seed, :ed25519])
+      jws = signing_input <> "." <> Base.url_encode64(signature, padding: false)
+
+      assert {:error, :invalid_envelope} =
+               OfferReceipt.verify_offer(%{"format" => "jws", "signature" => jws},
+                 public_key: public
+               )
+    end
+
     test "a signed offer JWS never verifies as a receipt (kind confusion)", %{ed: {public, seed}} do
       # A public offer JWS is signed by the same key that signs receipts — if
       # verify_receipt accepted it, an attacker could present the published
@@ -534,6 +549,51 @@ defmodule X402.Extensions.OfferReceiptTest do
 
       mistyped = put_in(receipt, ["payload", "transaction"], 7)
       assert {:error, {:invalid_field, "transaction"}} = OfferReceipt.validate_receipt(mistyped)
+    end
+
+    test "rejects envelopes that are not maps" do
+      assert {:error, :invalid_envelope} = OfferReceipt.validate_offer("nope")
+      assert {:error, :invalid_envelope} = OfferReceipt.validate_receipt(nil)
+    end
+
+    test "rejects an EIP-712 envelope whose payload is not a map" do
+      assert {:error, {:invalid_field, "payload"}} =
+               OfferReceipt.validate_offer(%{
+                 "format" => "eip712",
+                 "payload" => "nope",
+                 "signature" => "0x00"
+               })
+    end
+
+    test "rejects a JWS envelope without a signature" do
+      assert {:error, :invalid_jws} = OfferReceipt.validate_offer(%{"format" => "jws"})
+    end
+
+    test "rejects mistyped string fields in offer payloads" do
+      {:ok, offer} = OfferReceipt.sign_offer(offer_payload(), signer())
+
+      mistyped = put_in(offer, ["payload", "resourceUrl"], 123)
+
+      assert {:error, {:invalid_field, "resourceUrl"}} =
+               OfferReceipt.validate_offer(mistyped)
+    end
+
+    test "rejects a mistyped validUntil in offer payloads" do
+      {:ok, offer} = OfferReceipt.sign_offer(offer_payload(), signer())
+
+      mistyped = put_in(offer, ["payload", "validUntil"], "later")
+
+      assert {:error, {:invalid_field, "validUntil"}} =
+               OfferReceipt.validate_offer(mistyped)
+    end
+
+    test "rejects a mistyped issuedAt in receipt payloads" do
+      {:ok, receipt} = OfferReceipt.sign_receipt(receipt_payload(), signer())
+
+      mistyped = put_in(receipt, ["payload", "issuedAt"], "soon")
+
+      assert {:error, {:invalid_field, "issuedAt"}} =
+               OfferReceipt.validate_receipt(mistyped)
     end
   end
 

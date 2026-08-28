@@ -1,3 +1,21 @@
+defmodule X402.ClientTest.BogusSignScheme do
+  @moduledoc false
+  # A scheme whose sign/3 breaks the contract by returning a bare term.
+  @behaviour X402.Scheme
+
+  @impl X402.Scheme
+  def scheme, do: "exact"
+
+  @impl X402.Scheme
+  def networks, do: ["eip155:*"]
+
+  @impl X402.Scheme
+  def signable?(_requirements), do: true
+
+  @impl X402.Scheme
+  def sign(_requirements, _signer, _opts), do: :bogus
+end
+
 defmodule X402.ClientTest do
   use ExUnit.Case, async: true
 
@@ -122,6 +140,23 @@ defmodule X402.ClientTest do
                {:ok, @evm_requirements}
 
       assert Client.select_requirements(payment_required, max_amount: 50) ==
+               {:error, :no_acceptable_requirements}
+    end
+
+    test "filters out entries missing the filtered field" do
+      no_network = Map.delete(@evm_requirements, "network")
+
+      assert Client.select_requirements([no_network], network: "eip155:*") ==
+               {:error, :no_acceptable_requirements}
+
+      no_asset = Map.delete(@evm_requirements, "asset")
+
+      assert Client.select_requirements([no_asset], asset: @contract) ==
+               {:error, :no_acceptable_requirements}
+
+      bad_amount = Map.put(@evm_requirements, "amount", "not-a-number")
+
+      assert Client.select_requirements([bad_amount], max_amount: 10_000) ==
                {:error, :no_acceptable_requirements}
     end
 
@@ -261,6 +296,23 @@ defmodule X402.ClientTest do
 
     test "rejects malformed input" do
       assert Client.build_payment("nope", signer()) == {:error, :invalid_payment_required}
+    end
+
+    test "rejects a scheme module whose sign/3 returns a bare term" do
+      assert Client.build_payment(@evm_requirements, signer(),
+               schemes: [X402.ClientTest.BogusSignScheme]
+             ) == {:error, {:invalid_scheme_payload, :bogus}}
+    end
+
+    test "drops non-map resource and extensions echoes" do
+      payment_required =
+        @payment_required
+        |> Map.put("resource", "https://api.example.com/paid")
+        |> Map.put("extensions", "nope")
+
+      assert {:ok, payload} = Client.build_payment(payment_required, signer())
+      refute Map.has_key?(payload, "resource")
+      refute Map.has_key?(payload, "extensions")
     end
 
     test "emits telemetry for select, sign, and build" do
