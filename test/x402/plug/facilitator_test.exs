@@ -549,7 +549,12 @@ defmodule X402.Plug.FacilitatorTest do
       assert json_response(conn) == %{
                "kinds" => [
                  %{"x402Version" => 2, "scheme" => "exact", "network" => @network},
-                 %{"x402Version" => 2, "scheme" => "exact", "network" => @svm_network}
+                 %{
+                   "x402Version" => 2,
+                   "scheme" => "exact",
+                   "network" => @svm_network,
+                   "extra" => %{"feePayer" => @svm_fee_payer}
+                 }
                ],
                "extensions" => [],
                "signers" => %{

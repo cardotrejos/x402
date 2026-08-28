@@ -149,7 +149,7 @@ defmodule X402.Facilitator.SVMEngineTest do
       engine = engine(context)
 
       assert engine.simulate
-      refute engine.simulate_in_settle
+      assert engine.simulate_in_settle
       assert engine.settlement_cache == nil
       assert engine.pending_settlement_store == nil
       assert engine.confirm_timeout_ms == 500
@@ -190,12 +190,20 @@ defmodule X402.Facilitator.SVMEngineTest do
   # -- supported/1 ------------------------------------------------------------
 
   describe "supported/1" do
-    test "lists one exact kind per network under the solana signer family", context do
+    test "lists one exact kind per network with the fee payer in extra", context do
       engine = engine(context)
 
+      # Reference resource servers discover the fee payer to advertise in
+      # their 402 challenges from each kind's extra.feePayer (the reference
+      # facilitator's getExtra); "signers" alone is never consulted for it.
       assert SVMEngine.supported(engine) == %{
                "kinds" => [
-                 %{"x402Version" => 2, "scheme" => "exact", "network" => @network}
+                 %{
+                   "x402Version" => 2,
+                   "scheme" => "exact",
+                   "network" => @network,
+                   "extra" => %{"feePayer" => @fee_payer}
+                 }
                ],
                "extensions" => [],
                "signers" => %{"solana:*" => [@fee_payer]}
@@ -300,6 +308,30 @@ defmodule X402.Facilitator.SVMEngineTest do
               }} = SVMEngine.verify(engine, signed_payload(requirements), requirements)
     end
 
+    test "node-level simulation rejection is a verdict, not an infrastructure error", context do
+      # The node evaluated the request and rejected the transaction (a
+      # JSON-RPC error, e.g. unsanitizable input): a 200 rejection, not an
+      # opaque 500.
+      engine =
+        engine(context,
+          stub: %{
+            simulate:
+              {:error,
+               %{"code" => -32_602, "message" => "invalid transaction: could not be sanitized"}}
+          }
+        )
+
+      requirements = requirements()
+
+      assert SVMEngine.verify(engine, signed_payload(requirements), requirements) ==
+               {:ok,
+                %{
+                  "isValid" => false,
+                  "invalidReason" => "invalid_exact_svm_transaction_simulation_failed",
+                  "payer" => @client
+                }}
+    end
+
     test "returns infrastructure errors when the node is unreachable", context do
       engine = engine(context)
       Bypass.down(context.bypass)
@@ -363,14 +395,42 @@ defmodule X402.Facilitator.SVMEngineTest do
       assert_received {:solana_rpc, "getSignatureStatuses", _params}
     end
 
-    test "re-verifies without simulation by default", context do
+    test "re-simulates by default, matching the reference facilitators", context do
       engine = engine(context)
       requirements = requirements()
 
       assert {:ok, %{"success" => true}} =
                SVMEngine.settle(engine, signed_payload(requirements), requirements)
 
+      assert_received {:solana_rpc, "simulateTransaction", _params}
+    end
+
+    test "simulate_in_settle: false skips the settle-time simulation", context do
+      engine = engine(context, simulate_in_settle: false)
+      requirements = requirements()
+
+      assert {:ok, %{"success" => true}} =
+               SVMEngine.settle(engine, signed_payload(requirements), requirements)
+
       refute_received {:solana_rpc, "simulateTransaction", _params}
+    end
+
+    test "a failing settle-time simulation broadcasts nothing", context do
+      engine =
+        engine(context,
+          stub: %{simulate: {:ok, %{"InstructionError" => [2, %{"Custom" => 1}]}}}
+        )
+
+      requirements = requirements()
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "invalid_exact_svm_transaction_simulation_failed",
+                "transaction" => ""
+              }} = SVMEngine.settle(engine, signed_payload(requirements), requirements)
+
+      refute_received {:solana_rpc, "sendTransaction", _params}
     end
 
     test "rejected re-verification broadcasts nothing", context do
@@ -498,6 +558,97 @@ defmodule X402.Facilitator.SVMEngineTest do
       # The claim was released, so a retry is NOT duplicate-blocked: it
       # broadcasts again and confirms against the second scripted status.
       assert {:ok, %{"success" => true}} = SVMEngine.settle(engine, payload, requirements)
+    end
+
+    test "an err at processed commitment keeps polling until confirmed", context do
+      # A "processed"-level err can sit on a minority fork that is later
+      # discarded; the reference only trusts an err at confirmed/finalized.
+      processed_err = [
+        %{"confirmationStatus" => "processed", "err" => %{"InstructionError" => [2, 1]}}
+      ]
+
+      confirmed_err = [
+        %{"confirmationStatus" => "confirmed", "err" => %{"InstructionError" => [2, 1]}}
+      ]
+
+      engine = engine(context, stub: %{statuses: [processed_err, confirmed_err]})
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "invalid_exact_svm_transaction_failed",
+                "transaction" => transaction
+              }} = SVMEngine.settle(engine, payload, requirements)
+
+      assert transaction != ""
+
+      # Both scripted statuses were consumed: the processed-level err alone
+      # did not terminate the poll.
+      assert_received {:solana_rpc, "getSignatureStatuses", _first_poll}
+      assert_received {:solana_rpc, "getSignatureStatuses", _second_poll}
+    end
+
+    test "an err seen only at processed commitment times out as settlement_pending", context do
+      processed_err = [
+        %{"confirmationStatus" => "processed", "err" => %{"InstructionError" => [2, 1]}}
+      ]
+
+      engine =
+        engine(context,
+          confirm_timeout_ms: 50,
+          confirm_interval_ms: 10,
+          # After the processed+err answer the exhausted queue answers [nil]
+          # forever: never confirmed.
+          stub: %{statuses: [processed_err]}
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "settlement_pending",
+                "transaction" => transaction
+              }} = SVMEngine.settle(engine, payload, requirements)
+
+      assert transaction != ""
+    end
+
+    test "without a pending store, settlement_pending releases the claim so a retry re-broadcasts",
+         context do
+      cache = settlement_cache()
+
+      engine =
+        engine(context,
+          settlement_cache: cache,
+          confirm_timeout_ms: 50,
+          confirm_interval_ms: 10,
+          # An empty queue answers [nil] forever: never confirmed.
+          stub: %{statuses: []}
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+      txkey = transaction_key(payload)
+
+      assert {:ok, %{"success" => false, "errorReason" => "settlement_pending"}} =
+               SVMEngine.settle(engine, payload, requirements)
+
+      assert_received {:solana_rpc, "sendTransaction", _first_broadcast}
+
+      # Nothing was recorded, so a retry has nothing to reconcile against:
+      # the claim must be released so the retry can re-broadcast the
+      # identical wire bytes (the network collapses them to one transaction
+      # id) instead of dead-ending on duplicate_settlement.
+      assert Cache.get(cache, "svm:" <> txkey) == :miss
+
+      assert {:ok, %{"success" => false, "errorReason" => "settlement_pending"}} =
+               SVMEngine.settle(engine, payload, requirements)
+
+      assert_received {:solana_rpc, "sendTransaction", _second_broadcast}
     end
 
     test "confirmation timeout records the pending settlement", context do

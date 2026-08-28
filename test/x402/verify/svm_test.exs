@@ -205,6 +205,25 @@ defmodule X402.Verify.SVMTest do
                {:error, {:invalid, :memo_mismatch}}
     end
 
+    test "fails closed on uninterpretable requirements instead of skipping checks" do
+      {payload, reqs} = signed_payload()
+
+      # ExactSVM.precheck (a gate-side pre-filter) SKIPS the amount/mint/
+      # recipient comparisons when the field is unparseable, deferring to
+      # the facilitator — which is this module, so it must reject instead.
+      for amount <- ["10.5", "not-a-number", "-1", nil, 1.5] do
+        assert SVM.verify(payload, Map.put(reqs, "amount", amount), structural_opts()) ==
+                 {:error, {:invalid, :invalid_requirements_amount}},
+               "amount #{inspect(amount)} must fail closed"
+      end
+
+      assert SVM.verify(payload, Map.put(reqs, "asset", "not-base58!"), structural_opts()) ==
+               {:error, {:invalid, :invalid_requirements_asset}}
+
+      assert SVM.verify(payload, Map.put(reqs, "payTo", "bogus"), structural_opts()) ==
+               {:error, {:invalid, :invalid_requirements_pay_to}}
+    end
+
     test "raises on missing required options" do
       {payload, reqs} = signed_payload()
 
@@ -248,6 +267,23 @@ defmodule X402.Verify.SVMTest do
       rpc =
         X402.TestSolanaRPCStub.stub_rpc(context.bypass, context.finch, %{
           simulate: {:ok, %{"InstructionError" => [2, %{"Custom" => 1}]}}
+        })
+
+      {payload, reqs} = signed_payload()
+
+      assert SVM.verify(payload, reqs, structural_opts(level: :full, rpc: rpc)) ==
+               {:error, {:invalid, :simulation_failed}}
+    end
+
+    test "maps a node-level simulateTransaction rejection to the simulation-failed verdict",
+         context do
+      # The node evaluated the request and rejected the transaction — a
+      # verdict about the payment, not an infrastructure failure.
+      rpc =
+        X402.TestSolanaRPCStub.stub_rpc(context.bypass, context.finch, %{
+          simulate:
+            {:error,
+             %{"code" => -32_602, "message" => "invalid transaction: could not be sanitized"}}
         })
 
       {payload, reqs} = signed_payload()
@@ -327,6 +363,17 @@ defmodule X402.Verify.SVMTest do
       assert SVM.reason_string(:memo_mismatch) == "invalid_exact_svm_payload_memo_mismatch"
 
       assert SVM.reason_string(:verification_failed) == "invalid_exact_svm_verification_failed"
+
+      # Uninterpretable-requirements rejections surface as the generic
+      # verification failure on the wire.
+      assert SVM.reason_string(:invalid_requirements_amount) ==
+               "invalid_exact_svm_verification_failed"
+
+      assert SVM.reason_string(:invalid_requirements_asset) ==
+               "invalid_exact_svm_verification_failed"
+
+      assert SVM.reason_string(:invalid_requirements_pay_to) ==
+               "invalid_exact_svm_verification_failed"
 
       assert SVM.reason_string(:simulation_failed) ==
                "invalid_exact_svm_transaction_simulation_failed"

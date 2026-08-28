@@ -40,14 +40,19 @@ defmodule X402.Facilitator.SVMEngine do
      bytes — and **atomically claim it** in the `:settlement_cache`
      (`duplicate_settlement` when already claimed). The claim is released on
      verify failure, node-side broadcast rejection, and terminal on-chain
-     failure, and kept on success and `settlement_pending`.
+     failure, and kept on success. On `settlement_pending` the claim is
+     kept only when the `:pending_settlement_store` recorded the broadcast
+     (a retry then reconciles against the recorded signature); without a
+     store it is released, so a retry re-verifies and re-broadcasts the
+     identical wire bytes instead of dead-ending on `duplicate_settlement`.
   2. Pending-settlement fast path: when a prior settle for this exact
      transaction broadcast but could not confirm, re-await the recorded
      signature instead of re-verifying and re-broadcasting (Solana
      transactions embed an expiring blockhash, so a resend can fail while
      the original is still perfectly valid).
-  3. Re-verify via `X402.Verify.SVM` at `:full` level (simulation off by
-     default — verify already simulated; see `:simulate_in_settle`).
+  3. Re-verify via `X402.Verify.SVM` at `:full` level, re-simulating by
+     default exactly as the reference facilitators do (see
+     `:simulate_in_settle`).
   4. Sign the message bytes with the configured signer, splice the
      signature into the fee payer's slot 0
      (`X402.Solana.Transaction.attach_signature/3`), and broadcast with
@@ -60,22 +65,33 @@ defmodule X402.Facilitator.SVMEngine do
 
   ## Duplicate-settlement protection
 
-  > #### Configure a settlement cache {: .warning}
+  > #### Configure a settlement cache and a pending store {: .warning}
   >
   > With the default `settlement_cache: nil`, duplicate-settlement
   > protection is **disabled**: concurrent settles of the same payment all
   > broadcast (the network still collapses them to one transaction id, but
   > every call burns RPC round-trips and races the confirmation poll).
-  > Production engines should configure the cache the reference
-  > facilitators use — 120 seconds, roughly twice the blockhash lifetime:
+  > Production engines should configure **both** the cache the reference
+  > facilitators use — 120 seconds, roughly twice the blockhash lifetime —
+  > and a `:pending_settlement_store`. The two interact: on a
+  > `settlement_pending` verdict the cache claim is kept only when the
+  > store recorded the broadcast, letting the retry reconcile against the
+  > recorded signature; with a cache but no store the claim is released so
+  > the retry can re-broadcast the identical wire bytes (collapsed by the
+  > network to one transaction id) instead of being rejected as
+  > `duplicate_settlement`.
   >
   >     children = [
   >       {X402.Extensions.PaymentIdentifier.ETSCache,
-  >        name: MyApp.SettlementCache, ttl_ms: 120_000}
+  >        name: MyApp.SettlementCache, ttl_ms: 120_000},
+  >       {X402.Facilitator.PendingSettlementStore.ETS,
+  >        name: MyApp.PendingSettlements}
   >     ]
   >
   >     settlement_cache:
-  >       {X402.Extensions.PaymentIdentifier.ETSCache, MyApp.SettlementCache}
+  >       {X402.Extensions.PaymentIdentifier.ETSCache, MyApp.SettlementCache},
+  >     pending_settlement_store:
+  >       {X402.Facilitator.PendingSettlementStore.ETS, MyApp.PendingSettlements}
 
   ## Example
 
@@ -132,7 +148,7 @@ defmodule X402.Facilitator.SVMEngine do
     :networks,
     hooks: X402.Hooks.Default,
     simulate: true,
-    simulate_in_settle: false,
+    simulate_in_settle: true,
     settlement_cache: nil,
     pending_settlement_store: nil,
     confirm_timeout_ms: 30_000,
@@ -194,11 +210,15 @@ defmodule X402.Facilitator.SVMEngine do
     ],
     simulate_in_settle: [
       type: :boolean,
-      default: false,
+      default: true,
       doc: """
       Whether the independent re-verify inside `settle/3` also simulates.
-      Off by default, matching the reference facilitators — verify already
-      simulated, and the signed blockhash leaves no room to refresh anyway.
+      On by default, matching the reference facilitators, whose settle
+      always re-simulates: it is the blockhash-freshness and balance guard
+      right before the preflight-skipping broadcast, and the fee payer is
+      charged for a transaction that fails on-chain. Disabling it is an
+      explicit operator optimization that trades that guard for one fewer
+      RPC round-trip per settle.
       """
     ],
     settlement_cache: [
@@ -209,7 +229,8 @@ defmodule X402.Facilitator.SVMEngine do
       `X402.Extensions.PaymentIdentifier.Cache`, used as the atomic
       duplicate-settlement claim (`duplicate_settlement`). **`nil` disables
       duplicate protection entirely** — see the module documentation for
-      the recommended `ETSCache` configuration with `ttl_ms: 120_000`.
+      the recommended `ETSCache` configuration with `ttl_ms: 120_000`,
+      paired with a `:pending_settlement_store`.
       """
     ],
     pending_settlement_store: [
@@ -220,8 +241,10 @@ defmodule X402.Facilitator.SVMEngine do
       `X402.Facilitator.PendingSettlementStore`. Lets a retried settle for
       the same transaction reconcile against the already-broadcast
       signature instead of re-verifying and re-broadcasting. `nil` disables
-      reconciliation (a `settlement_pending` verdict is returned but not
-      recorded).
+      reconciliation: a `settlement_pending` verdict is returned but not
+      recorded, and the `:settlement_cache` claim is released so the retry
+      can re-broadcast the identical wire bytes rather than dead-end on
+      `duplicate_settlement`.
       """
     ],
     confirm_timeout_ms: [
@@ -353,29 +376,54 @@ defmodule X402.Facilitator.SVMEngine do
   Returns the `GET /supported` wire response for this engine.
 
   One `exact` kind per configured network, no extensions, and the signer's
-  address under the `solana:*` family.
+  address under the `solana:*` family. Each kind advertises the fee payer
+  under `"extra"` — the channel through which reference resource servers
+  discover which `extra.feePayer` to inject into their 402 challenges
+  (omitted only when the signer's address is unavailable).
 
   ## Examples
 
       {:ok, engine} = X402.Facilitator.SVMEngine.new(rpc: rpc, signer: signer, networks: [network])
       X402.Facilitator.SVMEngine.supported(engine)
       #=> %{
-      #     "kinds" => [%{"x402Version" => 2, "scheme" => "exact", "network" => network}],
+      #     "kinds" => [
+      #       %{
+      #         "x402Version" => 2,
+      #         "scheme" => "exact",
+      #         "network" => network,
+      #         "extra" => %{"feePayer" => "9hSR..."}
+      #       }
+      #     ],
       #     "extensions" => [],
       #     "signers" => %{"solana:*" => ["9hSR..."]}
       #   }
   """
   @spec supported(t()) :: wire_response()
   def supported(%__MODULE__{} = engine) do
+    extra =
+      case Signer.address(engine.signer) do
+        {:ok, address} -> %{"feePayer" => address}
+        {:error, _reason} -> nil
+      end
+
     %{
-      "kinds" =>
-        Enum.map(engine.networks, fn network ->
-          %{"x402Version" => @x402_version, "scheme" => @scheme, "network" => network}
-        end),
+      "kinds" => Enum.map(engine.networks, &kind(&1, extra)),
       "extensions" => [],
       "signers" => signers(engine)
     }
   end
+
+  @spec kind(String.t(), %{optional(String.t()) => String.t()} | nil) :: wire_response()
+  defp kind(network, nil),
+    do: %{"x402Version" => @x402_version, "scheme" => @scheme, "network" => network}
+
+  defp kind(network, extra),
+    do: %{
+      "x402Version" => @x402_version,
+      "scheme" => @scheme,
+      "network" => network,
+      "extra" => extra
+    }
 
   @doc false
   @spec validate_signer(term()) :: {:ok, Signer.t()} | {:error, String.t()}
@@ -627,10 +675,11 @@ defmodule X402.Facilitator.SVMEngine do
 
       {:error, _transport} ->
         # A transport failure mid-broadcast is ambiguous — the node may have
-        # accepted the transaction, so the claim is kept (a fresh broadcast
-        # could double-spend). On Solana the transaction id IS the first
-        # signature, so it is computable locally even though the node's
-        # answer never arrived.
+        # accepted the transaction — so it is treated as pending, never
+        # terminal. On Solana the transaction id IS the first signature, so
+        # it is computable locally even though the node's answer never
+        # arrived. A retry either reconciles via the pending store or
+        # re-broadcasts the identical wire bytes (same transaction id).
         entry = %{
           transaction: Base58.encode(fee_payer_signature),
           provenance: :local_hash,
@@ -713,16 +762,21 @@ defmodule X402.Facilitator.SVMEngine do
   @spec poll_status(t(), String.t(), integer()) :: :confirmed | {:failed, term()} | :timeout
   defp poll_status(engine, signature, deadline) do
     case Solana.RPC.get_signature_statuses(engine.rpc, [signature]) do
-      {:ok, [%{err: err}]} when not is_nil(err) ->
+      # An on-chain err is terminal only at "confirmed"/"finalized"
+      # commitment, mirroring the reference signer's confirmTransaction: a
+      # "processed"-level err can sit on a minority fork that is later
+      # discarded, so it keeps polling until the deadline.
+      {:ok, [%{confirmation_status: status, err: err}]}
+      when status in ["confirmed", "finalized"] and not is_nil(err) ->
         {:failed, err}
 
       {:ok, [%{confirmation_status: status}]} when status in ["confirmed", "finalized"] ->
         :confirmed
 
-      # Unknown signature, "processed", unexpected shapes, and transient RPC
-      # errors all keep polling until the deadline; the transaction is
-      # broadcast, so the only safe terminal answer without a status is
-      # settlement_pending.
+      # Unknown signature, "processed" (with or without an err), unexpected
+      # shapes, and transient RPC errors all keep polling until the
+      # deadline; the transaction is broadcast, so the only safe terminal
+      # answer without a confirmed status is settlement_pending.
       _pending_or_error ->
         retry_or_timeout(engine, signature, deadline)
     end
@@ -800,15 +854,18 @@ defmodule X402.Facilitator.SVMEngine do
           String.t() | nil
         ) :: settle_result()
   defp record_pending_or_terminal(
-         %{pending_settlement_store: nil},
-         _txkey,
+         %{pending_settlement_store: nil} = engine,
+         txkey,
          entry,
          network,
          payer
        ) do
-    # No store configured: the pending verdict is returned but not recorded.
-    # A retry re-verifies and re-broadcasts the identical wire bytes, which
+    # No store configured: the pending verdict is returned but not recorded,
+    # so a retry has nothing to reconcile against. Release the dedup claim —
+    # a kept claim would dead-end the retry on duplicate_settlement — so the
+    # retry re-verifies and re-broadcasts the identical wire bytes, which
     # the network collapses to the same transaction id.
+    release_claim(engine, txkey)
     {:settled, failure_response("settlement_pending", entry.transaction, network, payer)}
   end
 

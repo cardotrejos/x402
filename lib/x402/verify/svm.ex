@@ -23,7 +23,9 @@ defmodule X402.Verify.SVM do
   * `:structural` — no RPC: scheme, network, and fee-payer requirements;
     transaction decoding; Ed25519 signature verification of the required
     signers (pure `:crypto`, no optional dependency); the address-lookup-
-    table rejection; and the static instruction-layout checks against the
+    table rejection; fail-closed validation of the requirements' `amount`,
+    `asset`, and `payTo` (an uninterpretable field is rejected, never
+    skipped); and the static instruction-layout checks against the
     requirements (amount, mint, destination ATA, memo, compute budget
     bounds, fee-payer isolation).
 
@@ -90,6 +92,9 @@ defmodule X402.Verify.SVM do
           | :excessive_signers
           | :signature_invalid
           | :alt_resolution_not_available
+          | :invalid_requirements_amount
+          | :invalid_requirements_asset
+          | :invalid_requirements_pay_to
           | :instruction_count
           | :invalid_compute_limit_instruction
           | :invalid_compute_price_instruction
@@ -256,6 +261,12 @@ defmodule X402.Verify.SVM do
       excessive_signers: "invalid_exact_svm_payload_excessive_signers",
       signature_invalid: "invalid_exact_svm_payload_signature_invalid",
       alt_resolution_not_available: "invalid_exact_svm_smart_wallet_alt_resolution_not_available",
+      # Uninterpretable requirements fields have no dedicated wire reason in
+      # the reference vocabulary (the reference throws out of verification);
+      # they surface as the generic verification failure.
+      invalid_requirements_amount: "invalid_exact_svm_verification_failed",
+      invalid_requirements_asset: "invalid_exact_svm_verification_failed",
+      invalid_requirements_pay_to: "invalid_exact_svm_verification_failed",
       instruction_count: "invalid_exact_svm_payload_transaction_instructions_length",
       invalid_compute_limit_instruction:
         "invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction",
@@ -285,6 +296,7 @@ defmodule X402.Verify.SVM do
     with {:ok, ctx} <- build_context(payment_payload, requirements, opts),
          :ok <- check_signatures(ctx),
          :ok <- check_lookups(ctx),
+         :ok <- check_requirements(requirements),
          :ok <- run_precheck(payment_payload, requirements),
          :ok <- maybe_simulate(ctx, level, opts) do
       {:ok, %{payer: transfer_authority(ctx.decoded), level: level}}
@@ -443,7 +455,59 @@ defmodule X402.Verify.SVM do
   defp check_lookups(%{decoded: %{address_table_lookups: 0}}), do: :ok
   defp check_lookups(_ctx), do: {:error, {:invalid, :alt_resolution_not_available}}
 
-  # -- Check 10: static instruction layout -------------------------------------
+  # -- Check 10: requirements interpretability (fail closed) -------------------
+
+  # X402.Scheme.ExactSVM.precheck is a gate-side pre-filter: it SKIPS the
+  # amount, mint, and destination-ATA comparisons when the corresponding
+  # requirements field cannot be interpreted locally, deferring to the
+  # facilitator. This module IS the facilitator's authoritative check — the
+  # deferral target — so uninterpretable requirements must be rejected here
+  # before the precheck runs, or the skip would silently drop the
+  # money-matching checks. The reference likewise fails closed (e.g.
+  # BigInt(requirements.amount) throws on a malformed amount).
+  @spec check_requirements(map()) :: :ok | {:error, {:invalid, invalid_reason()}}
+  defp check_requirements(requirements) do
+    with :ok <- check_requirements_amount(Utils.map_value(requirements, {"amount", :amount})),
+         :ok <-
+           check_requirements_address(
+             Utils.map_value(requirements, {"asset", :asset}),
+             :invalid_requirements_asset
+           ) do
+      check_requirements_address(
+        Utils.map_value(requirements, {"payTo", :pay_to}),
+        :invalid_requirements_pay_to
+      )
+    end
+  end
+
+  @u64_max 0xFFFFFFFFFFFFFFFF
+
+  @spec check_requirements_amount(term()) ::
+          :ok | {:error, {:invalid, :invalid_requirements_amount}}
+  defp check_requirements_amount(amount)
+       when is_integer(amount) and amount >= 0 and amount <= @u64_max,
+       do: :ok
+
+  defp check_requirements_amount(amount) when is_binary(amount) do
+    case Integer.parse(amount) do
+      {value, ""} when value >= 0 and value <= @u64_max -> :ok
+      _other -> {:error, {:invalid, :invalid_requirements_amount}}
+    end
+  end
+
+  defp check_requirements_amount(_amount),
+    do: {:error, {:invalid, :invalid_requirements_amount}}
+
+  @spec check_requirements_address(term(), invalid_reason()) ::
+          :ok | {:error, {:invalid, invalid_reason()}}
+  defp check_requirements_address(address, reason) do
+    case Solana.valid_address?(address) do
+      true -> :ok
+      false -> {:error, {:invalid, reason}}
+    end
+  end
+
+  # -- Check 11: static instruction layout -------------------------------------
 
   # Dispatched through the public X402.Scheme behaviour rather than the
   # scheme module directly; ALT transactions never reach this (the scheme's
@@ -461,7 +525,7 @@ defmodule X402.Verify.SVM do
   defp map_precheck_reason(reason) when reason in @precheck_reasons, do: reason
   defp map_precheck_reason(_other), do: :verification_failed
 
-  # -- Check 11: simulation (level :full) ---------------------------------------
+  # -- Check 12: simulation (level :full) ---------------------------------------
 
   @spec maybe_simulate(map(), level(), keyword()) :: :ok | {:error, error()}
   defp maybe_simulate(_ctx, :structural, _opts), do: :ok
@@ -493,9 +557,23 @@ defmodule X402.Verify.SVM do
     commitment = Keyword.fetch!(opts, :commitment)
 
     case Solana.RPC.simulate_transaction(rpc, ctx.transaction_base64, commitment: commitment) do
-      {:ok, %{err: nil}} -> :ok
-      {:ok, %{err: _err}} -> {:error, {:invalid, :simulation_failed}}
-      {:error, reason} -> {:error, {:rpc_error, reason}}
+      {:ok, %{err: nil}} ->
+        :ok
+
+      {:ok, %{err: _err}} ->
+        {:error, {:invalid, :simulation_failed}}
+
+      # A JSON-RPC error means the node evaluated the request and rejected
+      # the transaction (e.g. it could not be sanitized) — a verdict about
+      # the payment, not an infrastructure failure. Deliberate divergence
+      # from the reference, which converts EVERY thrown simulate error into
+      # this verdict: transport-level failures below stay infrastructure
+      # errors, because a network outage is not a payment verdict.
+      {:error, {:jsonrpc_error, _error}} ->
+        {:error, {:invalid, :simulation_failed}}
+
+      {:error, reason} ->
+        {:error, {:rpc_error, reason}}
     end
   end
 
