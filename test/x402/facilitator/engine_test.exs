@@ -208,6 +208,37 @@ defmodule X402.Facilitator.EngineTest do
 
       assert {:error, {:rpc_error, _reason}} = Engine.verify(engine, payload, requirements)
     end
+
+    test "simulate: false still proves counterfactual payments via the atomic simulation",
+         context do
+      engine = engine(context, simulate: false, eip6492_allowed_factories: [@factory])
+      requirements = requirements()
+      {payload, _inner} = counterfactual_payload(signed_payload(requirements), @factory)
+
+      # verify predicts settle: settle's re-verify keeps the counterfactual
+      # proof even with simulation off, so verify must accept (not reject as
+      # undeployed_smart_wallet) the same payment.
+      assert {:ok, %{"isValid" => true, "payer" => @payer}} =
+               Engine.verify(engine, payload, requirements)
+
+      # The atomic Multicall3 deploy-and-transfer proof ran — the only
+      # possible signature check for a counterfactual wallet.
+      assert_received {:rpc, "eth_call", [%{"data" => "0x82ad56cb" <> _rest}, _block]}
+    end
+
+    test "simulate: false keeps the transfer simulation off for EOA payments", context do
+      engine = engine(context, simulate: false, eip6492_allowed_factories: [@factory])
+      requirements = requirements()
+
+      assert {:ok, %{"isValid" => true, "payer" => @payer}} =
+               Engine.verify(engine, signed_payload(requirements), requirements)
+
+      # No transferWithAuthorization eth_call (either variant) and no
+      # Multicall3 call — only counterfactuals keep their proof.
+      refute_received {:rpc, "eth_call", [%{"data" => "0xe3ee160e" <> _vrs}, _block]}
+      refute_received {:rpc, "eth_call", [%{"data" => "0xcf092995" <> _bytes}, _block2]}
+      refute_received {:rpc, "eth_call", [%{"data" => "0x82ad56cb" <> _agg}, _block3]}
+    end
   end
 
   # -- settle/3 ---------------------------------------------------------------
@@ -528,6 +559,36 @@ defmodule X402.Facilitator.EngineTest do
       refute_received {:rpc, "eth_sendRawTransaction", _params}
     end
 
+    test "an estimateGas revert for a consumed authorization reports nonce_already_used",
+         context do
+      engine =
+        engine(context,
+          stub: %{
+            estimate_gas:
+              {:error,
+               %{
+                 "code" => 3,
+                 "message" => "execution reverted: FiatTokenV2: authorization is used or canceled"
+               }}
+          }
+        )
+
+      requirements = requirements()
+
+      # A retry of a payment whose transaction already confirmed (pending
+      # entry expired or consumed by a concurrent retry) passes re-verify and
+      # dies at estimateGas with the token's revert text — the canonical
+      # nonce_already_used tells the client the payment already went through,
+      # where simulation_failed would invite a double payment.
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "invalid_exact_evm_nonce_already_used"
+              }} = Engine.settle(engine, signed_payload(requirements), requirements)
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+
     test "a transport failure on broadcast returns settlement_pending with the local hash",
          context do
       engine = engine(context, stub: %{send_raw: :http_error})
@@ -703,6 +764,27 @@ defmodule X402.Facilitator.EngineTest do
                Engine.settle(engine, payload, requirements)
 
       assert_received {:rpc, "eth_sendRawTransaction", [_deploy_hex]}
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+
+    test "a deployment estimateGas revert keeps the deployment failure reason", context do
+      engine =
+        engine(context,
+          eip6492_allowed_factories: [@factory],
+          stub: %{
+            estimate_gas:
+              {:error, %{"code" => 3, "message" => "execution reverted: authorization is used"}}
+          }
+        )
+
+      requirements = requirements()
+      {payload, _inner} = counterfactual_payload(signed_payload(requirements), @factory)
+
+      # Revert-text classification applies only to the transfer's estimate —
+      # the factory deployment keeps its own fixed reason.
+      assert {:ok, %{"success" => false, "errorReason" => "smart_wallet_deployment_failed"}} =
+               Engine.settle(engine, payload, requirements)
+
       refute_received {:rpc, "eth_sendRawTransaction", _params}
     end
 
@@ -929,6 +1011,90 @@ defmodule X402.Facilitator.EngineTest do
                     "errorReason" => "invalid_exact_evm_transaction_failed",
                     "transaction" => @tx_hash
                   }} = Engine.settle(engine, payload, requirements)
+        end)
+
+      assert log =~ "failed to persist for retry"
+    end
+
+    test "reconcile validates the Transfer event against the signed authorization, not the retry's requirements",
+         context do
+      store = pending_store(__MODULE__.DriftStore)
+      {:ok, queue} = Agent.start_link(fn -> [] end)
+
+      engine =
+        engine(context,
+          pending_settlement_store: store,
+          receipt_timeout_ms: 50,
+          receipt_interval_ms: 10,
+          stub: %{receipt_queue: queue}
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:ok, %{"errorReason" => "settlement_pending", "transaction" => @tx_hash}} =
+               Engine.settle(engine, payload, requirements)
+
+      assert_received {:rpc, "eth_sendRawTransaction", [_raw_hex]}
+
+      # The transaction confirms on chain with the real
+      # Transfer(payer, payTo, 10000) log.
+      Agent.update(queue, fn _empty -> [%{"status" => "0x1"}] end)
+
+      # Retry with the identical payload but drifted requirements (e.g. the
+      # resource server re-derived them after a price change). The reconcile
+      # path runs without re-verification, so the expected event must come
+      # from the signature-bound authorization: the completed settlement is
+      # reported as success, not as a transfer-event mismatch.
+      drifted = requirements(%{"amount" => "12000"})
+
+      assert {:ok, %{"success" => true, "transaction" => @tx_hash}} =
+               Engine.settle(engine, payload, drifted)
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+      assert PendingSettlementStore.get(store, pending_key(payload)) == :miss
+    end
+
+    test "an unavailable store falls through to a normal broadcast instead of crashing",
+         context do
+      # The configured store name was never started: every adapter call
+      # exits (:noproc) inside GenServer.call.
+      store = {X402.Facilitator.PendingSettlementStore.ETS, __MODULE__.NeverStartedStore}
+
+      engine = engine(context, pending_settlement_store: store)
+      requirements = requirements()
+
+      assert {:ok, %{"success" => true, "transaction" => @tx_hash}} =
+               Engine.settle(engine, signed_payload(requirements), requirements)
+
+      assert_received {:rpc, "eth_sendRawTransaction", [_raw_hex]}
+    end
+
+    test "a pending write against a dead store downgrades to a terminal failure with the hash",
+         context do
+      store = {X402.Facilitator.PendingSettlementStore.ETS, __MODULE__.DeadStore}
+
+      engine =
+        engine(context,
+          pending_settlement_store: store,
+          receipt_timeout_ms: 50,
+          receipt_interval_ms: 10,
+          stub: %{receipts: []}
+        )
+
+      requirements = requirements()
+
+      # The broadcast happened; the store exit on put must not crash the
+      # settle — the terminal response keeps the transaction hash for
+      # manual reconciliation.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok,
+                  %{
+                    "success" => false,
+                    "errorReason" => "invalid_exact_evm_transaction_failed",
+                    "transaction" => @tx_hash
+                  }} = Engine.settle(engine, signed_payload(requirements), requirements)
         end)
 
       assert log =~ "failed to persist for retry"

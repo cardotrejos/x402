@@ -200,7 +200,13 @@ defmodule X402.Facilitator.Engine do
     simulate: [
       type: :boolean,
       default: true,
-      doc: "Whether `verify/3` simulates `transferWithAuthorization` via `eth_call`."
+      doc: """
+      Whether `verify/3` simulates `transferWithAuthorization` via
+      `eth_call`. Even when `false`, verify keeps the atomic ERC-6492
+      counterfactual simulation — the only possible proof of a
+      counterfactual signature — so verify predicts settle, whose re-verify
+      always keeps that proof too.
+      """
     ],
     simulate_in_settle: [
       type: :boolean,
@@ -331,7 +337,11 @@ defmodule X402.Facilitator.Engine do
       case run_before_hook(engine.hooks, :before_verify, context, metadata) do
         {:cont, %Context{} = before_context} ->
           engine
-          |> verify_result(before_context.payload, before_context.requirements, engine.simulate)
+          |> verify_result(
+            before_context.payload,
+            before_context.requirements,
+            verify_simulate(engine)
+          )
           |> handle_verify_result(engine, before_context, metadata)
 
         {:halt, reason} ->
@@ -576,16 +586,25 @@ defmodule X402.Facilitator.Engine do
   @spec settle_context(t(), map(), map()) :: settle_context()
   defp settle_context(engine, payload, requirements) do
     payer = payer(payload)
+    authorization = authorization(payload)
 
     %{
       network: network(requirements, payload),
       payer: payer,
       pending_key: pending_key(engine, payload),
+      # The expected Transfer event is built from the payload's signed
+      # authorization — the fields the pending key's signature binds — never
+      # from the caller-supplied requirements: the pending-store reconcile
+      # path runs without re-verification, so requirements drift on a retry
+      # must not turn a completed settlement into a terminal mismatch. Only
+      # the log address stays the requirements' asset, matching the
+      # reference facilitator's awaitEIP3009Settlement. (The fresh-broadcast
+      # path re-verifies, proving authorization and requirements agree.)
       event: %{
         asset: asset(requirements),
         from: payer,
-        to: Utils.map_value(requirements, {"payTo", :payTo}),
-        value: Utils.map_value(requirements, {"amount", :amount})
+        to: Utils.map_value(authorization, {"to", :to}),
+        value: Utils.map_value(authorization, {"value", :value})
       },
       entry: nil
     }
@@ -598,6 +617,15 @@ defmodule X402.Facilitator.Engine do
   @spec settle_simulate(t()) :: EVM.simulate()
   defp settle_simulate(%{simulate_in_settle: true}), do: true
   defp settle_simulate(_engine), do: :counterfactual_only
+
+  # verify/3 maps :simulate the same way settle's re-verify maps
+  # :simulate_in_settle: with simulation off, counterfactual payments keep
+  # the atomic Multicall3 deploy-and-transfer proof instead of being
+  # rejected as undeployed — otherwise verify would reject payments settle
+  # settles. EOA/ERC-1271 transfer simulation stays off.
+  @spec verify_simulate(t()) :: EVM.simulate()
+  defp verify_simulate(%{simulate: true}), do: true
+  defp verify_simulate(_engine), do: :counterfactual_only
 
   # The reference SDKs key EVM pending entries by the EIP-3009 signature;
   # hashing it keeps raw signature material out of adapter keys.
@@ -1012,8 +1040,24 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  defp gas_limit(_engine, {:error, {:jsonrpc_error, _error}}, {_gas_ceiling, revert_reason}),
-    do: {:settle_failed, revert_reason}
+  defp gas_limit(_engine, {:error, {:jsonrpc_error, error}}, {_gas_ceiling, revert_reason}),
+    do: {:settle_failed, estimate_revert_reason(error, revert_reason)}
+
+  # The transfer's estimateGas revert carries the token's revert text —
+  # classify it onto the canonical wire reasons (matching the reference
+  # facilitator's parseEip3009TransferError) so a retry of an
+  # already-confirmed authorization reports nonce_already_used instead of a
+  # generic simulation failure. Unclassifiable reverts keep the fixed
+  # reason, and the factory-deployment path always keeps its own.
+  @spec estimate_revert_reason(RPC.jsonrpc_error(), String.t()) :: String.t()
+  defp estimate_revert_reason(error, "invalid_exact_evm_transaction_simulation_failed" = fixed) do
+    case EVM.classify_revert(error) do
+      nil -> fixed
+      reason -> EVM.reason_string(reason)
+    end
+  end
+
+  defp estimate_revert_reason(_error, fixed_reason), do: fixed_reason
 
   # EIP-1559 fee data: next base fee from eth_feeHistory plus the node's
   # suggested priority fee; maxFeePerGas = 2 * baseFee + priority. Nodes
@@ -1453,6 +1497,17 @@ defmodule X402.Facilitator.Engine do
       {"authorization", :authorization},
       {"from", :from}
     ])
+  end
+
+  @spec authorization(map()) :: map()
+  defp authorization(payload) do
+    case Utils.nested_map_value(payload, [
+           {"payload", :payload},
+           {"authorization", :authorization}
+         ]) do
+      %{} = authorization -> authorization
+      _missing -> %{}
+    end
   end
 
   @spec network(map(), map()) :: String.t()

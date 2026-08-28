@@ -887,6 +887,16 @@ defmodule X402.Verify.EVM do
     end
   end
 
+  # Classifies a node revert (message plus any ABI-encoded Error(string)
+  # data) onto the canonical invalid reasons. Public so
+  # `X402.Facilitator.Engine` can classify `eth_estimateGas` reverts during
+  # settlement — e.g. a retry of an already-confirmed authorization must
+  # report `:nonce_already_used`, not a generic simulation failure. Returns
+  # `nil` when the revert text is unrecognized.
+  @doc false
+  @spec classify_revert(RPC.jsonrpc_error()) :: invalid_reason() | nil
+  def classify_revert(error), do: classify_revert_text(revert_text(error))
+
   # Combines the node's error message with any ABI-encoded Error(string)
   # revert reason carried in the error data.
   @spec revert_text(RPC.jsonrpc_error()) :: String.t()

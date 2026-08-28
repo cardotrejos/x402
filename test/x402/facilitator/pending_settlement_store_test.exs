@@ -28,6 +28,21 @@ defmodule X402.Facilitator.PendingSettlementStoreTest do
     def get(_store, _key), do: :miss
   end
 
+  defmodule CrashingStore do
+    @behaviour X402.Facilitator.PendingSettlementStore
+
+    @impl true
+    def get(:exit, _key), do: exit(:noproc)
+    def get(:raise, _key), do: raise("store boom")
+    def get(:throw, _key), do: throw(:store_ball)
+
+    @impl true
+    def put(kind, key, _entry), do: get(kind, key)
+
+    @impl true
+    def delete(kind, key), do: get(kind, key)
+  end
+
   defp entry do
     %{
       transaction: "0x" <> String.duplicate("ab", 32),
@@ -53,6 +68,44 @@ defmodule X402.Facilitator.PendingSettlementStoreTest do
       assert PendingSettlementStore.put(adapter, "key", entry()) == :ok
       assert PendingSettlementStore.delete(adapter, "key") == :ok
       assert PendingSettlementStore.get(adapter, "key") == :miss
+    end
+  end
+
+  describe "adapter crash isolation" do
+    test "adapter exits become {:error, {:store_unavailable, _}}" do
+      adapter = {CrashingStore, :exit}
+
+      assert {:error, {:store_unavailable, {:exit, :noproc}}} =
+               PendingSettlementStore.get(adapter, "key")
+
+      assert {:error, {:store_unavailable, {:exit, :noproc}}} =
+               PendingSettlementStore.put(adapter, "key", entry())
+
+      assert {:error, {:store_unavailable, {:exit, :noproc}}} =
+               PendingSettlementStore.delete(adapter, "key")
+    end
+
+    test "adapter raises become {:error, {:store_unavailable, _}}" do
+      assert {:error, {:store_unavailable, %RuntimeError{message: "store boom"}}} =
+               PendingSettlementStore.get({CrashingStore, :raise}, "key")
+    end
+
+    test "adapter throws become {:error, {:store_unavailable, _}}" do
+      assert {:error, {:store_unavailable, {:throw, :store_ball}}} =
+               PendingSettlementStore.get({CrashingStore, :throw}, "key")
+    end
+
+    test "a dead named ETS store returns store_unavailable instead of exiting" do
+      adapter = {ETSStore, __MODULE__.NeverStartedStore}
+
+      assert {:error, {:store_unavailable, {:exit, {:noproc, _call}}}} =
+               PendingSettlementStore.get(adapter, "key")
+
+      assert {:error, {:store_unavailable, {:exit, {:noproc, _call2}}}} =
+               PendingSettlementStore.put(adapter, "key", entry())
+
+      assert {:error, {:store_unavailable, {:exit, {:noproc, _call3}}}} =
+               PendingSettlementStore.delete(adapter, "key")
     end
   end
 

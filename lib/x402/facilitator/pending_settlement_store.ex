@@ -124,24 +124,56 @@ defmodule X402.Facilitator.PendingSettlementStore do
   @doc since: "0.6.0"
   @doc """
   Reads `key` through the `{module, store}` adapter.
+
+  Adapter crashes never propagate: a raise, throw, or exit from the adapter
+  (a dead, restarting, or overloaded store process, for example) is caught
+  and returned as `{:error, {:store_unavailable, reason}}`, so callers can
+  apply their documented store-failure handling —
+  `X402.Facilitator.Engine.settle/3` treats a failed read as a miss and
+  falls through to a normal broadcast.
   """
   @spec get(adapter(), key()) :: get_result()
-  def get({module, store}, key) when is_binary(key), do: module.get(store, key)
+  def get({module, store}, key) when is_binary(key),
+    do: safely(fn -> module.get(store, key) end)
 
   @doc since: "0.6.0"
   @doc """
   Writes `entry` under `key` through the `{module, store}` adapter.
+
+  Adapter crashes never propagate: a raise, throw, or exit from the adapter
+  is caught and returned as `{:error, {:store_unavailable, reason}}` —
+  `X402.Facilitator.Engine.settle/3` downgrades a failed write to a
+  terminal response that keeps the broadcast transaction hash.
   """
   @spec put(adapter(), key(), entry()) :: write_result()
   def put({module, store}, key, entry) when is_binary(key) and is_map(entry),
-    do: module.put(store, key, entry)
+    do: safely(fn -> module.put(store, key, entry) end)
 
   @doc since: "0.6.0"
   @doc """
   Deletes `key` through the `{module, store}` adapter.
+
+  Adapter crashes never propagate: a raise, throw, or exit from the adapter
+  is caught and returned as `{:error, {:store_unavailable, reason}}`.
   """
   @spec delete(adapter(), key()) :: write_result()
-  def delete({module, store}, key) when is_binary(key), do: module.delete(store, key)
+  def delete({module, store}, key) when is_binary(key),
+    do: safely(fn -> module.delete(store, key) end)
+
+  # Adapter processes can be dead, mid-restart, or overloaded — a
+  # GenServer.call inside the adapter then EXITS (:noproc/:timeout) rather
+  # than returning {:error, _}. Converting every raise/throw/exit into a
+  # structured error return keeps the engine's documented store-failure
+  # semantics (get -> miss fall-through, put -> downgrade with the
+  # transaction hash) intact for every adapter.
+  @spec safely((-> term())) :: term() | {:error, {:store_unavailable, term()}}
+  defp safely(operation) do
+    operation.()
+  rescue
+    error -> {:error, {:store_unavailable, error}}
+  catch
+    kind, reason -> {:error, {:store_unavailable, {kind, reason}}}
+  end
 
   @doc since: "0.6.0"
   @doc """
