@@ -106,10 +106,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @behaviour Plug
 
+    alias X402.EIP712
     alias X402.Extensions.PaymentIdentifier
     alias X402.Extensions.PaymentIdentifier.Cache
     alias X402.Extensions.PaymentIdentifier.ETSCache
-    alias X402.EIP712
     alias X402.Facilitator
     alias X402.Facilitator.Error
     alias X402.Hooks
