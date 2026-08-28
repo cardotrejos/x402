@@ -39,6 +39,15 @@ verify matters for deploying it safely:
   deployment each node claims independently — use a shared adapter
   (implementing `X402.Extensions.PaymentIdentifier.Cache`) if a duplicate
   request served by a second node is unacceptable for your resource.
+- **ERC-6492 counterfactual settlement is allowlist-gated.** The facilitator
+  engine (`X402.Facilitator.Engine`) signs caller-supplied factory calldata
+  only toward addresses explicitly listed in `:eip6492_allowed_factories`,
+  capped by `:max_deploy_gas_limit`. The default empty allowlist rejects
+  every counterfactual payment at verify and again at settle's independent
+  re-verify, so an engine that never opts in never broadcasts
+  caller-supplied calldata. Allowlist only factories you have audited — a
+  listed factory receives deployment transactions paid for by your fee
+  payer.
 
 ## Known advisories affecting the wider x402 ecosystem
 

@@ -30,32 +30,45 @@ defmodule X402.Facilitator.Engine do
   constrained: settlement transactions are always built by this module with
   `to` set to the verified requirements' `asset`, `value` `0`, and calldata
   produced exclusively by `X402.EIP3009.transfer_calldata/3` from the
-  authorization fields the signature verification just proved — the engine
-  has no code path that signs caller-supplied calldata. Consequently
-  ERC-6492 *counterfactual* payments (which would require broadcasting
-  arbitrary factory calldata to deploy the wallet) are rejected fail-closed
-  at verify **and** at settle's re-verify; deployed ERC-1271 smart wallets
-  are fully supported.
+  authorization fields the signature verification just proved. The single
+  exception is ERC-6492 *counterfactual* settlement: the engine signs
+  caller-supplied calldata ONLY toward explicitly allowlisted factory
+  addresses (`:eip6492_allowed_factories`), capped by
+  `:max_deploy_gas_limit` — with the default empty allowlist it never does,
+  and counterfactual payments are rejected fail-closed at verify **and** at
+  settle's re-verify. Deployed ERC-1271 smart wallets are fully supported
+  either way.
 
   ## Settlement pipeline
 
-  1. Re-verify via `X402.Verify.EVM` at `:full` level (simulation off by
-     default — verify already simulated; see `:simulate_in_settle`).
-  2. Build `transferWithAuthorization` calldata (shared with verification's
+  1. Reconcile: with a `:pending_settlement_store` configured, a payload
+     whose earlier attempt already broadcast a transaction is re-awaited
+     instead of re-verified and re-broadcast.
+  2. Re-verify via `X402.Verify.EVM` at `:full` level (transfer simulation
+     off by default — verify already simulated; see `:simulate_in_settle` —
+     while the atomic ERC-6492 counterfactual simulation always runs, being
+     the only possible proof of a counterfactual signature).
+  3. For a verified counterfactual payment whose wallet is still
+     undeployed, broadcast the wrapper's factory calldata (allowlist-gated,
+     `:max_deploy_gas_limit`-capped) and require a successful deploy
+     receipt first.
+  4. Build `transferWithAuthorization` calldata (shared with verification's
      simulation encoding).
-  3. One batched RPC round-trip: `eth_estimateGas` (with a safety margin),
+  5. One batched RPC round-trip: `eth_estimateGas` (with a safety margin),
      `eth_maxPriorityFeePerGas` + `eth_feeHistory` (falling back to
      `eth_gasPrice` on nodes without EIP-1559 fee APIs), and
      `eth_getTransactionCount` (`pending`).
-  4. Encode the EIP-1559 transaction (`X402.Transaction`), sign its keccak
+  6. Encode the EIP-1559 transaction (`X402.Transaction`), sign its keccak
      digest through the configured `X402.Signer` (the signer must support
      raw digest signing — `X402.Signer.LocalKey` does; the 27/28 recovery id
      it returns is normalized to the EIP-1559 `yParity`), and broadcast via
      `eth_sendRawTransaction`.
-  5. Poll `eth_getTransactionReceipt` until confirmation or timeout. A
-     broadcast whose confirmation cannot be established returns the spec's
-     non-terminal `"settlement_pending"` with the transaction hash so
-     callers can reconcile on chain.
+  7. Poll `eth_getTransactionReceipt` until confirmation or timeout. A
+     confirmed receipt must also carry the matching ERC-20 `Transfer` event
+     before success is reported. A broadcast whose confirmation cannot be
+     established returns the spec's non-terminal `"settlement_pending"`
+     with the transaction hash so callers can reconcile on chain, recording
+     the attempt in the `:pending_settlement_store` when one is configured.
 
   ## Hooks
 
@@ -91,10 +104,13 @@ defmodule X402.Facilitator.Engine do
   `[:x402, :facilitator_engine, :settle]` with `:status` metadata.
   """
 
+  require Logger
+
   alias X402.EIP3009
   alias X402.EIP712
   alias X402.ERC6492
   alias X402.Facilitator.NonceManager
+  alias X402.Facilitator.PendingSettlementStore
   alias X402.Hooks
   alias X402.Hooks.Context
   alias X402.RPC
@@ -106,6 +122,11 @@ defmodule X402.Facilitator.Engine do
 
   @x402_version 2
   @scheme "exact"
+
+  # keccak256("Transfer(address,address,uint256)")
+  @transfer_event_topic "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+  @max_uint256 Integer.pow(2, 256) - 1
 
   @enforce_keys [:rpc, :signer, :networks]
   defstruct [
@@ -120,7 +141,10 @@ defmodule X402.Facilitator.Engine do
     receipt_timeout_ms: 60_000,
     receipt_interval_ms: 1_000,
     nonce_manager: nil,
-    max_gas_limit: 200_000
+    max_gas_limit: 200_000,
+    eip6492_allowed_factories: [],
+    max_deploy_gas_limit: 600_000,
+    pending_settlement_store: nil
   ]
 
   @typedoc "A validated engine configuration built by `new/1`."
@@ -136,7 +160,10 @@ defmodule X402.Facilitator.Engine do
           receipt_timeout_ms: pos_integer(),
           receipt_interval_ms: pos_integer(),
           nonce_manager: GenServer.server() | nil,
-          max_gas_limit: pos_integer()
+          max_gas_limit: pos_integer(),
+          eip6492_allowed_factories: [String.t()],
+          max_deploy_gas_limit: pos_integer(),
+          pending_settlement_store: PendingSettlementStore.adapter() | nil
         }
 
   @typedoc "A facilitator wire response (`/verify` or `/settle` shape)."
@@ -182,6 +209,8 @@ defmodule X402.Facilitator.Engine do
       Whether the independent re-verify inside `settle/3` also simulates.
       Off by default, matching the reference facilitators — verify already
       simulated, and `eth_estimateGas` re-simulates right before broadcast.
+      Even when off, the re-verify keeps the atomic ERC-6492 counterfactual
+      simulation, the only possible proof of a counterfactual signature.
       """
     ],
     verify_chain_id: [
@@ -226,6 +255,38 @@ defmodule X402.Facilitator.Engine do
       estimate above this ceiling means the asset contract is burning the
       fee payer's gas and the settlement is refused — the fee payer never
       broadcasts unbounded-gas transactions against unvetted bytecode.
+      """
+    ],
+    eip6492_allowed_factories: [
+      type: {:list, :string},
+      default: [],
+      doc: """
+      Factory contract addresses (case-insensitive) trusted to deploy
+      counterfactual ERC-6492 smart wallets during settlement. Threaded
+      into verification so verify predicts settle. The default empty list
+      keeps the fail-closed behavior: every counterfactual payment is
+      rejected and the engine never signs caller-supplied factory calldata.
+      """
+    ],
+    max_deploy_gas_limit: [
+      type: :pos_integer,
+      default: 600_000,
+      doc: """
+      Absolute gas ceiling for the ERC-6492 factory deployment transaction
+      (margin included). Smart-account deployments legitimately cost far
+      more than a transfer (~300k gas), so the deployment carries its own
+      ceiling; the transfer keeps `:max_gas_limit`.
+      """
+    ],
+    pending_settlement_store: [
+      type: {:or, [nil, {:custom, PendingSettlementStore, :validate_adapter, []}]},
+      default: nil,
+      doc: """
+      Optional `{module, store}` adapter implementing
+      `X402.Facilitator.PendingSettlementStore`. When configured, `settle/3`
+      records broadcasts whose confirmation could not be established and
+      reconciles a retried payload against the already-broadcast transaction
+      instead of broadcasting a second one.
       """
     ]
   ]
@@ -396,7 +457,7 @@ defmodule X402.Facilitator.Engine do
            | {:invalid, wire_response()}
            | {:error, term()}
 
-  @spec verify_result(t(), map(), map(), boolean()) :: protocol_result()
+  @spec verify_result(t(), map(), map(), EVM.simulate()) :: protocol_result()
   defp verify_result(engine, payload, requirements, simulate) do
     case route(engine, payload, requirements) do
       :ok ->
@@ -407,18 +468,18 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec delegate_verify(t(), map(), map(), boolean()) :: protocol_result()
+  @spec delegate_verify(t(), map(), map(), EVM.simulate()) :: protocol_result()
   defp delegate_verify(engine, payload, requirements, simulate) do
-    # eip6492_allowed_factories stays [] by design: settling a counterfactual
-    # wallet would require signing arbitrary factory calldata, which the
-    # fee-payer-safety invariant forbids — so verify must reject what settle
-    # cannot broadcast.
+    # The engine signs caller-supplied calldata only toward the factories
+    # allowlisted here, capped by :max_deploy_gas_limit (see "Fee-payer
+    # safety"); with the default [] no counterfactual payment verifies, so
+    # settle never deploys anything.
     opts = [
       level: :full,
       rpc: engine.rpc,
       simulate: simulate,
       verify_chain_id: engine.verify_chain_id,
-      eip6492_allowed_factories: []
+      eip6492_allowed_factories: engine.eip6492_allowed_factories
     ]
 
     case EVM.verify(payload, requirements, opts) do
@@ -471,54 +532,294 @@ defmodule X402.Facilitator.Engine do
 
   @typep settle_result :: {:settled, wire_response()} | {:error, term()}
 
+  @typep settle_context :: %{
+           network: String.t(),
+           payer: String.t() | nil,
+           pending_key: String.t() | nil,
+           event: map(),
+           entry: PendingSettlementStore.entry() | nil
+         }
+
   @spec settle_result(t(), map(), map()) :: settle_result()
   defp settle_result(engine, payload, requirements) do
-    network = network(requirements, payload)
-    payer = payer(payload)
+    ctx = settle_context(engine, payload, requirements)
 
-    case verify_result(engine, payload, requirements, engine.simulate_in_settle) do
+    case route(engine, payload, requirements) do
+      :ok ->
+        case reconcile_pending(engine, ctx) do
+          {:settled, _response} = reconciled ->
+            reconciled
+
+          :miss ->
+            verify_and_settle(engine, payload, requirements, ctx)
+        end
+
+      {:unsupported, reason_string} ->
+        {:settled, failure_response(reason_string, "", ctx.network, ctx.payer)}
+    end
+  end
+
+  @spec verify_and_settle(t(), map(), map(), settle_context()) :: settle_result()
+  defp verify_and_settle(engine, payload, requirements, ctx) do
+    case delegate_verify(engine, payload, requirements, settle_simulate(engine)) do
       {:valid, _response, signature_type} ->
-        execute_settlement(engine, payload, requirements, network, payer, signature_type)
+        execute_settlement(engine, payload, requirements, ctx, signature_type)
 
       {:invalid, response} ->
-        {:settled, failure_response(response["invalidReason"], "", network, payer)}
+        {:settled, failure_response(response["invalidReason"], "", ctx.network, ctx.payer)}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  @spec execute_settlement(t(), map(), map(), String.t(), String.t() | nil, EVM.signature_type()) ::
+  @spec settle_context(t(), map(), map()) :: settle_context()
+  defp settle_context(engine, payload, requirements) do
+    payer = payer(payload)
+
+    %{
+      network: network(requirements, payload),
+      payer: payer,
+      pending_key: pending_key(engine, payload),
+      event: %{
+        asset: asset(requirements),
+        from: payer,
+        to: Utils.map_value(requirements, {"payTo", :payTo}),
+        value: Utils.map_value(requirements, {"amount", :amount})
+      },
+      entry: nil
+    }
+  end
+
+  # Settle's independent re-verify keeps the atomic counterfactual
+  # simulation even when :simulate_in_settle is off — it is the only
+  # possible proof of a counterfactual signature, and verify must predict
+  # settle.
+  @spec settle_simulate(t()) :: EVM.simulate()
+  defp settle_simulate(%{simulate_in_settle: true}), do: true
+  defp settle_simulate(_engine), do: :counterfactual_only
+
+  # The reference SDKs key EVM pending entries by the EIP-3009 signature;
+  # hashing it keeps raw signature material out of adapter keys.
+  @spec pending_key(t(), map()) :: String.t() | nil
+  defp pending_key(%{pending_settlement_store: nil}, _payload), do: nil
+
+  defp pending_key(_engine, payload) do
+    signature =
+      Utils.nested_map_value(payload, [{"payload", :payload}, {"signature", :signature}])
+
+    case unhex(signature) do
+      {:ok, bytes} -> Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+      :error -> nil
+    end
+  end
+
+  @spec reconcile_pending(t(), settle_context()) :: {:settled, wire_response()} | :miss
+  defp reconcile_pending(%{pending_settlement_store: nil}, _ctx), do: :miss
+  defp reconcile_pending(_engine, %{pending_key: nil}), do: :miss
+
+  defp reconcile_pending(engine, ctx) do
+    case PendingSettlementStore.get(engine.pending_settlement_store, ctx.pending_key) do
+      {:hit, entry} ->
+        # Delete before reconciling: a concurrent retry of the same payload
+        # misses here and falls through to the normal path, where the chain
+        # rejects the duplicate via the EIP-3009 authorization nonce.
+        PendingSettlementStore.delete(engine.pending_settlement_store, ctx.pending_key)
+
+        # :local_hash entries are re-awaited exactly like node-acknowledged
+        # ones — never rebroadcast: rebroadcasting a transaction the node
+        # may have accepted risks a duplicate-spend race. The stored raw
+        # bytes exist for operator-driven inspection only.
+        await_receipt(engine, entry.transaction, %{ctx | entry: entry})
+
+      :miss ->
+        :miss
+
+      {:error, _reason} ->
+        # A failing store must not block settlement; falling through to the
+        # broadcast path is safe because the chain rejects a duplicate
+        # authorization.
+        :miss
+    end
+  end
+
+  @spec execute_settlement(t(), map(), map(), settle_context(), EVM.signature_type()) ::
           settle_result()
-  defp execute_settlement(engine, payload, requirements, network, payer, signature_type) do
+  defp execute_settlement(engine, payload, requirements, ctx, signature_type) do
     # Fee-payer safety: `to` is the verified requirements' asset, `value` is
     # 0, and the calldata comes exclusively from the shared EIP-3009 builder
-    # over the authorization the re-verify just proved — the engine never
-    # signs caller-supplied calldata. The overload follows the VERIFIED
-    # signature type (an ERC-1271 signature can be 65 bytes too).
-    with {:ok, inner_signature} <- inner_signature(payload),
-         {:ok, calldata} <- build_calldata(payload, inner_signature, signature_type),
+    # over the authorization the re-verify just proved. The one exception is
+    # the allowlist-gated counterfactual deployment (deploy_wallet/4). The
+    # overload follows the VERIFIED signature type (an ERC-1271 signature
+    # can be 65 bytes too).
+    with {:ok, parsed} <- parse_wrapper(payload),
          {:ok, from} <- Signer.address(engine.signer),
          {:ok, chain_id} <- chain_id(requirements),
-         {:ok, params} <- transaction_params(engine, from, asset(requirements), calldata),
-         {:ok, raw} <- sign_or_release(engine, chain_id, params, requirements, calldata, from) do
-      broadcast_and_await(engine, raw, network, payer, from, params.nonce)
+         :ok <- ensure_wallet_deployed(engine, signature_type, parsed, ctx.payer, from, chain_id),
+         {:ok, calldata} <- build_calldata(payload, parsed.inner_signature, signature_type),
+         {:ok, params} <-
+           transaction_params(
+             engine,
+             from,
+             asset(requirements),
+             calldata,
+             transfer_limits(engine)
+           ),
+         {:ok, raw} <-
+           sign_or_release(engine, chain_id, params, asset(requirements), calldata, from) do
+      broadcast_and_await(engine, raw, from, params.nonce, ctx)
     else
       {:settle_failed, reason_string} ->
-        {:settled, failure_response(reason_string, "", network, payer)}
+        {:settled, failure_response(reason_string, "", ctx.network, ctx.payer)}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  @spec transfer_limits(t()) :: {pos_integer(), String.t()}
+  defp transfer_limits(engine),
+    do: {engine.max_gas_limit, "invalid_exact_evm_transaction_simulation_failed"}
+
+  @spec deploy_limits(t()) :: {pos_integer(), String.t()}
+  defp deploy_limits(engine),
+    do: {engine.max_deploy_gas_limit, "smart_wallet_deployment_failed"}
+
+  # A wallet verified as counterfactual may have been deployed since — the
+  # bytes-variant transfer calldata already carries the inner signature, so
+  # a deployed wallet just skips the deployment transaction.
+  @spec ensure_wallet_deployed(
+          t(),
+          EVM.signature_type(),
+          ERC6492.parsed(),
+          String.t() | nil,
+          String.t(),
+          non_neg_integer()
+        ) :: :ok | {:settle_failed, String.t()} | {:error, term()}
+  defp ensure_wallet_deployed(engine, :erc6492_counterfactual, parsed, payer, from, chain_id) do
+    case rpc_request(engine.rpc, "eth_getCode", [payer, "latest"]) do
+      {:ok, code} ->
+        case deployed_code?(code) do
+          true -> :ok
+          false -> deploy_wallet(engine, parsed, from, chain_id)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp ensure_wallet_deployed(_engine, _signature_type, _parsed, _payer, _from, _chain_id),
+    do: :ok
+
+  # The only code path that signs caller-supplied calldata: `to` and `data`
+  # come from the ERC-6492 wrapper, so the factory is re-checked against the
+  # allowlist fail-closed (re-verify already enforced it) and the gas limit
+  # is capped by :max_deploy_gas_limit. After a confirmed deployment the
+  # transfer is NOT re-simulated: verify's atomic Multicall3 deploy+transfer
+  # simulation was the authoritative pre-check, a standalone eth_call here
+  # can race the deploy's state propagation across load-balanced RPC nodes
+  # into false rejections, and the on-chain transferWithAuthorization is
+  # itself the definitive signature check.
+  @spec deploy_wallet(t(), ERC6492.parsed(), String.t(), non_neg_integer()) ::
+          :ok | {:settle_failed, String.t()} | {:error, term()}
+  defp deploy_wallet(engine, parsed, from, chain_id) do
+    with :ok <- check_factory_allowlist(engine, parsed.factory),
+         {:ok, params} <-
+           transaction_params(
+             engine,
+             from,
+             parsed.factory,
+             parsed.factory_calldata,
+             deploy_limits(engine)
+           ),
+         {:ok, raw} <-
+           sign_or_release(
+             engine,
+             chain_id,
+             params,
+             parsed.factory,
+             parsed.factory_calldata,
+             from
+           ) do
+      broadcast_deploy(engine, raw, from, params.nonce)
+    end
+  end
+
+  @spec check_factory_allowlist(t(), String.t() | nil) :: :ok | {:settle_failed, String.t()}
+  defp check_factory_allowlist(engine, factory) when is_binary(factory) do
+    allowed = Enum.map(engine.eip6492_allowed_factories, &String.downcase(String.trim(&1)))
+
+    case String.downcase(factory) in allowed do
+      true -> :ok
+      false -> {:settle_failed, "eip6492_factory_not_allowed"}
+    end
+  end
+
+  defp check_factory_allowlist(_engine, _factory),
+    do: {:settle_failed, "eip6492_factory_not_allowed"}
+
+  # The deployment consumes its own fee-payer nonce ahead of the transfer's.
+  # Every deploy failure is terminal but safe: the EIP-3009 authorization
+  # was not consumed, so the client may retry the identical payment.
+  @spec broadcast_deploy(t(), binary(), String.t(), non_neg_integer()) ::
+          :ok | {:settle_failed, String.t()} | {:error, term()}
+  defp broadcast_deploy(engine, raw, from, nonce) do
+    case RPC.request(engine.rpc, "eth_sendRawTransaction", [hex(raw)]) do
+      {:ok, transaction_hash} when is_binary(transaction_hash) ->
+        complete_nonce(engine, from, nonce)
+        await_deploy_receipt(engine, transaction_hash)
+
+      {:ok, other} ->
+        complete_nonce(engine, from, nonce)
+        {:error, {:rpc_error, {:invalid_response, other}}}
+
+      {:error, {:jsonrpc_error, _error}} ->
+        release_nonce(engine, from, nonce)
+        {:settle_failed, "smart_wallet_deployment_failed"}
+
+      {:error, _reason} ->
+        # Ambiguous transport failure: the node may have accepted the
+        # deploy, so the nonce counts as consumed.
+        complete_nonce(engine, from, nonce)
+        {:settle_failed, "smart_wallet_deployment_failed"}
+    end
+  end
+
+  @spec await_deploy_receipt(t(), String.t()) :: :ok | {:settle_failed, String.t()}
+  defp await_deploy_receipt(engine, transaction_hash) do
+    deadline = System.monotonic_time(:millisecond) + engine.receipt_timeout_ms
+    poll_deploy_receipt(engine, transaction_hash, deadline)
+  end
+
+  @spec poll_deploy_receipt(t(), String.t(), integer()) :: :ok | {:settle_failed, String.t()}
+  defp poll_deploy_receipt(engine, transaction_hash, deadline) do
+    case RPC.request(engine.rpc, "eth_getTransactionReceipt", [transaction_hash]) do
+      {:ok, %{"status" => "0x1"}} ->
+        :ok
+
+      {:ok, %{"status" => "0x0"}} ->
+        {:settle_failed, "smart_wallet_deployment_failed"}
+
+      _pending_or_error ->
+        case System.monotonic_time(:millisecond) + engine.receipt_interval_ms <= deadline do
+          true ->
+            Process.sleep(engine.receipt_interval_ms)
+            poll_deploy_receipt(engine, transaction_hash, deadline)
+
+          false ->
+            {:settle_failed, "smart_wallet_deployment_failed"}
+        end
     end
   end
 
   # Once a nonce is checked out, every failure before the node could have
   # seen the transaction must return it — otherwise a gap forms and later
   # settlements stall pending at the node.
-  @spec sign_or_release(t(), non_neg_integer(), map(), map(), binary(), String.t()) ::
+  @spec sign_or_release(t(), non_neg_integer(), map(), String.t(), binary(), String.t()) ::
           {:ok, binary()} | {:settle_failed, String.t()} | {:error, term()}
-  defp sign_or_release(engine, chain_id, params, requirements, calldata, from) do
-    case sign_transaction(engine, chain_id, params, asset(requirements), calldata) do
+  defp sign_or_release(engine, chain_id, params, to, calldata, from) do
+    case sign_transaction(engine, chain_id, params, to, calldata) do
       {:ok, raw} ->
         {:ok, raw}
 
@@ -528,16 +829,16 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec inner_signature(map()) :: {:ok, binary()} | {:error, term()}
-  defp inner_signature(payload) do
+  @spec parse_wrapper(map()) :: {:ok, ERC6492.parsed()} | {:error, term()}
+  defp parse_wrapper(payload) do
     signature =
       Utils.nested_map_value(payload, [{"payload", :payload}, {"signature", :signature}])
 
-    # Re-verify already proved the signature parses; a deployed ERC-1271
-    # wallet's ERC-6492 wrapper is unwrapped here because the token contract
-    # expects the inner signature.
+    # Re-verify already proved the signature parses; the wrapper is retained
+    # for counterfactual deployment, while the token contract always
+    # receives the inner signature.
     case ERC6492.parse(signature || "") do
-      {:ok, %{inner_signature: inner}} -> {:ok, inner}
+      {:ok, parsed} -> {:ok, parsed}
       {:error, reason} -> {:error, {:settle_error, reason}}
     end
   end
@@ -563,11 +864,13 @@ defmodule X402.Facilitator.Engine do
   end
 
   # One batched round-trip: gas estimate, EIP-1559 fee data, pending nonce.
-  @spec transaction_params(t(), String.t(), String.t(), binary()) ::
+  # `limits` carries the gas ceiling and the estimate-revert reason for the
+  # transaction kind being built (transfer vs. factory deployment).
+  @spec transaction_params(t(), String.t(), String.t(), binary(), {pos_integer(), String.t()}) ::
           {:ok, map()} | {:settle_failed, String.t()} | {:error, term()}
-  defp transaction_params(%{nonce_manager: nil} = engine, from, asset, calldata) do
+  defp transaction_params(%{nonce_manager: nil} = engine, from, to, calldata, limits) do
     requests = [
-      {"eth_estimateGas", [%{"from" => from, "to" => asset, "data" => hex(calldata)}]},
+      {"eth_estimateGas", [%{"from" => from, "to" => to, "data" => hex(calldata)}]},
       {"eth_maxPriorityFeePerGas", []},
       {"eth_feeHistory", ["0x1", "latest", []]},
       {"eth_getTransactionCount", [from, "pending"]}
@@ -575,7 +878,7 @@ defmodule X402.Facilitator.Engine do
 
     case RPC.batch(engine.rpc, requests) do
       {:ok, [estimate, priority, fee_history, nonce]} ->
-        assemble_params(engine, estimate, priority, fee_history, nonce)
+        assemble_params(engine, estimate, priority, fee_history, nonce, limits)
 
       {:error, reason} ->
         {:error, {:rpc_error, reason}}
@@ -587,16 +890,23 @@ defmodule X402.Facilitator.Engine do
   # concurrent settlements get distinct consecutive nonces instead of racing
   # on `pending`. The checkout happens LAST: a fee/gas failure before it
   # needs no release, and an assembly failure after it releases the nonce.
-  defp transaction_params(engine, from, asset, calldata) do
+  defp transaction_params(engine, from, to, calldata, limits) do
     requests = [
-      {"eth_estimateGas", [%{"from" => from, "to" => asset, "data" => hex(calldata)}]},
+      {"eth_estimateGas", [%{"from" => from, "to" => to, "data" => hex(calldata)}]},
       {"eth_maxPriorityFeePerGas", []},
       {"eth_feeHistory", ["0x1", "latest", []]}
     ]
 
     with {:ok, [estimate, priority, fee_history]} <- rpc_batch(engine, requests),
          {:ok, nonce} <- checkout_nonce(engine, from) do
-      case assemble_params(engine, estimate, priority, fee_history, {:ok, integer_hex(nonce)}) do
+      case assemble_params(
+             engine,
+             estimate,
+             priority,
+             fee_history,
+             {:ok, integer_hex(nonce)},
+             limits
+           ) do
         {:ok, params} ->
           {:ok, params}
 
@@ -662,10 +972,11 @@ defmodule X402.Facilitator.Engine do
           RPC.batch_result(),
           RPC.batch_result(),
           RPC.batch_result(),
-          RPC.batch_result()
+          RPC.batch_result(),
+          {pos_integer(), String.t()}
         ) :: {:ok, map()} | {:settle_failed, String.t()} | {:error, term()}
-  defp assemble_params(engine, estimate, priority, fee_history, nonce) do
-    with {:ok, gas_limit} <- gas_limit(engine, estimate),
+  defp assemble_params(engine, estimate, priority, fee_history, nonce, limits) do
+    with {:ok, gas_limit} <- gas_limit(engine, estimate, limits),
          {:ok, nonce} <- expect_quantity(nonce),
          {:ok, {max_priority, max_fee}} <- fee_fields(engine.rpc, priority, fee_history) do
       {:ok,
@@ -678,20 +989,20 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  # An eth_estimateGas revert means the transfer would fail on chain — a
+  # An eth_estimateGas revert means the call would fail on chain — a
   # protocol-level rejection (it is itself a simulation), not an
   # infrastructure error.
-  @spec gas_limit(t(), RPC.batch_result()) ::
+  @spec gas_limit(t(), RPC.batch_result(), {pos_integer(), String.t()}) ::
           {:ok, pos_integer()} | {:settle_failed, String.t()} | {:error, term()}
-  defp gas_limit(engine, {:ok, hex}) do
+  defp gas_limit(engine, {:ok, hex}, {gas_ceiling, _revert_reason}) do
     case parse_quantity(hex) do
       {:ok, estimate} ->
         margined = div(estimate * (100 + engine.gas_limit_margin_percent), 100)
 
-        # Absolute ceiling: a transferWithAuthorization on a real token costs
-        # well under 100k gas. An estimate beyond the ceiling means the
-        # "asset" is burning the fee payer's gas — refuse to settle.
-        case margined <= engine.max_gas_limit do
+        # Absolute ceiling per transaction kind: an estimate beyond what a
+        # legitimate transfer (or factory deployment) can cost means the
+        # contract is burning the fee payer's gas — refuse to settle.
+        case margined <= gas_ceiling do
           true -> {:ok, margined}
           false -> {:settle_failed, "settle_gas_limit_exceeded"}
         end
@@ -701,8 +1012,8 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  defp gas_limit(_engine, {:error, {:jsonrpc_error, _error}}),
-    do: {:settle_failed, "invalid_exact_evm_transaction_simulation_failed"}
+  defp gas_limit(_engine, {:error, {:jsonrpc_error, _error}}, {_gas_ceiling, revert_reason}),
+    do: {:settle_failed, revert_reason}
 
   # EIP-1559 fee data: next base fee from eth_feeHistory plus the node's
   # suggested priority fee; maxFeePerGas = 2 * baseFee + priority. Nodes
@@ -758,19 +1069,13 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec broadcast_and_await(
-          t(),
-          binary(),
-          String.t(),
-          String.t() | nil,
-          String.t(),
-          non_neg_integer()
-        ) :: settle_result()
-  defp broadcast_and_await(engine, raw, network, payer, from, nonce) do
+  @spec broadcast_and_await(t(), binary(), String.t(), non_neg_integer(), settle_context()) ::
+          settle_result()
+  defp broadcast_and_await(engine, raw, from, nonce, ctx) do
     case RPC.request(engine.rpc, "eth_sendRawTransaction", [hex(raw)]) do
       {:ok, transaction_hash} when is_binary(transaction_hash) ->
         complete_nonce(engine, from, nonce)
-        await_receipt(engine, transaction_hash, network, payer)
+        await_receipt(engine, transaction_hash, ctx)
 
       {:ok, other} ->
         complete_nonce(engine, from, nonce)
@@ -781,7 +1086,7 @@ defmodule X402.Facilitator.Engine do
         # the nonce (tail rollback, or a drain-triggered re-fetch when later
         # settlements are still in flight).
         release_nonce(engine, from, nonce)
-        {:settled, failure_response("unexpected_settle_error", "", network, payer)}
+        {:settled, failure_response("unexpected_settle_error", "", ctx.network, ctx.payer)}
 
       {:error, reason} ->
         # A transport failure mid-broadcast is ambiguous — the node may have
@@ -790,64 +1095,221 @@ defmodule X402.Facilitator.Engine do
         # Return the spec's non-terminal settlement_pending with the locally
         # computed hash so the caller can reconcile on chain.
         complete_nonce(engine, from, nonce)
-        pending_after_transport_failure(raw, network, payer, reason)
+        pending_after_transport_failure(engine, raw, ctx, reason)
     end
   end
 
-  @spec pending_after_transport_failure(binary(), String.t(), String.t() | nil, term()) ::
+  @spec pending_after_transport_failure(t(), binary(), settle_context(), term()) ::
           settle_result()
-  defp pending_after_transport_failure(raw, network, payer, reason) do
+  defp pending_after_transport_failure(engine, raw, ctx, reason) do
     case EIP712.keccak_module() do
       {:ok, keccak_module} ->
         transaction_hash = hex(keccak_module.hash_256(raw))
-        {:settled, failure_response("settlement_pending", transaction_hash, network, payer)}
+
+        # The node may never have seen this transaction — keep the raw
+        # signed bytes with the :local_hash entry so operators can inspect
+        # or manually rebroadcast; the engine itself never rebroadcasts.
+        entry = %{transaction: transaction_hash, provenance: :local_hash, raw_transaction: raw}
+        settlement_pending(engine, ctx, transaction_hash, entry)
 
       {:error, :missing_dependency} ->
         {:error, {:rpc_error, reason}}
     end
   end
 
-  @spec await_receipt(t(), String.t(), String.t(), String.t() | nil) :: settle_result()
-  defp await_receipt(engine, transaction_hash, network, payer) do
+  @spec await_receipt(t(), String.t(), settle_context()) :: settle_result()
+  defp await_receipt(engine, transaction_hash, ctx) do
     deadline = System.monotonic_time(:millisecond) + engine.receipt_timeout_ms
-    poll_receipt(engine, transaction_hash, network, payer, deadline)
+    poll_receipt(engine, transaction_hash, ctx, deadline)
   end
 
-  @spec poll_receipt(t(), String.t(), String.t(), String.t() | nil, integer()) :: settle_result()
-  defp poll_receipt(engine, transaction_hash, network, payer, deadline) do
+  @spec poll_receipt(t(), String.t(), settle_context(), integer()) :: settle_result()
+  defp poll_receipt(engine, transaction_hash, ctx, deadline) do
     case RPC.request(engine.rpc, "eth_getTransactionReceipt", [transaction_hash]) do
-      {:ok, %{"status" => "0x1"}} ->
-        {:settled, success_response(transaction_hash, network, payer)}
+      {:ok, %{"status" => "0x1"} = receipt} ->
+        confirm_transfer(engine, transaction_hash, receipt, ctx)
 
       {:ok, %{"status" => "0x0"}} ->
         {:settled,
          failure_response(
            "invalid_exact_evm_transaction_failed",
            transaction_hash,
-           network,
-           payer
+           ctx.network,
+           ctx.payer
          )}
 
       # Pending (null receipt), unexpected shapes, and transient RPC errors
       # all keep polling until the deadline; the transaction is broadcast, so
       # the only safe terminal answer without a receipt is settlement_pending.
       _pending_or_error ->
-        retry_or_pending(engine, transaction_hash, network, payer, deadline)
+        retry_or_pending(engine, transaction_hash, ctx, deadline)
     end
   end
 
-  @spec retry_or_pending(t(), String.t(), String.t(), String.t() | nil, integer()) ::
-          settle_result()
-  defp retry_or_pending(engine, transaction_hash, network, payer, deadline) do
+  # A confirmed receipt only proves the transaction did not revert; the
+  # matching ERC-20 Transfer event is what proves the payment moved.
+  @spec confirm_transfer(t(), String.t(), map(), settle_context()) :: settle_result()
+  defp confirm_transfer(engine, transaction_hash, receipt, ctx) do
+    case check_transfer_event(receipt, ctx.event) do
+      :ok ->
+        {:settled, success_response(transaction_hash, ctx.network, ctx.payer)}
+
+      :mismatch ->
+        {:settled,
+         failure_response(
+           "invalid_exact_evm_transfer_event_mismatch",
+           transaction_hash,
+           ctx.network,
+           ctx.payer
+         )}
+
+      :unparseable ->
+        # Logs the engine cannot read leave the transfer unestablished — a
+        # non-terminal outcome, unlike a parsed-but-mismatched event.
+        settlement_pending(engine, ctx, transaction_hash, pending_entry(ctx, transaction_hash))
+    end
+  end
+
+  @spec retry_or_pending(t(), String.t(), settle_context(), integer()) :: settle_result()
+  defp retry_or_pending(engine, transaction_hash, ctx, deadline) do
     case System.monotonic_time(:millisecond) + engine.receipt_interval_ms <= deadline do
       true ->
         Process.sleep(engine.receipt_interval_ms)
-        poll_receipt(engine, transaction_hash, network, payer, deadline)
+        poll_receipt(engine, transaction_hash, ctx, deadline)
 
       false ->
-        {:settled, failure_response("settlement_pending", transaction_hash, network, payer)}
+        settlement_pending(engine, ctx, transaction_hash, pending_entry(ctx, transaction_hash))
     end
   end
+
+  # Reconciled entries are re-recorded as-is (keeping :local_hash provenance
+  # and raw bytes); fresh timeouts record the node-acknowledged hash.
+  @spec pending_entry(settle_context(), String.t()) :: PendingSettlementStore.entry()
+  defp pending_entry(%{entry: %{} = entry}, _transaction_hash), do: entry
+
+  defp pending_entry(_ctx, transaction_hash),
+    do: %{transaction: transaction_hash, provenance: :node_acknowledged, raw_transaction: nil}
+
+  @spec settlement_pending(t(), settle_context(), String.t(), PendingSettlementStore.entry()) ::
+          settle_result()
+  defp settlement_pending(engine, ctx, transaction_hash, entry) do
+    case record_pending(engine, ctx.pending_key, entry) do
+      :ok ->
+        {:settled,
+         failure_response("settlement_pending", transaction_hash, ctx.network, ctx.payer)}
+
+      {:error, reason} ->
+        # A pending answer that was not persisted cannot be made good on —
+        # the retry would miss the store and double-broadcast. Downgrade to
+        # a terminal failure, keeping the hash for manual reconciliation.
+        Logger.warning(
+          "x402 facilitator settlement_pending, but failed to persist for retry: " <>
+            inspect(reason)
+        )
+
+        {:settled,
+         failure_response(
+           "invalid_exact_evm_transaction_failed",
+           transaction_hash,
+           ctx.network,
+           ctx.payer
+         )}
+    end
+  end
+
+  @spec record_pending(t(), String.t() | nil, PendingSettlementStore.entry()) ::
+          :ok | {:error, term()}
+  defp record_pending(%{pending_settlement_store: nil}, _key, _entry), do: :ok
+  defp record_pending(_engine, nil, _entry), do: :ok
+
+  defp record_pending(engine, key, entry),
+    do: PendingSettlementStore.put(engine.pending_settlement_store, key, entry)
+
+  # -- Transfer-event verification ---------------------------------------------
+
+  # Wire shapes come straight from the node: a parseable log list with no
+  # matching Transfer entry is a terminal mismatch, while logs the engine
+  # cannot read structurally make no verdict possible.
+  @spec check_transfer_event(map(), map()) :: :ok | :mismatch | :unparseable
+  defp check_transfer_event(receipt, event) do
+    with {:ok, logs} <- receipt_logs(receipt),
+         {:ok, expected} <- expected_transfer_log(event),
+         {:ok, normalized} <- normalize_logs(logs, []) do
+      case expected in normalized do
+        true -> :ok
+        false -> :mismatch
+      end
+    else
+      :unparseable -> :unparseable
+    end
+  end
+
+  @spec receipt_logs(map()) :: {:ok, [term()]} | :unparseable
+  defp receipt_logs(%{"logs" => logs}) when is_list(logs), do: {:ok, logs}
+  defp receipt_logs(_receipt), do: :unparseable
+
+  @spec normalize_logs([term()], [map()]) :: {:ok, [map()]} | :unparseable
+  defp normalize_logs([], acc), do: {:ok, acc}
+
+  defp normalize_logs([%{"address" => address, "topics" => topics, "data" => data} | rest], acc)
+       when is_binary(address) and is_list(topics) and is_binary(data) do
+    case Enum.all?(topics, &is_binary/1) do
+      true ->
+        normalized = %{
+          address: String.downcase(address),
+          topics: Enum.map(topics, &String.downcase/1),
+          data: String.downcase(data)
+        }
+
+        normalize_logs(rest, [normalized | acc])
+
+      false ->
+        :unparseable
+    end
+  end
+
+  defp normalize_logs(_malformed, _acc), do: :unparseable
+
+  @spec expected_transfer_log(map()) :: {:ok, map()} | :unparseable
+  defp expected_transfer_log(%{asset: asset} = event) when is_binary(asset) do
+    with {:ok, from_topic} <- address_topic(event.from),
+         {:ok, to_topic} <- address_topic(event.to),
+         {:ok, value} <- parse_amount(event.value) do
+      {:ok,
+       %{
+         address: String.downcase(asset),
+         topics: [@transfer_event_topic, from_topic, to_topic],
+         data: "0x" <> Base.encode16(<<value::unsigned-big-integer-size(256)>>, case: :lower)
+       }}
+    else
+      :error -> :unparseable
+    end
+  end
+
+  defp expected_transfer_log(_event), do: :unparseable
+
+  @spec address_topic(term()) :: {:ok, String.t()} | :error
+  defp address_topic("0x" <> hex_address) when byte_size(hex_address) == 40 do
+    case Base.decode16(hex_address, case: :mixed) do
+      {:ok, _bytes} -> {:ok, "0x" <> String.duplicate("0", 24) <> String.downcase(hex_address)}
+      :error -> :error
+    end
+  end
+
+  defp address_topic(_address), do: :error
+
+  @spec parse_amount(term()) :: {:ok, non_neg_integer()} | :error
+  defp parse_amount(value) when is_integer(value) and value >= 0 and value <= @max_uint256,
+    do: {:ok, value}
+
+  defp parse_amount(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {amount, ""} when amount >= 0 and amount <= @max_uint256 -> {:ok, amount}
+      _other -> :error
+    end
+  end
+
+  defp parse_amount(_value), do: :error
 
   @spec handle_settle_result(settle_result(), t(), Context.t(), Hooks.metadata()) ::
           {:ok, wire_response()} | {:error, term()}
@@ -1037,6 +1499,20 @@ defmodule X402.Facilitator.Engine do
 
   @spec hex(binary()) :: String.t()
   defp hex(bytes), do: "0x" <> Base.encode16(bytes, case: :lower)
+
+  @spec unhex(term()) :: {:ok, binary()} | :error
+  defp unhex("0x" <> hex_digits), do: Base.decode16(hex_digits, case: :mixed)
+  defp unhex(_value), do: :error
+
+  @spec deployed_code?(term()) :: boolean()
+  defp deployed_code?(code) when is_binary(code) do
+    case unhex(code) do
+      {:ok, bytes} -> byte_size(bytes) > 0
+      :error -> false
+    end
+  end
+
+  defp deployed_code?(_code), do: false
 
   @spec stringify_reason(term()) :: String.t()
   defp stringify_reason(reason) when is_binary(reason), do: reason

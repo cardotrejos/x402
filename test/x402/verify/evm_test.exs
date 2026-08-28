@@ -975,6 +975,41 @@ defmodule X402.Verify.EVMTest do
       assert String.downcase(to) == @multicall3
     end
 
+    test ":counterfactual_only keeps the counterfactual policy and its simulation", context do
+      rpc = stub_rpc(context, %{})
+      requirements = requirements()
+
+      assert {:ok, %{signature_type: :erc6492_counterfactual}} =
+               EVM.verify(
+                 counterfactual_payload(requirements),
+                 requirements,
+                 level: :full,
+                 rpc: rpc,
+                 simulate: :counterfactual_only,
+                 eip6492_allowed_factories: [@factory]
+               )
+
+      assert_received {:rpc, "eth_call",
+                       [%{"to" => to, "data" => "0x82ad56cb" <> _args} | _block]}
+
+      assert String.downcase(to) == @multicall3
+    end
+
+    test ":counterfactual_only does not simulate the EOA transfer", context do
+      rpc = stub_rpc(context, %{})
+      requirements = requirements()
+
+      assert {:ok, %{signature_type: :eoa}} =
+               EVM.verify(signed_payload(requirements), requirements,
+                 level: :full,
+                 rpc: rpc,
+                 simulate: :counterfactual_only
+               )
+
+      refute_received {:rpc, "eth_call", [%{"data" => "0xe3ee160e" <> _vrs} | _block]}
+      refute_received {:rpc, "eth_call", [%{"data" => "0xcf092995" <> _bytes} | _block2]}
+    end
+
     test "rejects when the transfer leg of the simulation fails", context do
       revert_data =
         <<0x08, 0xC3, 0x79, 0xA0>> <>

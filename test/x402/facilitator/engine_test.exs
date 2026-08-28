@@ -4,6 +4,7 @@ defmodule X402.Facilitator.EngineTest do
   alias X402.EIP3009
   alias X402.ERC6492
   alias X402.Facilitator.Engine
+  alias X402.Facilitator.PendingSettlementStore
   alias X402.RPC
   alias X402.Signer.LocalKey
   alias X402.TestRLPDecoder
@@ -21,6 +22,8 @@ defmodule X402.Facilitator.EngineTest do
   @network "eip155:84532"
   @tx_hash "0x" <> String.duplicate("cd", 32)
   @factory "0x3333333333333333333333333333333333333333"
+  @factory_bytes :binary.copy(<<0x33>>, 20)
+  @factory_calldata <<0xDE, 0xAD>>
 
   setup [:setup_bypass, :setup_finch]
 
@@ -75,6 +78,30 @@ defmodule X402.Facilitator.EngineTest do
 
   defp stub_rpc(%{bypass: bypass, finch: finch}, overrides) do
     X402.TestRPCStub.stub_rpc(bypass, finch, overrides)
+  end
+
+  # Wraps the payload's real EOA signature in an ERC-6492 wrapper; the payer
+  # stays undeployed, so the engine classifies it as counterfactual.
+  defp counterfactual_payload(payload, factory) do
+    "0x" <> inner_hex = payload["payload"]["signature"]
+    inner = Base.decode16!(inner_hex, case: :mixed)
+    {:ok, wrapped} = ERC6492.wrap(factory, @factory_calldata, inner)
+
+    wrapped_payload =
+      put_in(payload, ["payload", "signature"], "0x" <> Base.encode16(wrapped, case: :lower))
+
+    {wrapped_payload, inner}
+  end
+
+  defp pending_store(name, opts \\ []) do
+    start_supervised!({X402.Facilitator.PendingSettlementStore.ETS, [name: name] ++ opts})
+    {X402.Facilitator.PendingSettlementStore.ETS, name}
+  end
+
+  defp pending_key(payload) do
+    "0x" <> signature_hex = payload["payload"]["signature"]
+    bytes = Base.decode16!(signature_hex, case: :mixed)
+    Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
   end
 
   # -- new/1 ------------------------------------------------------------------
@@ -588,6 +615,323 @@ defmodule X402.Facilitator.EngineTest do
                Engine.settle(engine, signed_payload(requirements), requirements)
 
       refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+  end
+
+  # -- ERC-6492 counterfactual settlement ---------------------------------------
+
+  describe "settle/3 — ERC-6492 counterfactual" do
+    test "deploys the wallet then transfers, on consecutive nonces", context do
+      manager = start_supervised!({X402.Facilitator.NonceManager, []})
+
+      engine =
+        engine(context,
+          nonce_manager: manager,
+          eip6492_allowed_factories: [@factory],
+          stub: %{receipts: [%{"status" => "0x1"}, %{"status" => "0x1"}]}
+        )
+
+      requirements = requirements()
+      {payload, inner} = counterfactual_payload(signed_payload(requirements), @factory)
+
+      assert {:ok, %{"success" => true, "transaction" => @tx_hash, "payer" => @payer}} =
+               Engine.settle(engine, payload, requirements)
+
+      assert_received {:rpc, "eth_sendRawTransaction", [deploy_hex]}
+      assert_received {:rpc, "eth_sendRawTransaction", [transfer_hex]}
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+
+      [deploy, transfer] =
+        for raw_hex <- [deploy_hex, transfer_hex] do
+          raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+          TestRLPDecoder.decode_eip1559(raw)
+        end
+
+      # First broadcast: the wrapper's factory calldata toward the factory.
+      [_chain, deploy_nonce, _priority, _fee, _gas, deploy_to, deploy_value, deploy_data | _] =
+        deploy
+
+      assert deploy_to == @factory_bytes
+      assert deploy_value == ""
+      assert deploy_data == @factory_calldata
+
+      # Second broadcast: the bytes-variant transfer with the inner signature.
+      [_chain2, transfer_nonce, _priority2, _fee2, _gas2, transfer_to, _value2, transfer_data | _] =
+        transfer
+
+      assert transfer_to == @asset_bytes
+
+      authorization = payload["payload"]["authorization"]
+
+      assert {:ok, transfer_data} ==
+               EIP3009.transfer_calldata(authorization, inner, :erc6492_counterfactual)
+
+      assert :binary.decode_unsigned(transfer_nonce) ==
+               :binary.decode_unsigned(deploy_nonce) + 1
+    end
+
+    test "an unlisted factory is rejected at verify and at settle without broadcasting",
+         context do
+      engine =
+        engine(context,
+          eip6492_allowed_factories: ["0x5555555555555555555555555555555555555555"]
+        )
+
+      requirements = requirements()
+      {payload, _inner} = counterfactual_payload(signed_payload(requirements), @factory)
+
+      assert {:ok, %{"isValid" => false, "invalidReason" => "eip6492_factory_not_allowed"}} =
+               Engine.verify(engine, payload, requirements)
+
+      assert {:ok, %{"success" => false, "errorReason" => "eip6492_factory_not_allowed"}} =
+               Engine.settle(engine, payload, requirements)
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+
+    test "a reverted deployment fails without broadcasting the transfer", context do
+      engine =
+        engine(context,
+          eip6492_allowed_factories: [@factory],
+          stub: %{receipts: [%{"status" => "0x0"}]}
+        )
+
+      requirements = requirements()
+      {payload, _inner} = counterfactual_payload(signed_payload(requirements), @factory)
+
+      assert {:ok, %{"success" => false, "errorReason" => "smart_wallet_deployment_failed"}} =
+               Engine.settle(engine, payload, requirements)
+
+      assert_received {:rpc, "eth_sendRawTransaction", [_deploy_hex]}
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+
+    test "a deployment estimate above the deploy ceiling refuses to settle", context do
+      engine =
+        engine(context,
+          eip6492_allowed_factories: [@factory],
+          max_deploy_gas_limit: 100_000,
+          stub: %{estimate_gas: {:ok, 3_000_000}}
+        )
+
+      requirements = requirements()
+      {payload, _inner} = counterfactual_payload(signed_payload(requirements), @factory)
+
+      assert {:ok, %{"success" => false, "errorReason" => "settle_gas_limit_exceeded"}} =
+               Engine.settle(engine, payload, requirements)
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+
+    test "a wallet deployed since verification skips the deployment", context do
+      engine =
+        engine(context,
+          eip6492_allowed_factories: [@factory],
+          stub: %{
+            code: %{
+              String.downcase(@asset) => "0x6001",
+              # Undeployed during the re-verify's preflight, deployed by the
+              # time the engine re-checks before broadcasting.
+              @payer => ["0x", "0x6001"]
+            }
+          }
+        )
+
+      requirements = requirements()
+      {payload, inner} = counterfactual_payload(signed_payload(requirements), @factory)
+
+      assert {:ok, %{"success" => true, "transaction" => @tx_hash}} =
+               Engine.settle(engine, payload, requirements)
+
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex]}
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+
+      raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+
+      [_chain, _nonce, _priority, _fee, _gas, to, _value, data | _] =
+        TestRLPDecoder.decode_eip1559(raw)
+
+      assert to == @asset_bytes
+
+      authorization = payload["payload"]["authorization"]
+
+      assert {:ok, data} ==
+               EIP3009.transfer_calldata(authorization, inner, :erc6492_counterfactual)
+    end
+  end
+
+  # -- Transfer-event verification ----------------------------------------------
+
+  describe "settle/3 Transfer-event verification" do
+    test "a mismatched Transfer event is a terminal failure", context do
+      engine =
+        engine(context,
+          stub: %{
+            receipts: [
+              %{"status" => "0x1", "logs" => [X402.TestRPCStub.transfer_log(%{value: 999})]}
+            ]
+          }
+        )
+
+      requirements = requirements()
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "invalid_exact_evm_transfer_event_mismatch",
+                "transaction" => @tx_hash
+              }} = Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "a receipt without the Transfer log is a terminal failure", context do
+      engine = engine(context, stub: %{receipts: [%{"status" => "0x1", "logs" => []}]})
+      requirements = requirements()
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "invalid_exact_evm_transfer_event_mismatch",
+                "transaction" => @tx_hash
+              }} = Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+
+    test "unreadable logs return settlement_pending", context do
+      engine = engine(context, stub: %{receipts: [%{"status" => "0x1", "logs" => ["junk"]}]})
+      requirements = requirements()
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "settlement_pending",
+                "transaction" => @tx_hash
+              }} = Engine.settle(engine, signed_payload(requirements), requirements)
+    end
+  end
+
+  # -- Pending-settlement reconciliation ----------------------------------------
+
+  describe "settle/3 with a pending-settlement store" do
+    test "a receipt timeout records the pending entry and a retry reconciles it", context do
+      store = pending_store(__MODULE__.TimeoutStore)
+      {:ok, queue} = Agent.start_link(fn -> [] end)
+
+      engine =
+        engine(context,
+          pending_settlement_store: store,
+          receipt_timeout_ms: 50,
+          receipt_interval_ms: 10,
+          stub: %{receipt_queue: queue}
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "settlement_pending",
+                "transaction" => @tx_hash
+              }} = Engine.settle(engine, payload, requirements)
+
+      assert {:hit,
+              %{transaction: @tx_hash, provenance: :node_acknowledged, raw_transaction: nil}} =
+               PendingSettlementStore.get(store, pending_key(payload))
+
+      # Consume the first attempt's broadcast so the retries can prove they
+      # add none.
+      assert_received {:rpc, "eth_sendRawTransaction", [_raw_hex]}
+      assert_received {:rpc, "eth_estimateGas", [_call]}
+
+      # A retry that still cannot confirm re-records the entry and stays
+      # pending.
+      assert {:ok, %{"errorReason" => "settlement_pending"}} =
+               Engine.settle(engine, payload, requirements)
+
+      assert {:hit, %{transaction: @tx_hash}} =
+               PendingSettlementStore.get(store, pending_key(payload))
+
+      Agent.update(queue, fn _empty -> [%{"status" => "0x1"}] end)
+
+      assert {:ok, %{"success" => true, "transaction" => @tx_hash}} =
+               Engine.settle(engine, payload, requirements)
+
+      # The retries reconciled: no re-verify, no second broadcast, and the
+      # confirmed entry stays deleted.
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+      refute_received {:rpc, "eth_estimateGas", _params2}
+      assert PendingSettlementStore.get(store, pending_key(payload)) == :miss
+    end
+
+    test "a transport failure records a local-hash entry that a retry re-awaits", context do
+      store = pending_store(__MODULE__.TransportStore)
+      {:ok, queue} = Agent.start_link(fn -> [] end)
+
+      engine =
+        engine(context,
+          pending_settlement_store: store,
+          stub: %{send_raw: :http_error, receipt_queue: queue}
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "settlement_pending",
+                "transaction" => local_hash
+              }} = Engine.settle(engine, payload, requirements)
+
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex]}
+      raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+      assert local_hash == "0x" <> Base.encode16(ExKeccak.hash_256(raw), case: :lower)
+
+      assert {:hit, %{transaction: ^local_hash, provenance: :local_hash, raw_transaction: ^raw}} =
+               PendingSettlementStore.get(store, pending_key(payload))
+
+      # The retry re-awaits the recorded hash — it never rebroadcasts the
+      # stored raw bytes.
+      Agent.update(queue, fn _empty -> [%{"status" => "0x1"}] end)
+
+      assert {:ok, %{"success" => true, "transaction" => ^local_hash}} =
+               Engine.settle(engine, payload, requirements)
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+      assert_received {:rpc, "eth_getTransactionReceipt", [^local_hash]}
+    end
+
+    test "a failed pending-store write downgrades to a terminal failure", context do
+      store = pending_store(__MODULE__.FullStore, max_size: 1)
+
+      :ok =
+        PendingSettlementStore.put(store, "occupied", %{
+          transaction: "0x00",
+          provenance: :node_acknowledged,
+          raw_transaction: nil
+        })
+
+      engine =
+        engine(context,
+          pending_settlement_store: store,
+          receipt_timeout_ms: 50,
+          receipt_interval_ms: 10,
+          stub: %{receipts: []}
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok,
+                  %{
+                    "success" => false,
+                    "errorReason" => "invalid_exact_evm_transaction_failed",
+                    "transaction" => @tx_hash
+                  }} = Engine.settle(engine, payload, requirements)
+        end)
+
+      assert log =~ "failed to persist for retry"
     end
   end
 
