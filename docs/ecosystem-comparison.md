@@ -6,6 +6,8 @@
 
 **Method:** produced by a multi-agent deep read of the upstream TypeScript/Python/Go/Java SDKs, the full spec tree, the examples/e2e harness, and this SDK, plus web research on community SDKs and facilitators. Sixteen load-bearing claims (tagged `matrix/C1–C8`, `security/C1–C8` below) were independently re-verified against source with file-and-line evidence; two came back *partial* and their corrections are incorporated. Adoption numbers were checked directly against the GitHub/npm/PyPI/crates.io/hex.pm APIs on 2026-08-26.
 
+**Status (read this first):** this document is the *pre-sprint baseline*, preserved as written. Every P0/P1/P2 item in §8 shipped in the 2026-08-27 gap-closure sprint (25 PRs), and the follow-ups that sprint left open closed on 2026-08-28: inline gate verification (`local_verification`), ERC-6492 counterfactual settlement behind a factory allowlist, ERC-20 Transfer-event receipt verification, pending-settlement reconciliation (`X402.Facilitator.PendingSettlementStore`), the SVM on-chain facilitator (`X402.Solana.RPC`, `X402.Verify.SVM`, `X402.Facilitator.SVMEngine`) with a multi-engine `X402.Plug.Facilitator`, and canonical signature-bound replay keys in the gate (closing §6's raw-byte-keying and unused-`paymentId` caveats). Current status lives in `ROADMAP.md` and `CHANGELOG.md`; the annotated ledger lives in the companion artifact.
+
 ---
 
 ## 1. Executive Summary
