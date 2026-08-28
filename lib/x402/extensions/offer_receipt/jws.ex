@@ -305,7 +305,7 @@ defmodule X402.Extensions.OfferReceipt.JWS do
           {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, :signature_mismatch}
   defp der_to_integers(<<0x30, _length, 0x02, r_length, rest::binary>>) do
     case rest do
-      <<r::binary-size(r_length), 0x02, s_length, s::binary-size(s_length)>> ->
+      <<r::binary-size(^r_length), 0x02, s_length, s::binary-size(s_length)>> ->
         {:ok, {:binary.decode_unsigned(r), :binary.decode_unsigned(s)}}
 
       _other ->

@@ -297,6 +297,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Development and CI toolchain bumped to Elixir 1.20.4 / Erlang OTP 29.0.5;
+  CI now tests both the supported floor (Elixir 1.19 / OTP 27) and the
+  latest stack. The library still requires only `~> 1.19`. Bitstring
+  patterns that read a size from an outer variable now use the explicit
+  pin operator (`binary-size(^len)`), fixing the deprecation warnings the
+  Elixir 1.20 type checker emits for the implicit form. `credo` updated to
+  1.7.19 for Elixir 1.20 compatibility
 - `X402.Facilitator.verify/2..4` and `settle/2..4` now execute the HTTP
   request — including retries with backoff, lifecycle hooks, telemetry spans,
   and per-request auth header minting — in the calling process. The

@@ -10,8 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        elixir: ["1.19"]
-        otp: ["27"]
+        include:
+          - elixir: "1.19"
+            otp: "27"
+          - elixir: "1.20"
+            otp: "29"
     steps:
       - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
@@ -24,8 +27,8 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-v2-${{ hashFiles('mix.lock') }}
-          restore-keys: ${{ runner.os }}-mix-v2-
+          key: ${{ runner.os }}-mix-v3-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-v3-${{ matrix.elixir }}-${{ matrix.otp }}-
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix format --check-formatted
@@ -47,8 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        elixir: ["1.19"]
-        otp: ["27"]
+        elixir: ["1.20"]
+        otp: ["29"]
     steps:
       - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
