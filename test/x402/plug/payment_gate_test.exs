@@ -24,6 +24,7 @@ defmodule X402.Plug.PaymentGateTest do
   import Plug.Test
 
   alias X402.Client
+  alias X402.EIP3009
   alias X402.Extensions.PaymentIdentifier
   alias X402.Extensions.PaymentIdentifier.ETSCache
   alias X402.Facilitator
@@ -32,7 +33,9 @@ defmodule X402.Plug.PaymentGateTest do
   alias X402.PaymentResponse
   alias X402.Plug.PaymentGate
   alias X402.RPC
+  alias X402.Signer.LocalKey
   alias X402.Signer.SolanaKey
+  alias X402.TestRPCStub
 
   setup :verify_on_exit!
 
@@ -2227,6 +2230,78 @@ defmodule X402.Plug.PaymentGateTest do
       end
     end
 
+    test "init/1 accepts simulate: :counterfactual_only" do
+      opts =
+        PaymentGate.init(
+          routes: [@route],
+          local_verification: [level: :structural, simulate: :counterfactual_only]
+        )
+
+      assert opts.local_verification[:simulate] == :counterfactual_only
+    end
+
+    test ":full passes simulate: :counterfactual_only through to Verify.EVM" do
+      facilitator = start_mock_facilitator()
+
+      rpc_bypass = Bypass.open()
+      finch = String.to_atom("gate_rpc_finch_#{System.unique_integer([:positive, :monotonic])}")
+      start_supervised!(Supervisor.child_spec({Finch, name: finch}, id: finch))
+      rpc = TestRPCStub.stub_rpc(rpc_bypass, finch)
+
+      stub = TestRPCStub.defaults()
+
+      requirements = %{
+        "scheme" => "exact",
+        "network" => @network,
+        "amount" => @amount,
+        "asset" => stub.asset,
+        "payTo" => stub.pay_to,
+        "maxTimeoutSeconds" => 60,
+        "extra" => @eip712_extra
+      }
+
+      # The stub's configured payer is the address of this well-known key.
+      {:ok, signer} = LocalKey.new("0x" <> String.duplicate("11", 32))
+      {:ok, scheme_payload} = EIP3009.sign(requirements, signer, valid_after_buffer: 60)
+
+      header =
+        encode_header(%{
+          "x402Version" => 2,
+          "accepted" => requirements,
+          "payload" => scheme_payload
+        })
+
+      route = %{
+        method: :get,
+        path: "/api/resource",
+        price: @amount,
+        network: @network,
+        asset: stub.asset,
+        pay_to: stub.pay_to,
+        extra: @eip712_extra
+      }
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(
+          routes: [route],
+          facilitator: facilitator,
+          local_verification: [level: :full, rpc: rpc, simulate: :counterfactual_only]
+        )
+
+      assert conn.status == 200
+      assert_receive {:verify_called, _payload, _requirements}
+
+      # Local verification ran at :full against the RPC...
+      assert_received {:rpc, "eth_getCode", _params}
+
+      # ...and :counterfactual_only skipped the EOA transfer simulation —
+      # simulate: true (the default) would eth_call transferWithAuthorization.
+      refute_received {:rpc, "eth_call", [%{"data" => "0xe3ee160e" <> _}, _block]}
+      refute_received {:rpc, "eth_call", [%{"data" => "0xcf092995" <> _}, _block]}
+    end
+
     test ":structural passes a well-formed payment through to the facilitator" do
       facilitator = start_mock_facilitator()
       route = Map.put(@route, :extra, @eip712_extra)
@@ -2667,6 +2742,85 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 200
       assert conn.assigns[:x402_payment_id] == "pay-9"
+    end
+
+    test "accepts the info-wrapped envelope map form the echo matcher honors" do
+      facilitator = start_mock_facilitator()
+
+      # The route advertises the generic %{"info" => ..., "schema" => ...}
+      # envelope; the client's echo passes validate_extensions (the matcher
+      # unwraps "info" on both sides), so extraction must honor the same
+      # envelope instead of rejecting the payment as malformed.
+      route =
+        Map.put(@route, :extensions, %{
+          "paymentIdentifier" => %{"schema" => "https://x402.org/ext", "info" => %{}}
+        })
+
+      header =
+        valid_payment_payload()
+        |> Map.put("extensions", %{
+          "paymentIdentifier" => %{
+            "schema" => "https://x402.org/ext",
+            "info" => %{"paymentId" => "pay-env-1"}
+          }
+        })
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_payment_id] == "pay-env-1"
+    end
+
+    test "accepts the info-wrapped Base64 string form of the extension" do
+      facilitator = start_mock_facilitator()
+      {:ok, encoded} = PaymentIdentifier.encode("pay-env-2")
+
+      header =
+        valid_payment_payload()
+        |> Map.put("extensions", %{"paymentIdentifier" => %{"info" => encoded}})
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_payment_id] == "pay-env-2"
+    end
+
+    test "rejects info-wrapped garbage with 400 before any facilitator call" do
+      facilitator = start_mock_facilitator()
+
+      malformed_envelopes = [
+        %{"info" => "%%% not base64 %%%"},
+        %{"info" => %{}},
+        %{"info" => %{"paymentId" => ""}},
+        %{"info" => 42}
+      ]
+
+      for malformed <- malformed_envelopes do
+        conn =
+          conn(:get, "/api/resource")
+          |> put_req_header(
+            "payment-signature",
+            valid_payment_payload()
+            |> Map.put("extensions", %{"paymentIdentifier" => malformed})
+            |> encode_header()
+          )
+          |> run_request(routes: [@route], facilitator: facilitator)
+
+        assert conn.status == 400
+
+        assert decode_payment_required!(conn)["error"] ==
+                 "invalid payment identifier extension"
+      end
+
+      refute_received {:verify_called, _, _}
     end
 
     test "rejects a malformed extension with 400 before any facilitator call" do

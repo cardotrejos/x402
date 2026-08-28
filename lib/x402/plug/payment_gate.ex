@@ -311,9 +311,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         doc: "An `X402.RPC` configuration. Required for level `:full`."
       ],
       simulate: [
-        type: :boolean,
+        type: {:in, [true, false, :counterfactual_only]},
         default: true,
-        doc: "Whether level `:full` simulates the transfer via `eth_call`."
+        doc: """
+        Whether level `:full` simulates the transfer via `eth_call`.
+        `:counterfactual_only` skips the EOA/ERC-1271 transfer simulation
+        but keeps the atomic counterfactual deploy-and-transfer simulation
+        — the only possible proof of an ERC-6492 counterfactual signature.
+        """
       ],
       verify_chain_id: [
         type: :boolean,
@@ -1528,23 +1533,35 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    # The extension value may arrive in the generic `%{"info" => ...,
+    # "schema" => ...}` envelope form — the same envelope
+    # `X402.PaymentRequirements.extensions_match?/2` unwraps when validating
+    # the client's echo — so an echo that passes extension validation must
+    # not then be rejected as malformed. Mirror that unwrapping here before
+    # decoding; malformed content inside a present envelope is still a hard
+    # 400.
     @spec decode_client_payment_id(term()) ::
             {:ok, String.t()} | {:error, {:invalid_payment_identifier, term()}}
-    defp decode_client_payment_id(value) when is_binary(value) do
+    defp decode_client_payment_id(%{"info" => info}), do: decode_bare_payment_id(info)
+    defp decode_client_payment_id(value), do: decode_bare_payment_id(value)
+
+    @spec decode_bare_payment_id(term()) ::
+            {:ok, String.t()} | {:error, {:invalid_payment_identifier, term()}}
+    defp decode_bare_payment_id(value) when is_binary(value) do
       case PaymentIdentifier.decode(value) do
         {:ok, payment_id} -> {:ok, payment_id}
         {:error, reason} -> {:error, {:invalid_payment_identifier, reason}}
       end
     end
 
-    defp decode_client_payment_id(value) when is_map(value) do
+    defp decode_bare_payment_id(value) when is_map(value) do
       case PaymentIdentifier.fetch_payment_id(value) do
         {:ok, payment_id} -> {:ok, payment_id}
         {:error, reason} -> {:error, {:invalid_payment_identifier, reason}}
       end
     end
 
-    defp decode_client_payment_id(_value),
+    defp decode_bare_payment_id(_value),
       do: {:error, {:invalid_payment_identifier, :invalid_payment_id}}
 
     @spec maybe_assign_client_payment_id(Plug.Conn.t(), String.t() | nil) :: Plug.Conn.t()
