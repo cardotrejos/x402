@@ -155,11 +155,18 @@ defmodule X402.Solana.RPC do
   a signature the node does not know, or a map with its
   `confirmation_status` and `err` (non-`nil` when the transaction was
   included but failed on chain).
+
+  The request is issued with `searchTransactionHistory: true`. The node's
+  in-memory status cache only retains recent signatures, so pending-store
+  retries that arrive after a confirmed transaction ages out would otherwise
+  see `nil` and never observe the successful payment.
   """
   @spec get_signature_statuses(RPC.t(), [String.t()]) ::
           {:ok, [signature_status()]} | {:error, RPC.error()}
   def get_signature_statuses(%RPC{} = rpc, signatures) when is_list(signatures) do
-    with {:ok, result} <- RPC.request(rpc, "getSignatureStatuses", [signatures]),
+    config = %{"searchTransactionHistory" => true}
+
+    with {:ok, result} <- RPC.request(rpc, "getSignatureStatuses", [signatures, config]),
          {:ok, value} <- unwrap_value(result) do
       decode_statuses(value)
     end

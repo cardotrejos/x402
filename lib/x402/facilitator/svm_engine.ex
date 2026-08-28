@@ -870,7 +870,7 @@ defmodule X402.Facilitator.SVMEngine do
   end
 
   defp record_pending_or_terminal(
-         %{pending_settlement_store: store},
+         %{pending_settlement_store: store} = engine,
          txkey,
          entry,
          network,
@@ -883,10 +883,16 @@ defmodule X402.Facilitator.SVMEngine do
       {:error, reason} ->
         # A retry would have no record to reconcile against and would
         # re-broadcast blindly — downgrade to a terminal failure, keeping
-        # the signature in the response for manual reconciliation.
+        # the signature in the response for manual reconciliation. Release
+        # the dedup claim (like the no-store branch does) so a retry is not
+        # dead-ended at `duplicate_settlement`: without this, the claim
+        # outlives the missing pending record and the charged transaction
+        # cannot be reconciled or re-broadcast.
         Logger.warning(
           "x402 SVM settlement pending, but failed to persist for retry: #{inspect(reason)}"
         )
+
+        release_claim(engine, txkey)
 
         {:settled,
          failure_response(

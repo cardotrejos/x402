@@ -174,7 +174,10 @@ defmodule X402.Solana.RPCTest do
            %{"confirmationStatus" => "finalized", "err" => %{"InstructionError" => [0, 1]}}
          ])},
         fn request ->
-          assert %{"method" => "getSignatureStatuses", "params" => [[@signature]]} = request
+          assert %{
+                   "method" => "getSignatureStatuses",
+                   "params" => [[@signature], %{"searchTransactionHistory" => true}]
+                 } = request
         end
       )
 

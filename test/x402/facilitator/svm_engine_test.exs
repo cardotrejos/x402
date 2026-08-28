@@ -715,7 +715,9 @@ defmodule X402.Facilitator.SVMEngineTest do
                 }}
 
       refute_received {:solana_rpc, "sendTransaction", _params}
-      assert_received {:solana_rpc, "getSignatureStatuses", [[^signature]]}
+
+      assert_received {:solana_rpc, "getSignatureStatuses",
+                       [[^signature], %{"searchTransactionHistory" => true}]}
 
       # Delete-before-reconcile: the entry is consumed.
       assert PendingSettlementStore.get(store, txkey) == :miss
@@ -771,8 +773,11 @@ defmodule X402.Facilitator.SVMEngineTest do
     end
 
     test "a failing pending store downgrades settlement_pending to terminal", context do
+      cache = settlement_cache()
+
       engine =
         engine(context,
+          settlement_cache: cache,
           pending_settlement_store: {FailingPendingStore, :whatever},
           confirm_timeout_ms: 50,
           confirm_interval_ms: 10,
@@ -781,6 +786,7 @@ defmodule X402.Facilitator.SVMEngineTest do
 
       requirements = requirements()
       payload = signed_payload(requirements)
+      txkey = transaction_key(payload)
 
       log =
         capture_log(fn ->
@@ -795,6 +801,11 @@ defmodule X402.Facilitator.SVMEngineTest do
         end)
 
       assert log =~ "failed to persist for retry"
+
+      # The dedup claim is released so a retry can re-verify and
+      # re-broadcast — otherwise the store-write failure dead-ends the
+      # payment on `duplicate_settlement`.
+      assert Cache.get(cache, "svm:" <> txkey) == :miss
     end
 
     test "before_settle halts turn into failure responses", context do
