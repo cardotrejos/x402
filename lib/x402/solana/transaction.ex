@@ -454,7 +454,7 @@ defmodule X402.Solana.Transaction do
 
   defp take_chunks(binary, count, size, acc) do
     case binary do
-      <<chunk::binary-size(size), rest::binary>> ->
+      <<chunk::binary-size(^size), rest::binary>> ->
         take_chunks(rest, count - 1, size, [chunk | acc])
 
       _short ->
@@ -514,9 +514,9 @@ defmodule X402.Solana.Transaction do
 
   defp decode_instructions(<<program_index, rest::binary>>, count, acc) do
     with {:ok, num_accounts, rest} <- decode_compact_u16(rest),
-         <<indices::binary-size(num_accounts), rest::binary>> <- rest,
+         <<indices::binary-size(^num_accounts), rest::binary>> <- rest,
          {:ok, data_len, rest} <- decode_compact_u16(rest),
-         <<data::binary-size(data_len), rest::binary>> <- rest do
+         <<data::binary-size(^data_len), rest::binary>> <- rest do
       instruction = %{
         program_index: program_index,
         account_indices: :binary.bin_to_list(indices),
@@ -546,9 +546,9 @@ defmodule X402.Solana.Transaction do
 
   defp skip_lookups(<<_table::binary-size(32), rest::binary>>, count) do
     with {:ok, writable, rest} <- decode_compact_u16(rest),
-         <<_writable::binary-size(writable), rest::binary>> <- rest,
+         <<_writable::binary-size(^writable), rest::binary>> <- rest,
          {:ok, readonly, rest} <- decode_compact_u16(rest),
-         <<_readonly::binary-size(readonly), rest::binary>> <- rest do
+         <<_readonly::binary-size(^readonly), rest::binary>> <- rest do
       skip_lookups(rest, count - 1)
     else
       _error -> :error
