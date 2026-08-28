@@ -262,4 +262,51 @@ defmodule X402.Solana.TransactionTest do
              ]
     end
   end
+
+  describe "attach_signature/3" do
+    test "splices the fee-payer signature preserving the other slots" do
+      client_seed = :binary.copy(<<1>>, 32)
+      fee_payer_seed = :binary.copy(<<2>>, 32)
+      client_signature = :crypto.sign(:eddsa, :none, compiled().bytes, [client_seed, :ed25519])
+
+      wire = Transaction.serialize(compiled(), %{@client => client_signature})
+      {:ok, decoded} = Transaction.decode(wire)
+
+      fee_payer_signature =
+        :crypto.sign(:eddsa, :none, decoded.message_bytes, [fee_payer_seed, :ed25519])
+
+      assert {:ok, signed_wire} = Transaction.attach_signature(decoded, 0, fee_payer_signature)
+
+      # Round-trip: both slots filled, message bytes untouched.
+      assert {:ok, signed} = Transaction.decode(signed_wire)
+      assert signed.signatures == [fee_payer_signature, client_signature]
+      assert signed.message_bytes == decoded.message_bytes
+
+      {fee_payer_public, _private} = :crypto.generate_key(:eddsa, :ed25519, fee_payer_seed)
+
+      assert :crypto.verify(
+               :eddsa,
+               :none,
+               signed.message_bytes,
+               hd(signed.signatures),
+               [fee_payer_public, :ed25519]
+             )
+    end
+
+    test "rejects non-64-byte signatures instead of zero-filling" do
+      {:ok, decoded} = compiled() |> Transaction.serialize(%{}) |> Transaction.decode()
+
+      assert Transaction.attach_signature(decoded, 0, <<1, 2, 3>>) ==
+               {:error, :invalid_signature}
+
+      assert Transaction.attach_signature(decoded, 0, <<0::520>>) ==
+               {:error, :invalid_signature}
+    end
+
+    test "rejects out-of-range signature slots" do
+      {:ok, decoded} = compiled() |> Transaction.serialize(%{}) |> Transaction.decode()
+
+      assert Transaction.attach_signature(decoded, 2, <<1::512>>) == {:error, :invalid_slot}
+    end
+  end
 end

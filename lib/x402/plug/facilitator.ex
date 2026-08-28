@@ -1,17 +1,17 @@
 if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
   defmodule X402.Plug.Facilitator do
     @moduledoc """
-    Plug scaffold exposing an `X402.Facilitator.Engine` as the facilitator
-    HTTP API.
+    Plug scaffold exposing one or more facilitator engines as the
+    facilitator HTTP API.
 
     Serves the x402 v2 facilitator endpoints over any Plug-compatible server
     (Bandit, Cowboy, or mounted inside a Phoenix endpoint):
 
     | Endpoint                   | Behaviour                                          |
     | -------------------------- | -------------------------------------------------- |
-    | `POST /verify`             | `X402.Facilitator.Engine.verify/3`                 |
-    | `POST /settle`             | `X402.Facilitator.Engine.settle/3`                 |
-    | `GET /supported`           | `X402.Facilitator.Engine.supported/1`              |
+    | `POST /verify`             | the matching engine's `verify/3`                   |
+    | `POST /settle`             | the matching engine's `settle/3`                   |
+    | `GET /supported`           | the engines' `supported/1`, merged                 |
     | `GET /discovery/resources` | `404` — bazaar discovery serving is not included   |
 
     ## Usage
@@ -30,6 +30,25 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     Mount the plug at the root of its listener (or behind a `forward` that
     strips the prefix): it answers `404` for paths it does not serve.
+
+    ## Multiple engines
+
+    A facilitator serving several chain families passes `:engines` instead
+    of `:engine` — for example an EVM `X402.Facilitator.Engine` next to an
+    SVM `X402.Facilitator.SVMEngine`:
+
+        {X402.Plug.Facilitator, engines: [evm_engine, svm_engine]}
+
+    Exactly one of `:engine` and `:engines` must be given. `POST /verify`
+    and `POST /settle` dispatch to the first engine whose `supported/1`
+    kinds contain the request's `paymentRequirements` `(scheme, network)`
+    pair; when none matches, the request is answered with a `200`
+    protocol rejection (`unsupported_scheme`, or `invalid_network` when
+    some engine serves the scheme on other networks). `GET /supported`
+    merges the engines' responses — kinds concatenated, extensions
+    unioned, signer families merged. Any struct whose module exports
+    `verify/3`, `settle/3`, and `supported/1` with the engine wire
+    contract can be listed.
 
     ## Request/response contract
 
@@ -75,8 +94,21 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @options_schema [
       engine: [
         type: {:custom, Engine, :validate_config, []},
-        required: true,
-        doc: "The `X402.Facilitator.Engine` configuration built with `Engine.new/1`."
+        doc: """
+        A single `X402.Facilitator.Engine` configuration built with
+        `Engine.new/1`. Exactly one of `:engine` or `:engines` must be
+        given.
+        """
+      ],
+      engines: [
+        type: {:custom, __MODULE__, :validate_engines, []},
+        doc: """
+        A non-empty list of engine structs (`X402.Facilitator.Engine`,
+        `X402.Facilitator.SVMEngine`, or any struct whose module exports
+        `verify/3`, `settle/3`, and `supported/1`), dispatched by the
+        request's `(scheme, network)`. Exactly one of `:engine` or
+        `:engines` must be given.
+        """
       ],
       auth_token: [
         type: {:or, [:string, nil]},
@@ -99,14 +131,19 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @typedoc "Validated plug options."
     @type options :: %{
-            engine: Engine.t(),
+            engines: [struct()],
             auth_token: String.t() | nil,
             max_body_bytes: pos_integer()
           }
 
+    @engine_callbacks [verify: 3, settle: 3, supported: 1]
+
     @doc since: "0.6.0"
     @doc """
     Validates the plug options.
+
+    Exactly one of `:engine` and `:engines` must be given; both are
+    normalized to a list of engines internally.
 
     ## Options
 
@@ -120,6 +157,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         |> NimbleOptions.validate!(@options_schema)
         |> Map.new()
 
+      engines = resolve_engines(options)
+
       if is_nil(options.auth_token) do
         IO.warn(
           "[X402.Plug.Facilitator] auth_token is not configured. The verify " <>
@@ -132,6 +171,55 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
 
       options
+      |> Map.delete(:engine)
+      |> Map.put(:engines, engines)
+    end
+
+    @doc false
+    @spec validate_engines(term()) :: {:ok, [struct()]} | {:error, String.t()}
+    def validate_engines([_head | _tail] = engines) do
+      case Enum.all?(engines, &engine_struct?/1) do
+        true -> {:ok, engines}
+        false -> {:error, invalid_engines_message()}
+      end
+    end
+
+    def validate_engines(_other), do: {:error, invalid_engines_message()}
+
+    @spec engine_struct?(term()) :: boolean()
+    defp engine_struct?(%module{}), do: X402.Behaviour.implements?(module, @engine_callbacks)
+    defp engine_struct?(_other), do: false
+
+    @spec invalid_engines_message() :: String.t()
+    defp invalid_engines_message do
+      "expected a non-empty list of engine structs whose modules export " <>
+        "verify/3, settle/3, and supported/1 (e.g. X402.Facilitator.Engine, " <>
+        "X402.Facilitator.SVMEngine)"
+    end
+
+    # NimbleOptions cannot express "exactly one of" across keys, so the
+    # mutual exclusion is enforced here with the same exception type.
+    @spec resolve_engines(map()) :: [struct()]
+    defp resolve_engines(options) do
+      case {Map.get(options, :engine), Map.get(options, :engines)} do
+        {nil, nil} ->
+          raise %NimbleOptions.ValidationError{
+            key: :engine,
+            message: "exactly one of :engine or :engines must be given"
+          }
+
+        {engine, nil} when engine != nil ->
+          [engine]
+
+        {nil, engines} ->
+          engines
+
+        {_engine, _engines} ->
+          raise %NimbleOptions.ValidationError{
+            key: :engines,
+            message: ":engine and :engines are mutually exclusive — pass exactly one"
+          }
+      end
     end
 
     @doc since: "0.6.0"
@@ -158,7 +246,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       do: handle_operation(conn, options, :settle)
 
     defp dispatch(%Plug.Conn{method: "GET", path_info: ["supported"]} = conn, options),
-      do: send_json(conn, 200, Engine.supported(options.engine))
+      do: send_json(conn, 200, merged_supported(options.engines))
 
     defp dispatch(%Plug.Conn{path_info: path} = conn, _options)
          when path in [["verify"], ["settle"], ["supported"]],
@@ -186,15 +274,121 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec run_engine(Plug.Conn.t(), options(), :verify | :settle, map(), map()) :: Plug.Conn.t()
     defp run_engine(conn, options, operation, payment_payload, payment_requirements) do
-      case apply(Engine, operation, [options.engine, payment_payload, payment_requirements]) do
-        {:ok, response} ->
-          send_json(conn, 200, response)
+      scheme = payment_requirements["scheme"]
+      network = payment_requirements["network"]
 
-        {:error, reason} ->
-          # Opaque on the wire; the operator sees the real reason here.
-          Logger.error("x402 facilitator #{operation} failed: #{inspect(reason)}")
-          send_json(conn, 500, %{"error" => "internal_server_error"})
+      case select_engine(options.engines, scheme, network) do
+        {:ok, %module{} = engine} ->
+          case apply(module, operation, [engine, payment_payload, payment_requirements]) do
+            {:ok, response} ->
+              send_json(conn, 200, response)
+
+            {:error, reason} ->
+              # Opaque on the wire; the operator sees the real reason here.
+              Logger.error("x402 facilitator #{operation} failed: #{inspect(reason)}")
+              send_json(conn, 500, %{"error" => "internal_server_error"})
+          end
+
+        {:unsupported, reason} ->
+          # Facilitator convention: no matching engine is a protocol-level
+          # rejection, not a transport error.
+          send_json(conn, 200, unsupported_response(operation, reason, network))
       end
+    end
+
+    # -- Engine selection ---------------------------------------------------------
+
+    @spec select_engine([struct()], term(), term()) ::
+            {:ok, struct()} | {:unsupported, String.t()}
+    defp select_engine(engines, scheme, network) do
+      case Enum.find(engines, &engine_supports?(&1, scheme, network)) do
+        nil -> {:unsupported, no_engine_reason(engines, scheme)}
+        engine -> {:ok, engine}
+      end
+    end
+
+    @spec engine_supports?(struct(), term(), term()) :: boolean()
+    defp engine_supports?(engine, scheme, network) do
+      engine
+      |> engine_kinds()
+      |> Enum.any?(fn kind -> kind["scheme"] == scheme and kind["network"] == network end)
+    end
+
+    @spec engine_kinds(struct()) :: [map()]
+    defp engine_kinds(%module{} = engine) do
+      case module.supported(engine) do
+        %{"kinds" => kinds} when is_list(kinds) -> kinds
+        _other -> []
+      end
+    end
+
+    # A scheme some engine serves (on other networks) rejects with the
+    # narrower invalid_network; a scheme no engine serves at all with
+    # unsupported_scheme.
+    @spec no_engine_reason([struct()], term()) :: String.t()
+    defp no_engine_reason(engines, scheme) do
+      scheme_known? =
+        Enum.any?(engines, fn engine ->
+          Enum.any?(engine_kinds(engine), &(&1["scheme"] == scheme))
+        end)
+
+      case scheme_known? do
+        true -> "invalid_network"
+        false -> "unsupported_scheme"
+      end
+    end
+
+    @spec unsupported_response(:verify | :settle, String.t(), term()) :: map()
+    defp unsupported_response(:verify, reason, _network),
+      do: %{"isValid" => false, "invalidReason" => reason}
+
+    defp unsupported_response(:settle, reason, network) do
+      %{
+        "success" => false,
+        "errorReason" => reason,
+        "transaction" => "",
+        "network" => network_or_empty(network)
+      }
+    end
+
+    @spec network_or_empty(term()) :: String.t()
+    defp network_or_empty(network) when is_binary(network), do: network
+    defp network_or_empty(_network), do: ""
+
+    # -- GET /supported merging ---------------------------------------------------
+
+    @spec merged_supported([struct()]) :: map()
+    defp merged_supported(engines) do
+      responses = Enum.map(engines, fn %module{} = engine -> module.supported(engine) end)
+
+      %{
+        "kinds" => merge_lists(responses, "kinds"),
+        "extensions" => merge_lists(responses, "extensions"),
+        "signers" => merge_signers(responses)
+      }
+    end
+
+    @spec merge_lists([map()], String.t()) :: [term()]
+    defp merge_lists(responses, key) do
+      responses
+      |> Enum.flat_map(&List.wrap(Map.get(&1, key)))
+      |> Enum.uniq()
+    end
+
+    @spec merge_signers([map()]) :: %{optional(String.t()) => [String.t()]}
+    defp merge_signers(responses) do
+      responses
+      |> Enum.flat_map(fn response ->
+        case Map.get(response, "signers") do
+          %{} = signers -> Map.to_list(signers)
+          _other -> []
+        end
+      end)
+      |> Enum.reduce(%{}, fn {family, addresses}, acc ->
+        Map.update(acc, family, Enum.uniq(List.wrap(addresses)), fn existing ->
+          Enum.uniq(existing ++ List.wrap(addresses))
+        end)
+      end)
     end
 
     # -- Body parsing -----------------------------------------------------------

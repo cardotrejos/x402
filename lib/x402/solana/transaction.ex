@@ -287,6 +287,62 @@ defmodule X402.Solana.Transaction do
     encode_compact_u16(length(signers)) <> IO.iodata_to_binary(slots) <> message
   end
 
+  @doc since: "0.6.0"
+  @doc """
+  Splices a 64-byte Ed25519 signature into a decoded transaction's slot.
+
+  Rebuilds the wire transaction from a `decode/1` result — compact-u16
+  signature count, the signature slots with `signature` at `index`, then the
+  message bytes — **preserving** every other existing signature. This is how
+  a facilitator fills the fee payer's empty slot 0 at settlement without
+  disturbing the payer's signature.
+
+  Unlike `serialize/2` (which zero-fills missing signatures by design, the
+  partially-signed representation), a malformed signature here returns
+  `{:error, :invalid_signature}`: silently broadcasting a zeroed fee-payer
+  slot would only fail later on chain. An out-of-range `index` returns
+  `{:error, :invalid_slot}`.
+
+  ## Examples
+
+      iex> decoded = %{
+      ...>   num_required_signatures: 2,
+      ...>   signatures: [<<0::512>>, <<1::512>>],
+      ...>   message_bytes: <<0x80, 2, 1, 4>>
+      ...> }
+      iex> {:ok, wire} = X402.Solana.Transaction.attach_signature(decoded, 0, <<9::512>>)
+      iex> wire == <<2>> <> <<9::512>> <> <<1::512>> <> <<0x80, 2, 1, 4>>
+      true
+
+      iex> X402.Solana.Transaction.attach_signature(
+      ...>   %{num_required_signatures: 1, signatures: [<<0::512>>], message_bytes: <<0x80>>},
+      ...>   0,
+      ...>   <<1, 2, 3>>
+      ...> )
+      {:error, :invalid_signature}
+  """
+  @spec attach_signature(decoded(), non_neg_integer(), binary()) ::
+          {:ok, binary()} | {:error, :invalid_signature | :invalid_slot}
+  def attach_signature(
+        %{num_required_signatures: count, signatures: signatures, message_bytes: message},
+        index,
+        <<signature::binary-size(64)>>
+      )
+      when is_integer(index) and index >= 0 do
+    case index < count and index < length(signatures) do
+      true ->
+        slots = List.replace_at(signatures, index, signature)
+        {:ok, encode_compact_u16(count) <> IO.iodata_to_binary(slots) <> message}
+
+      false ->
+        {:error, :invalid_slot}
+    end
+  end
+
+  def attach_signature(%{signatures: _signatures}, index, signature)
+      when is_integer(index) and index >= 0 and is_binary(signature),
+      do: {:error, :invalid_signature}
+
   # -- Decode -----------------------------------------------------------------
 
   @doc since: "0.6.0"

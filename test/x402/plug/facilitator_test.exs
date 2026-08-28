@@ -6,8 +6,11 @@ defmodule X402.Plug.FacilitatorTest do
 
   alias X402.EIP3009
   alias X402.Facilitator.Engine
+  alias X402.Facilitator.SVMEngine
   alias X402.Plug.Facilitator, as: FacilitatorPlug
+  alias X402.Scheme.ExactSVM
   alias X402.Signer.LocalKey
+  alias X402.Signer.SolanaKey
 
   import X402.TestHelpers
 
@@ -19,6 +22,16 @@ defmodule X402.Plug.FacilitatorTest do
   @asset "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
   @network "eip155:84532"
   @tx_hash "0x" <> String.duplicate("cd", 32)
+
+  # SVM golden fixture keys (see test/x402/scheme/exact_svm_test.exs).
+  @svm_client_seed :binary.copy(<<1>>, 32)
+  @svm_client "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9"
+  @svm_fee_payer_seed :binary.copy(<<2>>, 32)
+  @svm_fee_payer "9hSR6S7WPtxmTojgo6GG3k4yDPecgJY292j7xrsUGWBu"
+  @svm_pay_to "GyGKxMyg1p9SsHfm15MkNUu1u9TN2JtTspcdmrtGUdse"
+  @svm_usdc "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  @svm_blockhash "EZ3rST5dvHmbanh75jc4PuLfV96vp9fEYBVeNk4FfM1k"
+  @svm_network "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 
   setup [:setup_bypass, :setup_finch]
 
@@ -98,6 +111,56 @@ defmodule X402.Plug.FacilitatorTest do
     Jason.decode!(conn.resp_body)
   end
 
+  # SVM fixtures for the multi-engine tests.
+
+  defp svm_requirements(overrides \\ %{}) do
+    Map.merge(
+      %{
+        "scheme" => "exact",
+        "network" => @svm_network,
+        "amount" => "1000",
+        "asset" => @svm_usdc,
+        "payTo" => @svm_pay_to,
+        "maxTimeoutSeconds" => 60,
+        "extra" => %{
+          "feePayer" => @svm_fee_payer,
+          "memo" => "pi_3abc123def456",
+          "recentBlockhash" => @svm_blockhash
+        }
+      },
+      overrides
+    )
+  end
+
+  defp svm_signed_payload(requirements) do
+    {:ok, client_signer} = SolanaKey.new(@svm_client_seed)
+    {:ok, scheme_payload} = ExactSVM.sign(requirements, client_signer, [])
+    %{"x402Version" => 2, "accepted" => requirements, "payload" => scheme_payload}
+  end
+
+  defp svm_engine(finch) do
+    svm_bypass = Bypass.open()
+    rpc = X402.TestSolanaRPCStub.stub_rpc(svm_bypass, finch)
+    {:ok, signer} = SolanaKey.new(@svm_fee_payer_seed)
+
+    {:ok, engine} =
+      SVMEngine.new(
+        rpc: rpc,
+        signer: signer,
+        networks: [@svm_network],
+        confirm_timeout_ms: 500,
+        confirm_interval_ms: 10
+      )
+
+    engine
+  end
+
+  defp multi_engine_options(context) do
+    single = plug_options(context)
+    [evm_engine] = single.engines
+    FacilitatorPlug.init(engines: [evm_engine, svm_engine(context.finch)])
+  end
+
   # -- init/1 -----------------------------------------------------------------
 
   describe "init/1" do
@@ -109,6 +172,34 @@ defmodule X402.Plug.FacilitatorTest do
       assert_raise NimbleOptions.ValidationError, fn ->
         FacilitatorPlug.init(engine: :nope)
       end
+    end
+
+    test "validates the engines list" do
+      assert_raise NimbleOptions.ValidationError, fn ->
+        FacilitatorPlug.init(engines: [])
+      end
+
+      assert_raise NimbleOptions.ValidationError, fn ->
+        FacilitatorPlug.init(engines: [:nope])
+      end
+
+      # Struct without the engine contract.
+      assert_raise NimbleOptions.ValidationError, fn ->
+        FacilitatorPlug.init(engines: [%URI{}])
+      end
+    end
+
+    test "engine and engines are mutually exclusive", context do
+      single = plug_options(context)
+      [engine] = single.engines
+
+      assert_raise NimbleOptions.ValidationError, fn ->
+        FacilitatorPlug.init(engine: engine, engines: [engine])
+      end
+    end
+
+    test "normalizes a single engine to the engines list", context do
+      assert %{engines: [%Engine{}]} = plug_options(context)
     end
   end
 
@@ -388,6 +479,118 @@ defmodule X402.Plug.FacilitatorTest do
         assert conn.status == 405
         assert json_response(conn) == %{"error" => "method_not_allowed"}
       end
+    end
+  end
+
+  # -- Multiple engines ---------------------------------------------------------
+
+  describe "multiple engines" do
+    test "routes verify by the requirements' network", context do
+      options = multi_engine_options(context)
+
+      evm_requirements = requirements()
+
+      evm_conn =
+        post_json(
+          options,
+          "/verify",
+          wire_body(signed_payload(evm_requirements), evm_requirements)
+        )
+
+      assert evm_conn.status == 200
+      assert json_response(evm_conn) == %{"isValid" => true, "payer" => @payer}
+
+      svm_requirements = svm_requirements()
+
+      svm_conn =
+        post_json(
+          options,
+          "/verify",
+          wire_body(svm_signed_payload(svm_requirements), svm_requirements)
+        )
+
+      assert svm_conn.status == 200
+      assert json_response(svm_conn) == %{"isValid" => true, "payer" => @svm_client}
+    end
+
+    test "routes settle to the SVM engine", context do
+      options = multi_engine_options(context)
+      svm_requirements = svm_requirements()
+
+      conn =
+        post_json(
+          options,
+          "/settle",
+          wire_body(svm_signed_payload(svm_requirements), svm_requirements)
+        )
+
+      assert conn.status == 200
+
+      assert %{
+               "success" => true,
+               "transaction" => signature,
+               "network" => @svm_network,
+               "payer" => @svm_client
+             } = json_response(conn)
+
+      assert signature != ""
+      assert_received {:solana_rpc, "sendTransaction", _params}
+    end
+
+    test "answers 200 protocol rejections when no engine matches", context do
+      options = multi_engine_options(context)
+      payload = signed_payload(requirements())
+
+      # A scheme some engine serves, on a network none does.
+      wrong_network = requirements(%{"network" => "eip155:1"})
+      conn = post_json(options, "/verify", wire_body(payload, wrong_network))
+      assert conn.status == 200
+      assert json_response(conn) == %{"isValid" => false, "invalidReason" => "invalid_network"}
+
+      # A scheme no engine serves.
+      wrong_scheme = requirements(%{"scheme" => "upto"})
+      conn = post_json(options, "/verify", wire_body(payload, wrong_scheme))
+      assert conn.status == 200
+
+      assert json_response(conn) == %{
+               "isValid" => false,
+               "invalidReason" => "unsupported_scheme"
+             }
+
+      conn = post_json(options, "/settle", wire_body(payload, wrong_network))
+      assert conn.status == 200
+
+      assert json_response(conn) == %{
+               "success" => false,
+               "errorReason" => "invalid_network",
+               "transaction" => "",
+               "network" => "eip155:1"
+             }
+    end
+
+    test "GET /supported merges kinds, extensions, and signers", context do
+      options = multi_engine_options(context)
+
+      conn = :get |> conn("/supported") |> FacilitatorPlug.call(options)
+
+      assert conn.status == 200
+
+      assert json_response(conn) == %{
+               "kinds" => [
+                 %{"x402Version" => 2, "scheme" => "exact", "network" => @network},
+                 %{
+                   "x402Version" => 2,
+                   "scheme" => "exact",
+                   "network" => @svm_network,
+                   "extra" => %{"feePayer" => @svm_fee_payer}
+                 }
+               ],
+               "extensions" => [],
+               "signers" => %{
+                 "eip155:*" => [@facilitator_address],
+                 "solana:*" => [@svm_fee_payer]
+               }
+             }
     end
   end
 end

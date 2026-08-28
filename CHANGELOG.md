@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SVM on-chain facilitator — `X402.Facilitator.SVMEngine`**: verify and
+  settle `exact` payments on `solana:*` networks yourself, completing the
+  facilitator role for Solana (previously client-signing + structural
+  validation only). `X402.Verify.SVM` runs the reference static-path
+  checklist locally — mandatory Ed25519 verification of every required
+  signer except the fee-payer slot (simulation runs `sigVerify: false`, so
+  local verification is the signature check), fee-payer identity and
+  isolation, the instruction whitelist via `X402.Scheme.ExactSVM`, and
+  `simulateTransaction` at `:full` — emitting the TypeScript reference's
+  `invalid_exact_svm_*` reason strings. Settlement co-signs the fee-payer
+  slot (`X402.Solana.Transaction.attach_signature/3`), broadcasts with
+  `skipPreflight: true`, polls `getSignatureStatuses` to
+  confirmed/finalized, and dedups duplicate settlements atomically
+  (`duplicate_settlement`, 120s TTL) through any
+  `X402.Extensions.PaymentIdentifier.Cache` adapter. `X402.Solana.RPC`
+  provides the underlying Solana JSON-RPC calls over the existing
+  `X402.RPC` transport. Transactions using address lookup tables are
+  rejected fail-closed
+- **Multi-engine `X402.Plug.Facilitator`**: the new `engines:` option
+  serves several engines from one endpoint, routed by the request's
+  (scheme, network) against each engine's `supported/1`; `GET /supported`
+  merges kinds, extensions, and signers across engines. A single EVM +
+  SVM facilitator process is now one Plug
+- **ERC-6492 counterfactual settlement** in `X402.Facilitator.Engine`:
+  with the new `eip6492_allowed_factories:` allowlist (default `[]` keeps
+  the previous fail-closed behavior), settlement of a payment signed by a
+  not-yet-deployed smart wallet broadcasts the wrapper's factory calldata
+  as its own transaction first — gated by the allowlist and the new
+  `max_deploy_gas_limit:` ceiling — then settles with the unwrapped inner
+  signature, mirroring the reference facilitators
+  (`eip6492_factory_not_allowed` / `smart_wallet_deployment_failed`).
+  `X402.Verify.EVM`'s `:simulate` option gains `:counterfactual_only` so
+  settle's independent re-verify keeps the atomic Multicall3
+  deploy-and-transfer proof even with simulation otherwise off
+- **Transfer-event verification on settlement receipts**: a confirmed
+  settlement is reported successful only when the receipt carries the
+  matching ERC-20 `Transfer(from, to, value)` log for the verified
+  payment (`invalid_exact_evm_transfer_event_mismatch` otherwise),
+  closing the gap between "transaction mined" and "payment delivered"
+- **Pending-settlement reconciliation** —
+  `X402.Facilitator.PendingSettlementStore` behaviour with a bundled
+  supervised ETS adapter (5-minute TTL): when a broadcast's confirmation
+  cannot be established, both engines record the transaction before
+  returning `settlement_pending`, and a retried settle reconciles against
+  the already-broadcast transaction (delete-before-reconcile) instead of
+  broadcasting twice. `X402.Plug.PaymentGate` complements it from the
+  resource-server side by retrying a `settlement_pending` settle exactly
+  once, mirroring the reference SDKs' `settleWithPendingRetry`
+- **Inline local verification in `X402.Plug.PaymentGate`** — the new
+  `local_verification:` option runs `X402.Verify.EVM` (at `:structural`,
+  `:signature`, or `:full` with an `X402.RPC` config) inside the gate
+  before the facilitator round-trip for exact-EVM payments; rejections
+  answer 402 with the canonical reason strings, infrastructure failures
+  fail closed as 500, and non-EVM kinds skip it (the facilitator remains
+  the authority)
+
 - `X402.Facilitator.NonceManager` — serializes fee-payer transaction nonces
   for concurrent settlements (fetch-once-then-increment, reset on broadcast
   rejection); pass to `X402.Facilitator.Engine.new/1` via `nonce_manager:`.
@@ -297,6 +353,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The dialyzer PLT filename now carries the OTP/Elixir versions
+  (`priv/plts/project-otp<release>-<version>.plt`), and the CI PLT cache no
+  longer falls back to other toolchains' entries — after a toolchain bump,
+  `mix dialyzer` builds a fresh PLT instead of slowly migrating the old
+  toolchain's file in place (the near-silent churn that read as a hang;
+  note the first run on a new OTP still spends several minutes building
+  the core PLTs)
 - Development and CI toolchain bumped to Elixir 1.20.4 / Erlang OTP 29.0.5;
   CI now tests both the supported floor (Elixir 1.19 / OTP 27) and the
   latest stack. The library still requires only `~> 1.19`. Bitstring
@@ -304,6 +367,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pin operator (`binary-size(^len)`), fixing the deprecation warnings the
   Elixir 1.20 type checker emits for the implicit form. `credo` updated to
   1.7.19 for Elixir 1.20 compatibility
+- **Replay/dedup keys are now canonical**: `X402.Plug.PaymentGate` keys
+  its replay claim on signature-covered payment identity — the EIP-3009
+  `from` + `nonce` for exact-EVM, the Permit2 owner + nonce for upto, and
+  the sha256 of the signed message bytes for exact-SVM — instead of the
+  raw header hash, so a re-encoded duplicate of the same authorization
+  (JSON key order, whitespace, Base64 variant) can no longer bypass
+  replay protection. Unknown schemes keep the raw-header-hash behavior.
+  The gate also decodes an echoed `payment_identifier` extension
+  (malformed → 400) and surfaces the client's `paymentId` in
+  `conn.assigns[:x402_payment_id]`, the settlement context, and telemetry
+  — deliberately **not** as the dedup key, which must never derive from
+  unsigned client-controlled fields
 - `X402.Facilitator.verify/2..4` and `settle/2..4` now execute the HTTP
   request — including retries with backoff, lifecycle hooks, telemetry spans,
   and per-request auth header minting — in the calling process. The

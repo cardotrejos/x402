@@ -17,9 +17,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
        equality, validity window); see the `:local_prechecks` option.
        Kinds with no registered scheme module skip straight to the
        facilitator.
-    5. Matched requirements are verified before the protected handler runs.
+    5. Matched requirements are verified before the protected handler runs —
+       optionally preceded by inline local verification through
+       `X402.Verify.EVM` (see the `:local_verification` option).
     6. Successful handler responses are settled immediately before they are
-       sent. Successful settlements attach a `PAYMENT-RESPONSE` header and assign
+       sent. A `settlement_pending` settle failure that already carries a
+       transaction hash is retried once, so the facilitator's pending store
+       can reconcile — mirroring the reference resource servers. Successful
+       settlements attach a `PAYMENT-RESPONSE` header and assign
        `:x402_payment_payload` / `:x402_payment_requirements` on the conn.
 
     HTTP status mapping (HTTP transport v2):
@@ -45,12 +50,28 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     ## Replay protection
 
-    When `:payment_identifier_cache` is configured, the gate claims the SHA-256
-    hash of the raw `PAYMENT-SIGNATURE` header through the
-    `X402.Extensions.PaymentIdentifier.Cache` behaviour before settling.
-    Duplicate proofs are rejected with **402** and the claim is released when
-    the protected handler responds with a status >= 400 or settlement fails,
-    so clients may retry a payment whose resource was never delivered.
+    When `:payment_identifier_cache` is configured, the gate claims a
+    canonical replay key for the payment proof through the
+    `X402.Extensions.PaymentIdentifier.Cache` behaviour before settling. The
+    key is derived from signature-covered content, so re-encoding the same
+    signed authorization (JSON key order, whitespace, Base64 variant) cannot
+    mint a fresh key:
+
+    * `"exact"` on `eip155:*` — the EIP-3009 authorization's `from` + `nonce`
+    * `"upto"` on `eip155:*` — the Permit2 authorization's `from` + `nonce`
+    * `"exact"` on `solana:*` — the SHA-256 of the transaction's signed
+      message bytes (immune to the mutable fee-payer signature slot)
+    * everything else — the SHA-256 hash of the raw `PAYMENT-SIGNATURE`
+      header, prefixed so families cannot collide. Re-encodings of the same
+      proof are distinct keys here, exactly as before canonical keys existed.
+
+    The key is **never** derived from client-controlled unsigned fields — in
+    particular not from the payment identifier extension's `paymentId`: a
+    replayer could vary it to mint a fresh key and bypass deduplication, or
+    squat another payment's id to deny it service. Duplicate proofs are
+    rejected with **402** and the claim is released when the protected
+    handler responds with a status >= 400 or settlement fails, so clients may
+    retry a payment whose resource was never delivered.
 
     The `:claim_order` option controls when the claim is taken relative to
     facilitator verification:
@@ -85,8 +106,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @behaviour Plug
 
+    alias X402.Extensions.PaymentIdentifier
     alias X402.Extensions.PaymentIdentifier.Cache
     alias X402.Extensions.PaymentIdentifier.ETSCache
+    alias X402.EIP712
     alias X402.Facilitator
     alias X402.Facilitator.Error
     alias X402.Hooks
@@ -96,8 +119,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     alias X402.PaymentResponse
     alias X402.PaymentSignature
     alias X402.Paywall
+    alias X402.RPC
     alias X402.Scheme
+    alias X402.Solana
     alias X402.Utils
+    alias X402.Verify
 
     require Logger
 
@@ -123,6 +149,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @precheck_time_buffer_seconds Scheme.EVM.time_buffer_seconds()
     @default_description "Payment required"
     @default_mime_type "application/json"
+    @payment_identifier_extension "paymentIdentifier"
+    @settlement_pending_reason "settlement_pending"
+    @local_verification_levels [:structural, :signature, :full]
 
     # Reasons that map to HTTP 400 Invalid Request (HTTP transport v2).
     @invalid_request_reasons [
@@ -266,6 +295,57 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       ]
     ]
 
+    # Mirrors X402.Verify.EVM's own option schema so init-time validation
+    # matches what verify/3 accepts at request time.
+    @local_verification_schema [
+      level: [
+        type: {:in, @local_verification_levels},
+        required: true,
+        doc: """
+        Verification depth passed to `X402.Verify.EVM.verify/3`.
+        `:structural` needs nothing, `:signature` needs the optional crypto
+        dependencies, `:full` additionally requires `:rpc`.
+        """
+      ],
+      rpc: [
+        type: {:custom, RPC, :validate_config, []},
+        doc: "An `X402.RPC` configuration. Required for level `:full`."
+      ],
+      simulate: [
+        type: {:in, [true, false, :counterfactual_only]},
+        default: true,
+        doc: """
+        Whether level `:full` simulates the transfer via `eth_call`.
+        `:counterfactual_only` skips the EOA/ERC-1271 transfer simulation
+        but keeps the atomic counterfactual deploy-and-transfer simulation
+        — the only possible proof of an ERC-6492 counterfactual signature.
+        """
+      ],
+      verify_chain_id: [
+        type: :boolean,
+        default: true,
+        doc: """
+        Whether level `:full` cross-checks `eth_chainId` against the CAIP-2
+        network in the requirements.
+        """
+      ],
+      eip6492_allowed_factories: [
+        type: {:list, :string},
+        default: [],
+        doc: """
+        Factory contract addresses trusted to deploy counterfactual ERC-6492
+        smart wallets (case-insensitive).
+        """
+      ],
+      multicall_address: [
+        type: :string,
+        doc: """
+        The Multicall3 contract used for atomic ERC-6492 deploy-and-transfer
+        simulation.
+        """
+      ]
+    ]
+
     @options_schema [
       facilitator: [
         type: :any,
@@ -339,6 +419,28 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         round-trip.
         """
       ],
+      local_verification: [
+        type: {:custom, __MODULE__, :validate_local_verification, []},
+        default: nil,
+        doc: """
+        Optional inline local verification through `X402.Verify.EVM`, run
+        before the facilitator verify. Accepts a level atom (`:structural`,
+        `:signature`, or `:full` — shorthand for `[level: level]`) or a
+        keyword list with `:level`, `:rpc` (an `X402.RPC` struct, required
+        for `:full`), `:simulate`, `:verify_chain_id`,
+        `:eip6492_allowed_factories`, and `:multicall_address` — see
+        `X402.Verify.EVM.verify/3` for their semantics. Local verification
+        only understands exact-EVM payments: it runs when the matched
+        requirements have scheme `"exact"` and an `eip155:*` network, and
+        is skipped silently for every other scheme/network combination —
+        the facilitator remains the authority, and still verifies and
+        settles payments local verification accepted. Verification failures
+        answer 402 exactly like a facilitator rejection (carrying the
+        canonical `invalidReason` string); infrastructure failures —
+        missing crypto dependencies, RPC errors, chain-id mismatches — fail
+        closed with 500. A configured level never silently downgrades.
+        """
+      ],
       paywall: [
         type: {:or, [nil, {:custom, Paywall, :validate_module, []}]},
         default: nil,
@@ -369,6 +471,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             routes: [compiled_route()],
             schemes: [module()],
             local_prechecks: boolean(),
+            local_verification: keyword() | nil,
             paywall: module() | nil
           }
 
@@ -404,6 +507,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             hooks: module(),
             payment_identifier_cache: Cache.adapter() | nil,
             payment_id: String.t(),
+            client_payment_id: String.t() | nil,
             payment_payload: map(),
             requirements: map(),
             route: compiled_route(),
@@ -456,6 +560,36 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     def validate_payment_identifier_cache(server), do: {:ok, {ETSCache, server}}
+
+    @doc false
+    @spec validate_local_verification(term()) :: {:ok, keyword() | nil} | {:error, String.t()}
+    def validate_local_verification(nil), do: {:ok, nil}
+
+    def validate_local_verification(level) when level in @local_verification_levels,
+      do: validate_local_verification(level: level)
+
+    def validate_local_verification(opts) when is_list(opts) do
+      case NimbleOptions.validate(opts, @local_verification_schema) do
+        {:ok, validated} -> ensure_full_level_rpc(validated)
+        {:error, error} -> {:error, Exception.message(error)}
+      end
+    end
+
+    def validate_local_verification(_other) do
+      {:error,
+       "expected nil, a verification level (:structural | :signature | :full), " <>
+         "or a keyword list with a :level"}
+    end
+
+    # Level :full without an RPC endpoint can only ever fail at request time
+    # ({:error, :rpc_not_configured}) — surface the misconfiguration at init.
+    @spec ensure_full_level_rpc(keyword()) :: {:ok, keyword()} | {:error, String.t()}
+    defp ensure_full_level_rpc(validated) do
+      case Keyword.fetch!(validated, :level) == :full and not Keyword.has_key?(validated, :rpc) do
+        true -> {:error, "level :full requires :rpc (an X402.RPC configuration)"}
+        false -> {:ok, validated}
+      end
+    end
 
     @doc false
     @spec validate_route(term(), [String.t()]) :: {:ok, map()} | {:error, String.t()}
@@ -518,6 +652,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           |> Enum.map(&compile_route/1),
         schemes: schemes,
         local_prechecks: Keyword.fetch!(validated_opts, :local_prechecks),
+        local_verification: Keyword.fetch!(validated_opts, :local_verification),
         paywall: Keyword.fetch!(validated_opts, :paywall)
       }
     end
@@ -644,10 +779,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           ) :: Plug.Conn.t()
     defp verify_and_prepare_settlement(conn, opts, route, request_method, request_path, header) do
       accepts = route_accepts(route)
-      payment_id = :crypto.hash(:sha256, header) |> Base.encode16(case: :lower)
 
       with {:ok, payment_payload, requirements} <-
              decode_and_validate_payment(header, accepts, route.extensions, opts.schemes),
+           {:ok, client_payment_id} <- extract_client_payment_id(payment_payload),
+           payment_id = replay_key(header, payment_payload, requirements),
            :ok <- run_local_prechecks(opts, payment_payload, requirements),
            :ok <- claim_and_verify(opts, payment_id, payment_payload, requirements) do
         settlement_context = %{
@@ -655,6 +791,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           hooks: opts.hooks,
           payment_identifier_cache: opts.payment_identifier_cache,
           payment_id: payment_id,
+          client_payment_id: client_payment_id,
           payment_payload: payment_payload,
           requirements: requirements,
           route: route,
@@ -665,6 +802,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         conn
         |> assign(:x402_payment_payload, payment_payload)
         |> assign(:x402_payment_requirements, requirements)
+        |> maybe_assign_client_payment_id(client_payment_id)
         |> register_before_send(fn response_conn ->
           settle_after_resource(response_conn, settlement_context)
         end)
@@ -734,13 +872,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
       case result do
         {:ok, settle_response} ->
-          complete_successful_settlement(
-            conn,
-            settle_response,
-            settlement_context.route,
-            settlement_context.request_method,
-            settlement_context.request_path
-          )
+          complete_successful_settlement(conn, settle_response, settlement_context)
 
         {:error, reason, settle_body} ->
           fail_settlement(conn, settlement_context, reason, settle_body || reason)
@@ -764,35 +896,29 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       )
     end
 
-    @spec complete_successful_settlement(
-            Plug.Conn.t(),
-            map(),
-            compiled_route(),
-            atom(),
-            String.t()
-          ) :: Plug.Conn.t()
-    defp complete_successful_settlement(
-           conn,
-           settle_response,
-           route,
-           request_method,
-           request_path
-         ) do
+    @spec complete_successful_settlement(Plug.Conn.t(), map(), settlement_context()) ::
+            Plug.Conn.t()
+    defp complete_successful_settlement(conn, settle_response, settlement_context) do
       case put_payment_response_header(conn, settle_response.body) do
         {:ok, response_conn} ->
-          emit(:payment_verified, %{
-            method: request_method,
-            path: request_path,
-            route: route.path
-          })
+          metadata = %{
+            method: settlement_context.request_method,
+            path: settlement_context.request_path,
+            route: settlement_context.route.path
+          }
+
+          emit(
+            :payment_verified,
+            maybe_put(metadata, :payment_id, settlement_context.client_payment_id)
+          )
 
           response_conn
 
         {:error, reason} ->
           emit(:payment_rejected, %{
-            method: request_method,
-            path: request_path,
-            route: route.path,
+            method: settlement_context.request_method,
+            path: settlement_context.request_path,
+            route: settlement_context.route.path,
             reason: reason
           })
 
@@ -899,6 +1025,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    # Mirrors the reference resource servers' settleWithPendingRetry: a
+    # success:false settle whose errorReason is "settlement_pending" AND
+    # that already carries a transaction hash means the facilitator
+    # submitted the transaction but had not confirmed it within its wait
+    # window — one immediate re-settle with the identical payload hits the
+    # facilitator's pending-store fast path and reconciles. Exactly one
+    # retry: a second pending, and every other failure, follows the normal
+    # failure path.
     @spec settle_with_hooks(
             Facilitator.server(),
             map(),
@@ -908,6 +1042,27 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             {:ok, map()}
             | {:error, term(), term()}
     defp settle_with_hooks(facilitator, payment_payload, requirements, hooks) do
+      case settle_once(facilitator, payment_payload, requirements, hooks) do
+        {:error, {:settlement_failed, _reason}, settle_body} = failure ->
+          case retryable_settlement_pending?(settle_body) do
+            true -> settle_once(facilitator, payment_payload, requirements, hooks)
+            false -> failure
+          end
+
+        result ->
+          result
+      end
+    end
+
+    @spec settle_once(
+            Facilitator.server(),
+            map(),
+            map(),
+            module()
+          ) ::
+            {:ok, map()}
+            | {:error, term(), term()}
+    defp settle_once(facilitator, payment_payload, requirements, hooks) do
       case facilitator_settle(facilitator, payment_payload, requirements, hooks) do
         {:ok, settle_response} when is_map(settle_response) ->
           case ensure_settle_success(settle_response) do
@@ -919,6 +1074,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           {:error, reason, nil}
       end
     end
+
+    @spec retryable_settlement_pending?(term()) :: boolean()
+    defp retryable_settlement_pending?(settle_body) when is_map(settle_body) do
+      transaction = Utils.map_value(settle_body, {"transaction", :transaction})
+
+      Utils.map_value(settle_body, {"errorReason", :errorReason}) ==
+        @settlement_pending_reason and is_binary(transaction) and transaction != ""
+    end
+
+    defp retryable_settlement_pending?(_settle_body), do: false
 
     # Orders the replay claim relative to facilitator verification.
     #
@@ -970,11 +1135,50 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec verify_payment(options(), map(), map()) :: :ok | {:error, term()}
     defp verify_payment(opts, payment_payload, requirements) do
-      with {:ok, verify_response} <-
+      with :ok <- run_local_verification(opts, payment_payload, requirements),
+           {:ok, verify_response} <-
              facilitator_verify(opts.facilitator, payment_payload, requirements, opts.hooks) do
         ensure_verify_success(verify_response)
       end
     end
+
+    # Inline local verification narrows the delegation gap before the
+    # facilitator round-trip; the facilitator remains the settlement
+    # authority and still verifies payments local verification accepted.
+    # X402.Verify.EVM only understands exact-EVM payments, so every other
+    # scheme/network combination skips it silently.
+    @spec run_local_verification(options(), map(), map()) :: :ok | {:error, term()}
+    defp run_local_verification(%{local_verification: nil}, _payload, _requirements), do: :ok
+
+    defp run_local_verification(%{local_verification: verify_opts}, payload, requirements) do
+      scheme = Utils.map_value(requirements, {"scheme", :scheme})
+      network = Utils.map_value(requirements, {"network", :network})
+
+      case exact_evm?(scheme, network) do
+        true -> local_verification_result(Verify.EVM.verify(payload, requirements, verify_opts))
+        false -> :ok
+      end
+    end
+
+    @spec exact_evm?(term(), term()) :: boolean()
+    defp exact_evm?("exact", "eip155:" <> _reference), do: true
+    defp exact_evm?(_scheme, _network), do: false
+
+    # {:invalid, reason} is a definitive rejection of the payment — surface
+    # it as the {:verification_failed, string} a facilitator rejection
+    # produces, so the 402 is indistinguishable from one. Every other error
+    # is an infrastructure failure (missing dependency, RPC trouble,
+    # misconfigured endpoint): fail closed rather than silently downgrade
+    # the configured level.
+    @spec local_verification_result({:ok, map()} | {:error, Verify.EVM.error()}) ::
+            :ok | {:error, term()}
+    defp local_verification_result({:ok, _verification}), do: :ok
+
+    defp local_verification_result({:error, {:invalid, reason}}),
+      do: {:error, {:verification_failed, Verify.EVM.reason_string(reason)}}
+
+    defp local_verification_result({:error, reason}),
+      do: {:error, {:local_verification_error, reason}}
 
     @spec claim_payment(Cache.adapter() | nil, String.t()) :: Cache.put_new_result()
     defp claim_payment(nil, _payment_id), do: :ok
@@ -1237,6 +1441,150 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    # SECURITY: the replay key MUST derive only from signature-covered
+    # content or, as a last resort, the raw header bytes — never from
+    # client-controlled unsigned fields. In particular never from the
+    # payment_identifier extension's paymentId: a replayer could vary it to
+    # mint a fresh key and bypass dedup, or squat another payment's id to
+    # deny it service. The per-family derivations below canonicalize the
+    # signed identity so re-encoding the same authorization (JSON key
+    # order, whitespace, Base64 variant) cannot mint a fresh key; families
+    # without a derivation fall back to the raw-header hash, prefixed so
+    # families can never collide.
+    @spec replay_key(String.t(), map(), map()) :: String.t()
+    defp replay_key(header, payment_payload, requirements) do
+      scheme = Utils.map_value(requirements, {"scheme", :scheme})
+      network = Utils.map_value(requirements, {"network", :network})
+      scheme_payload = Utils.map_value(payment_payload, {"payload", :payload})
+
+      case derive_replay_key(scheme, network, scheme_payload) do
+        {:ok, key} -> key
+        :error -> "hdr:" <> Base.encode16(:crypto.hash(:sha256, header), case: :lower)
+      end
+    end
+
+    # EIP-3009: the authorization's from + nonce are covered by the
+    # signature and uniquely identify the authorization on its network.
+    @spec derive_replay_key(term(), term(), term()) :: {:ok, String.t()} | :error
+    defp derive_replay_key("exact", "eip155:" <> _reference = network, scheme_payload)
+         when is_map(scheme_payload) do
+      scheme_payload
+      |> Utils.map_value({"authorization", :authorization})
+      |> signer_nonce_key("evm:", network)
+    end
+
+    # Permit2: the permit's owner (from) + nonce are covered by the
+    # PermitWitnessTransferFrom signature. The nonce is a uint256, so
+    # canonicalize it to its 32-byte encoding — equivalent JSON forms
+    # (`1`, `"1"`, `"01"`) must mint the same replay key so a re-encoded
+    # header cannot bypass dedup while sharing the same signature.
+    defp derive_replay_key("upto", "eip155:" <> _reference = network, scheme_payload)
+         when is_map(scheme_payload) do
+      with authorization when is_map(authorization) <-
+             Utils.map_value(scheme_payload, {"permit2Authorization", :permit2Authorization}),
+           from when is_binary(from) and from != "" <-
+             Utils.map_value(authorization, {"from", :from}),
+           {:ok, nonce_word} <-
+             EIP712.encode_uint256(Utils.map_value(authorization, {"nonce", :nonce})) do
+        {:ok,
+         "evm-upto:" <>
+           network <>
+           ":" <>
+           String.downcase(from) <> ":" <> Base.encode16(nonce_word, case: :lower)}
+      else
+        _other -> :error
+      end
+    end
+
+    # SVM: hash the signed message bytes, not the wire transaction — the
+    # fee-payer signature slot is mutable, so a facilitator co-signature
+    # (or a stripped slot) would mint a fresh key for the same signed
+    # message. Matches the reference SDKs' transactionMessageHash.
+    defp derive_replay_key("exact", "solana:" <> _reference = network, scheme_payload)
+         when is_map(scheme_payload) do
+      with transaction when is_binary(transaction) <-
+             Utils.map_value(scheme_payload, {"transaction", :transaction}),
+           {:ok, wire} <- Base.decode64(transaction),
+           {:ok, %{message_bytes: message_bytes}} <- Solana.Transaction.decode(wire) do
+        {:ok,
+         "svm:" <>
+           network <> ":" <> Base.encode16(:crypto.hash(:sha256, message_bytes), case: :lower)}
+      else
+        _other -> :error
+      end
+    end
+
+    defp derive_replay_key(_scheme, _network, _scheme_payload), do: :error
+
+    @spec signer_nonce_key(term(), String.t(), String.t()) :: {:ok, String.t()} | :error
+    defp signer_nonce_key(authorization, prefix, network) when is_map(authorization) do
+      from = Utils.map_value(authorization, {"from", :from})
+      nonce = Utils.map_value(authorization, {"nonce", :nonce})
+
+      case is_binary(from) and from != "" and is_binary(nonce) and nonce != "" do
+        true ->
+          {:ok,
+           prefix <> network <> ":" <> String.downcase(from) <> ":" <> String.downcase(nonce)}
+
+        false ->
+          :error
+      end
+    end
+
+    defp signer_nonce_key(_authorization, _prefix, _network), do: :error
+
+    # The echoed paymentId is surfaced for correlation only — never used as
+    # the replay key (see replay_key/3): it is client-controlled and not
+    # covered by any signature.
+    @spec extract_client_payment_id(map()) ::
+            {:ok, String.t() | nil} | {:error, {:invalid_payment_identifier, term()}}
+    defp extract_client_payment_id(payment_payload) do
+      with extensions when is_map(extensions) <-
+             Utils.map_value(payment_payload, {"extensions", :extensions}),
+           {:ok, value} <- Map.fetch(extensions, @payment_identifier_extension) do
+        decode_client_payment_id(value)
+      else
+        _absent -> {:ok, nil}
+      end
+    end
+
+    # The extension value may arrive in the generic `%{"info" => ...,
+    # "schema" => ...}` envelope form — the same envelope
+    # `X402.PaymentRequirements.extensions_match?/2` unwraps when validating
+    # the client's echo — so an echo that passes extension validation must
+    # not then be rejected as malformed. Mirror that unwrapping here before
+    # decoding; malformed content inside a present envelope is still a hard
+    # 400.
+    @spec decode_client_payment_id(term()) ::
+            {:ok, String.t()} | {:error, {:invalid_payment_identifier, term()}}
+    defp decode_client_payment_id(%{"info" => info}), do: decode_bare_payment_id(info)
+    defp decode_client_payment_id(value), do: decode_bare_payment_id(value)
+
+    @spec decode_bare_payment_id(term()) ::
+            {:ok, String.t()} | {:error, {:invalid_payment_identifier, term()}}
+    defp decode_bare_payment_id(value) when is_binary(value) do
+      case PaymentIdentifier.decode(value) do
+        {:ok, payment_id} -> {:ok, payment_id}
+        {:error, reason} -> {:error, {:invalid_payment_identifier, reason}}
+      end
+    end
+
+    defp decode_bare_payment_id(value) when is_map(value) do
+      case PaymentIdentifier.fetch_payment_id(value) do
+        {:ok, payment_id} -> {:ok, payment_id}
+        {:error, reason} -> {:error, {:invalid_payment_identifier, reason}}
+      end
+    end
+
+    defp decode_bare_payment_id(_value),
+      do: {:error, {:invalid_payment_identifier, :invalid_payment_id}}
+
+    @spec maybe_assign_client_payment_id(Plug.Conn.t(), String.t() | nil) :: Plug.Conn.t()
+    defp maybe_assign_client_payment_id(conn, nil), do: conn
+
+    defp maybe_assign_client_payment_id(conn, payment_id),
+      do: assign(conn, :x402_payment_id, payment_id)
+
     # Cheap local checks run before the facilitator round-trip, dispatched
     # to the X402.Scheme module resolved for the matched requirements'
     # scheme/network (X402.Scheme.EVM implements the built-in EVM checks).
@@ -1384,7 +1732,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       |> maybe_put("iconUrl", route.icon_url)
     end
 
-    @spec maybe_put(map(), String.t(), term()) :: map()
+    @spec maybe_put(map(), String.t() | atom(), term()) :: map()
     defp maybe_put(map, _key, nil), do: map
     defp maybe_put(map, _key, ""), do: map
     defp maybe_put(map, key, value), do: Map.put(map, key, value)
@@ -1588,11 +1936,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp status_for_reason({:invalid_fields, _fields}), do: 400
     defp status_for_reason(:invalid_payment_requirements), do: 400
     defp status_for_reason(:extension_echo_mismatch), do: 400
+    defp status_for_reason({:invalid_payment_identifier, _reason}), do: 400
     defp status_for_reason(:no_matching_requirements), do: 402
     defp status_for_reason(:already_exists), do: 402
     defp status_for_reason({:verification_failed, _reason}), do: 402
     defp status_for_reason({:settlement_failed, _reason}), do: 402
     defp status_for_reason(%Error{}), do: 500
+    defp status_for_reason({:local_verification_error, _reason}), do: 500
     defp status_for_reason({:unexpected_facilitator_status, _status}), do: 500
     defp status_for_reason({:malformed_facilitator_response, _operation}), do: 500
     defp status_for_reason({:invalid_settlement_amount, _reason}), do: 500
@@ -1685,6 +2035,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error({:invalid_fields, _fields}), do: "invalid_payload"
     defp rejection_error(:invalid_payment_requirements), do: "invalid_payload"
     defp rejection_error(:extension_echo_mismatch), do: "invalid_payload"
+
+    defp rejection_error({:invalid_payment_identifier, _reason}),
+      do: "invalid payment identifier extension"
+
     defp rejection_error({:verification_failed, _reason}), do: "facilitator rejected payment"
     defp rejection_error({:settlement_failed, _reason}), do: "facilitator rejected payment"
 
@@ -1695,6 +2049,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       do: "payment processing failed"
 
     defp rejection_error(%Error{}), do: "payment processing failed"
+    defp rejection_error({:local_verification_error, _reason}), do: "payment processing failed"
     defp rejection_error({:invalid_settlement_amount, _reason}), do: "payment processing failed"
 
     defp rejection_error({:payment_response_encoding_failed, _reason}),

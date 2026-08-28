@@ -128,6 +128,15 @@ defmodule X402.Verify.EVM do
   @typedoc "Requested verification depth."
   @type level :: :structural | :signature | :full
 
+  @typedoc """
+  Simulation mode for level `:full`.
+
+  `:counterfactual_only` skips the EOA/ERC-1271 transfer simulation like
+  `false`, but keeps the atomic ERC-6492 deploy-and-transfer simulation —
+  the only possible signature proof for an undeployed wallet.
+  """
+  @type simulate :: boolean() | :counterfactual_only
+
   @typedoc "How the payment signature was (or would be) verified."
   @type signature_type :: :eoa | :erc1271 | :erc6492_counterfactual
 
@@ -199,12 +208,15 @@ defmodule X402.Verify.EVM do
       doc: "An `X402.RPC` configuration. Required for level `:full`."
     ],
     simulate: [
-      type: :boolean,
+      type: {:in, [true, false, :counterfactual_only]},
       default: true,
       doc: """
       Whether level `:full` simulates `transferWithAuthorization` via
       `eth_call`. Counterfactual ERC-6492 payments always require simulation
-      and are rejected when it is disabled.
+      and are rejected when it is `false`; `:counterfactual_only` skips the
+      EOA/ERC-1271 transfer simulation but keeps the atomic counterfactual
+      deploy-and-transfer simulation, which is the only possible proof of a
+      counterfactual signature.
       """
     ],
     verify_chain_id: [
@@ -784,9 +796,10 @@ defmodule X402.Verify.EVM do
       String.downcase(parsed.factory) not in allowed ->
         {:error, {:invalid, :eip6492_factory_not_allowed}}
 
-      not Keyword.fetch!(opts, :simulate) ->
+      Keyword.fetch!(opts, :simulate) == false ->
         # A counterfactual signature is only ever proven by simulation;
         # without it the payment stays unproven — fail closed.
+        # (:counterfactual_only keeps exactly this proof running.)
         {:error, {:invalid, :undeployed_smart_wallet}}
 
       true ->
@@ -801,10 +814,13 @@ defmodule X402.Verify.EVM do
   defp maybe_simulate(rpc, ctx, parsed, :erc6492_counterfactual, opts),
     do: simulate_counterfactual(rpc, ctx, parsed, opts)
 
+  # Both `false` and `:counterfactual_only` skip here — under
+  # `:counterfactual_only` only the atomic counterfactual simulation (the
+  # clause above) runs.
   defp maybe_simulate(rpc, ctx, parsed, signature_type, opts) do
     case Keyword.fetch!(opts, :simulate) do
       true -> simulate_transfer(rpc, ctx, parsed, signature_type)
-      false -> :ok
+      _skip -> :ok
     end
   end
 
@@ -870,6 +886,16 @@ defmodule X402.Verify.EVM do
       reason -> {:error, {:invalid, reason}}
     end
   end
+
+  # Classifies a node revert (message plus any ABI-encoded Error(string)
+  # data) onto the canonical invalid reasons. Public so
+  # `X402.Facilitator.Engine` can classify `eth_estimateGas` reverts during
+  # settlement — e.g. a retry of an already-confirmed authorization must
+  # report `:nonce_already_used`, not a generic simulation failure. Returns
+  # `nil` when the revert text is unrecognized.
+  @doc false
+  @spec classify_revert(RPC.jsonrpc_error()) :: invalid_reason() | nil
+  def classify_revert(error), do: classify_revert_text(revert_text(error))
 
   # Combines the node's error message with any ABI-encoded Error(string)
   # revert reason carried in the error data.

@@ -20,6 +20,7 @@ defmodule X402.Telemetry do
   - `[:x402, :client, :request]`
   - `[:x402, :rpc, :request]`
   - `[:x402, :verify, :evm]`
+  - `[:x402, :verify, :svm]`
   - `[:x402, :facilitator_engine, :verify]`
   - `[:x402, :facilitator_engine, :settle]`
 
@@ -46,6 +47,7 @@ defmodule X402.Telemetry do
           | :build
           | :request
           | :evm
+          | :svm
           | :verify
           | :settle
   @type status :: :ok | :error

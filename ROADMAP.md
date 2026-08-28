@@ -60,15 +60,25 @@ covers EVM (`exact`/`upto`) and Solana (`exact`) schemes.
 - [ ] Security audit of crypto verification paths
 - [ ] Hex v1.0 publish
 
-## Follow-ups noted during the sprint
+## Follow-ups noted during the sprint — closed 2026-08-28
 
-- Wire `X402.Verify.EVM` into the gate / facilitator engine as an inline `before_verify` option (today
-  it is available for hook-based use and powers the engine).
-- Facilitator engine: counterfactual ERC-6492 *settlement* (deployed ERC-1271 wallets already settle),
-  and a pending-settlement reconciliation store beyond `settlement_pending`.
-- SVM: on-chain verify/settle (currently facilitator-delegated) once an SVM RPC layer lands.
-- Open the staged upstream e2e PR from the fork to `x402-foundation/x402`.
+- [x] `X402.Verify.EVM` wired into the gate as the inline `local_verification` option
+  (`:structural` / `:signature` / `:full`, exact-EVM only, fail-closed on infrastructure errors).
+- [x] Facilitator engine: counterfactual ERC-6492 settlement behind the `eip6492_allowed_factories`
+  allowlist (+ `max_deploy_gas_limit` ceiling), ERC-20 Transfer-event receipt verification, and
+  pending-settlement reconciliation (`X402.Facilitator.PendingSettlementStore` + ETS adapter,
+  delete-before-reconcile fast path); the gate retries a `settlement_pending` settle exactly once.
+- [x] SVM on-chain verify/settle: `X402.Solana.RPC`, `X402.Verify.SVM` (local Ed25519 + static path +
+  simulation, TS `invalid_exact_svm_*` reasons), `X402.Facilitator.SVMEngine` (fee-payer co-sign,
+  `duplicate_settlement` dedup, confirmation polling), and a multi-engine `X402.Plug.Facilitator`.
+- [x] Hardened replay keys: the gate's dedup claim now keys on signature-covered payment identity
+  (EIP-3009 from+nonce / Permit2 owner+nonce / SVM message-bytes hash) instead of raw header bytes,
+  and the `payment_identifier` extension's `paymentId` is decoded, validated, and surfaced.
+- [ ] Open the staged upstream e2e PR from the fork to `x402-foundation/x402`
+  (`cardotrejos/x402-1@feat/elixir-e2e-server` — merges cleanly at upstream HEAD; publishing it is a
+  maintainer action under the repo owner's name).
 
 ---
 
-*Last updated: 2026-08-27 — all P0/P1/P2 gap items merged.*
+*Last updated: 2026-08-28 — sprint follow-ups closed (inline verification, 6492 settlement,
+reconciliation, SVM facilitator, canonical replay keys).*
