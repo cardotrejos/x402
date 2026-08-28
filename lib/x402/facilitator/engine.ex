@@ -1461,7 +1461,10 @@ defmodule X402.Facilitator.Engine do
       Utils.nested_map_value(payload, [{"accepted", :accepted}, {"network", :network}]) || ""
   end
 
-  @spec asset(map()) :: String.t()
+  # Nil when the requirements are missing the field — re-verify rejects such
+  # requirements before any code that needs a real address runs, but the
+  # pending-store fast path builds its event context before re-verify.
+  @spec asset(map()) :: String.t() | nil
   defp asset(requirements), do: Utils.map_value(requirements, {"asset", :asset})
 
   @spec evm_network?(term()) :: boolean()
