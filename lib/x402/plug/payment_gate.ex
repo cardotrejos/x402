@@ -109,6 +109,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     alias X402.Extensions.PaymentIdentifier
     alias X402.Extensions.PaymentIdentifier.Cache
     alias X402.Extensions.PaymentIdentifier.ETSCache
+    alias X402.EIP712
     alias X402.Facilitator
     alias X402.Facilitator.Error
     alias X402.Hooks
@@ -1473,12 +1474,26 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     # Permit2: the permit's owner (from) + nonce are covered by the
-    # PermitWitnessTransferFrom signature.
+    # PermitWitnessTransferFrom signature. The nonce is a uint256, so
+    # canonicalize it to its 32-byte encoding — equivalent JSON forms
+    # (`1`, `"1"`, `"01"`) must mint the same replay key so a re-encoded
+    # header cannot bypass dedup while sharing the same signature.
     defp derive_replay_key("upto", "eip155:" <> _reference = network, scheme_payload)
          when is_map(scheme_payload) do
-      scheme_payload
-      |> Utils.map_value({"permit2Authorization", :permit2Authorization})
-      |> signer_nonce_key("evm-upto:", network)
+      with authorization when is_map(authorization) <-
+             Utils.map_value(scheme_payload, {"permit2Authorization", :permit2Authorization}),
+           from when is_binary(from) and from != "" <-
+             Utils.map_value(authorization, {"from", :from}),
+           {:ok, nonce_word} <-
+             EIP712.encode_uint256(Utils.map_value(authorization, {"nonce", :nonce})) do
+        {:ok,
+         "evm-upto:" <>
+           network <>
+           ":" <>
+           String.downcase(from) <> ":" <> Base.encode16(nonce_word, case: :lower)}
+      else
+        _other -> :error
+      end
     end
 
     # SVM: hash the signed message bytes, not the wire transaction — the
