@@ -100,6 +100,33 @@ defmodule X402.Plug.PaymentGateTest do
     def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
   end
 
+  # Replaces facilitator verify/settle results or errors with values the test
+  # stages in its process dictionary. Facilitator operations execute in the
+  # calling (test) process, so `Process.get/2` reads the staged value; without
+  # a staged value every callback passes the context through unchanged.
+  defmodule StagedResultHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+
+    def after_verify(%Context{} = context, _metadata),
+      do: {:cont, %Context{context | result: Process.get(:staged_verify_result, context.result)}}
+
+    def on_verify_failure(%Context{} = context, _metadata),
+      do: {:cont, %Context{context | error: Process.get(:staged_verify_error, context.error)}}
+
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+
+    def after_settle(%Context{} = context, _metadata),
+      do: {:cont, %Context{context | result: Process.get(:staged_settle_result, context.result)}}
+
+    def on_settle_failure(%Context{} = context, _metadata),
+      do: {:cont, %Context{context | error: Process.get(:staged_settle_error, context.error)}}
+  end
+
   @asset "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
   @receiver "0x1111111111111111111111111111111111111111"
   @network "eip155:84532"
@@ -2185,6 +2212,349 @@ defmodule X402.Plug.PaymentGateTest do
     test "init rejects modules that do not implement X402.Paywall" do
       assert_raise NimbleOptions.ValidationError, ~r/X402\.Paywall/, fn ->
         PaymentGate.init(routes: [@route], paywall: __MODULE__)
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Route and option validation edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "route and option validation edge cases" do
+    test "validate_route/1 validates a route map against the built-in schemes" do
+      assert {:ok, %{path: "/api/resource"}} = PaymentGate.validate_route(@route)
+    end
+
+    test "validate_route/1 rejects non-map routes" do
+      assert PaymentGate.validate_route(path: "/api/resource") ==
+               {:error, "expected a route map"}
+    end
+
+    test "validate_route/1 rejects non-atom route option keys" do
+      assert PaymentGate.validate_route(%{1 => "/api/resource"}) ==
+               {:error, "invalid route option key: 1"}
+    end
+
+    test "init/1 rejects non-map extra values" do
+      assert_raise NimbleOptions.ValidationError, ~r/expected a map/, fn ->
+        PaymentGate.init(routes: [Map.put(@route, :extra, "not-a-map")])
+      end
+    end
+
+    test "init/1 rejects non-binary prices" do
+      assert_raise NimbleOptions.ValidationError, ~r/digit-only/, fn ->
+        PaymentGate.init(routes: [Map.put(@route, :price, 10_000)])
+      end
+    end
+
+    test "accepts entries advertise only the supported payment flow" do
+      accept = %{
+        price: @amount,
+        network: @network,
+        asset: @asset,
+        pay_to: @receiver,
+        extra: %{"paymentFlow" => "authorization"}
+      }
+
+      route = %{method: :get, path: "/flow", accepts: [accept]}
+
+      assert {:ok, _validated} = PaymentGate.validate_route(route)
+
+      streaming = %{route | accepts: [put_in(accept, [:extra, "paymentFlow"], "streaming")]}
+
+      assert PaymentGate.validate_route(streaming) ==
+               {:error, ~s(unsupported payment flow: "streaming")}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Advertised requirements normalization
+  # ---------------------------------------------------------------------------
+
+  describe "advertised requirements normalization" do
+    test "omits empty serviceName and iconUrl from ResourceInfo" do
+      route = @route |> Map.put(:service_name, "") |> Map.put(:icon_url, "")
+
+      required =
+        conn(:get, "/api/resource")
+        |> run_request(routes: [route], facilitator: self())
+        |> decode_payment_required!()
+
+      refute Map.has_key?(required["resource"], "serviceName")
+      refute Map.has_key?(required["resource"], "iconUrl")
+    end
+
+    test "stringifies atom keys in advertised extra and extensions" do
+      route =
+        @route
+        |> Map.put(:extra, %{name: "USDC"})
+        |> Map.put(:extensions, %{payment_identifier: %{"info" => %{}}})
+
+      required =
+        conn(:get, "/api/resource")
+        |> run_request(routes: [route], facilitator: self())
+        |> decode_payment_required!()
+
+      assert [accept] = required["accepts"]
+      assert accept["extra"] == %{"name" => "USDC"}
+      assert required["extensions"] == %{"payment_identifier" => %{"info" => %{}}}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Payment payload rejection edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "payment payload rejection edge cases" do
+    test "rejects payloads whose accepted object has invalid field types" do
+      header =
+        valid_payment_payload()
+        |> put_in(["accepted", "amount"], 10_000)
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: self())
+
+      assert conn.status == 400
+      assert decode_payment_required!(conn)["error"] == "invalid_payload"
+    end
+
+    test "rejects oversized payment headers" do
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", String.duplicate("A", 8_193))
+        |> run_request(routes: [@route], facilitator: self())
+
+      assert conn.status == 400
+      assert decode_payment_required!(conn)["error"] == "invalid payment header"
+    end
+
+    test "skips local prechecks for kinds with no registered scheme module" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :network, "othernet:1")
+
+      header =
+        valid_payment_payload()
+        |> put_in(["accepted", "network"], "othernet:1")
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert_receive {:verify_called, _payload, %{"network" => "othernet:1"}}
+      assert_receive {:settle_called, _payload, _requirements}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Settlement amount edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "settlement amount edge cases" do
+    test "put_settlement_amount/2 normalizes integer amounts" do
+      assert {:ok, conn} = PaymentGate.put_settlement_amount(conn(:get, "/paid"), 7_500)
+      assert conn.private[:x402_settlement_amount] == "7500"
+    end
+
+    test "put_settlement_amount/2 rejects non-amount values" do
+      assert PaymentGate.put_settlement_amount(conn(:get, "/paid"), :free) ==
+               {:error, :invalid_settlement_amount}
+    end
+
+    test "settles an upto payment for a zero atomic amount" do
+      facilitator = start_mock_facilitator()
+
+      gated_conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_upto_payment_header(@amount))
+        |> gate_request(routes: [@upto_route], facilitator: facilitator)
+
+      assert {:ok, gated_conn} = PaymentGate.put_settlement_amount(gated_conn, "0")
+      response_conn = Plug.Conn.send_resp(gated_conn, 200, "free this time")
+
+      assert response_conn.status == 200
+      assert_receive {:settle_called, _payload, %{"amount" => "0"}}
+    end
+
+    test "fails closed when the settlement amount private is not an atomic amount" do
+      facilitator = start_mock_facilitator()
+
+      gated_conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_upto_payment_header(@amount))
+        |> gate_request(routes: [@upto_route], facilitator: facilitator)
+
+      tampered_conn = Plug.Conn.put_private(gated_conn, :x402_settlement_amount, :free)
+      response_conn = Plug.Conn.send_resp(tampered_conn, 200, "usage complete")
+
+      assert response_conn.status == 500
+      assert decode_payment_required!(response_conn)["error"] == "payment processing failed"
+      refute_received {:settle_called, _payload, _requirements}
+    end
+
+    test "does not settle when a before_send callback runs without a response status" do
+      facilitator = start_mock_facilitator()
+
+      gated_conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> gate_request(routes: [@route], facilitator: facilitator)
+
+      assert_receive {:verify_called, _payload, _requirements}
+      [settle_callback] = gated_conn.private[:before_send]
+
+      returned_conn = settle_callback.(gated_conn)
+
+      assert returned_conn.status == nil
+      assert get_resp_header(returned_conn, "payment-response") == []
+      refute_received {:settle_called, _payload, _requirements}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Facilitator response shape validation — hook-replaced results exercise the
+  # defensive clauses for responses the HTTP transport itself never produces.
+  # ---------------------------------------------------------------------------
+
+  describe "facilitator response shape validation" do
+    test "rejects verify results without a map body" do
+      facilitator = start_mock_facilitator()
+      Process.put(:staged_verify_result, %{status: 200, body: []})
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: StagedResultHooks)
+
+      assert conn.status == 500
+      assert decode_payment_required!(conn)["error"] == "payment processing failed"
+    end
+
+    test "rejects verify results with an unexpected HTTP status" do
+      facilitator = start_mock_facilitator()
+      Process.put(:staged_verify_result, %{status: 503})
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: StagedResultHooks)
+
+      assert conn.status == 500
+      assert decode_payment_required!(conn)["error"] == "payment processing failed"
+    end
+
+    test "rejects verify results without a status" do
+      facilitator = start_mock_facilitator()
+      Process.put(:staged_verify_result, %{})
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: StagedResultHooks)
+
+      assert conn.status == 500
+      assert decode_payment_required!(conn)["error"] == "payment processing failed"
+    end
+
+    test "rejects settle results without a map body" do
+      facilitator = start_mock_facilitator()
+      Process.put(:staged_settle_result, %{status: 200, body: []})
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: StagedResultHooks)
+
+      assert conn.status == 500
+      assert decode_payment_required!(conn)["error"] == "payment processing failed"
+      assert get_resp_header(conn, "payment-response") == []
+    end
+
+    test "rejects settle results with an unexpected HTTP status" do
+      facilitator = start_mock_facilitator()
+      Process.put(:staged_settle_result, %{status: 502})
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: StagedResultHooks)
+
+      assert conn.status == 500
+      assert decode_payment_required!(conn)["error"] == "payment processing failed"
+    end
+
+    test "rejects settle results without a status" do
+      facilitator = start_mock_facilitator()
+      Process.put(:staged_settle_result, %{})
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: StagedResultHooks)
+
+      assert conn.status == 500
+      assert decode_payment_required!(conn)["error"] == "payment processing failed"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Facilitator failure reason mapping
+  # ---------------------------------------------------------------------------
+
+  describe "facilitator failure reason mapping" do
+    test "surfaces a binary settlement failure reason as a PAYMENT-RESPONSE" do
+      facilitator = start_mock_facilitator(settle: {:ok, %{status: 500, body: %{}}})
+      Process.put(:staged_settle_error, {:settlement_failed, "facilitator exploded"})
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: StagedResultHooks)
+
+      assert conn.status == 402
+
+      assert decode_payment_response!(conn) == %{
+               "success" => false,
+               "errorReason" => "facilitator exploded",
+               "transaction" => "",
+               "network" => ""
+             }
+    end
+
+    test "stringifies non-binary settlement failure reasons" do
+      facilitator = start_mock_facilitator(settle: {:ok, %{status: 500, body: %{}}})
+      Process.put(:staged_settle_error, {:settlement_failed, :insufficient_funds})
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator, hooks: StagedResultHooks)
+
+      assert conn.status == 402
+      assert decode_payment_response!(conn)["errorReason"] == "insufficient_funds"
+    end
+
+    test "maps hook-normalized verify failure reasons onto transport statuses" do
+      for {reason, status, error} <- [
+            {{:unsupported_x402_version, 1}, 400, "unsupported x402 version"},
+            {:invalid_payment_requirements, 400, "invalid_payload"},
+            {{:payment_response_encoding_failed, :boom}, 500, "payment processing failed"}
+          ] do
+        facilitator = start_mock_facilitator(verify: {:ok, %{status: 500, body: %{}}})
+        Process.put(:staged_verify_error, reason)
+
+        conn =
+          conn(:get, "/api/resource")
+          |> put_req_header("payment-signature", valid_payment_header())
+          |> run_request(routes: [@route], facilitator: facilitator, hooks: StagedResultHooks)
+
+        assert conn.status == status
+        assert decode_payment_required!(conn)["error"] == error
       end
     end
   end

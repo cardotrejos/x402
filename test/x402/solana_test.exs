@@ -55,6 +55,16 @@ defmodule X402.SolanaTest do
         refute Solana.on_curve?(pubkey)
       end
     end
+
+    test "points with x = 0 are on the curve only with a zero sign bit" do
+      # y = 1 solves x^2 = (y^2 - 1) / (d*y^2 + 1) with x = 0; RFC 8032
+      # requires the sign bit to be 0 when x = 0.
+      y_one = <<1>> <> :binary.copy(<<0>>, 31)
+      assert Solana.on_curve?(y_one)
+
+      y_one_negative_sign = <<1>> <> :binary.copy(<<0>>, 30) <> <<0x80>>
+      refute Solana.on_curve?(y_one_negative_sign)
+    end
   end
 
   describe "find_program_address/2" do

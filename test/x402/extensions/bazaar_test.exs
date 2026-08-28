@@ -291,6 +291,56 @@ defmodule X402.Extensions.BazaarTest do
       assert ext["info"]["output"] == %{"type" => "json", "example" => %{"ok" => true}}
     end
 
+    test "accepts a string-keyed map with format and schema entries" do
+      ext =
+        Bazaar.build_extension(
+          method: :get,
+          output: %{
+            "type" => "json",
+            "format" => "iso8601",
+            "example" => %{"at" => "2026-01-01"},
+            "schema" => %{"properties" => %{"at" => %{"type" => "string"}}}
+          }
+        )
+
+      assert ext["info"]["output"]["format"] == "iso8601"
+
+      example_schema = ext["schema"]["properties"]["output"]["properties"]["example"]
+      assert example_schema["type"] == "object"
+      assert example_schema["properties"] == %{"at" => %{"type" => "string"}}
+    end
+
+    test "a custom schema without an example still declares an object" do
+      ext =
+        Bazaar.build_extension(
+          method: :get,
+          output: [schema: %{"minProperties" => 1}]
+        )
+
+      assert ext["schema"]["properties"]["output"]["properties"]["example"] == %{
+               "type" => "object",
+               "minProperties" => 1
+             }
+    end
+
+    test "examples with no JSON equivalent leave the example schema open" do
+      ext = Bazaar.build_extension(method: :get, output: [example: :pending])
+
+      assert ext["info"]["output"]["example"] == :pending
+      assert ext["schema"]["properties"]["output"]["properties"]["example"] == %{}
+    end
+
+    test "empty-string optional info fields are omitted" do
+      ext =
+        Bazaar.build_extension(
+          tool_name: "t",
+          input_schema: %{"type" => "object"},
+          description: ""
+        )
+
+      refute Map.has_key?(ext["info"]["input"], "description")
+    end
+
     test "applies to MCP input as well" do
       ext =
         Bazaar.build_extension(tool_name: "t", input_schema: %{"type" => "object"}, output: [])
@@ -397,6 +447,27 @@ defmodule X402.Extensions.BazaarTest do
       assert_raise NimbleOptions.ValidationError, ~r/unknown :output option/, fn ->
         Bazaar.build_extension(method: :get, output: %{"bogus" => 1})
       end
+    end
+
+    test "raises on mistyped output entries" do
+      assert_raise NimbleOptions.ValidationError, ~r/output/, fn ->
+        Bazaar.build_extension(method: :get, output: [type: 123])
+      end
+    end
+
+    test "validate_output/1 reports the failing option" do
+      assert {:error, message} = Bazaar.validate_output(type: 123)
+      assert message =~ ":type"
+
+      assert {:error, message} = Bazaar.validate_output("json")
+      assert message =~ "expected a keyword list or map"
+    end
+
+    test "validate_map/1 rejects non-map values" do
+      assert Bazaar.validate_map(%{"type" => "object"}) == {:ok, %{"type" => "object"}}
+
+      assert {:error, message} = Bazaar.validate_map("not a map")
+      assert message =~ "expected a map"
     end
   end
 
@@ -509,6 +580,40 @@ defmodule X402.Extensions.BazaarTest do
                Bazaar.list_resources(facilitator, limit: 0)
     end
 
+    test "list_resources/1 applies parameters to the default facilitator name" do
+      # Parameter validation happens before the default X402.Facilitator
+      # process is consulted, so the delegation is observable without one.
+      assert {:error, %NimbleOptions.ValidationError{}} = Bazaar.list_resources(limit: 0)
+    end
+
+    test "parse_resource/1 rejects mistyped or missing required fields" do
+      assert {:error, {:invalid_field, "resource"}} =
+               Bazaar.parse_resource(%{@valid_item | "resource" => 123})
+
+      assert {:error, {:invalid_field, "x402Version"}} =
+               Bazaar.parse_resource(%{@valid_item | "x402Version" => "2"})
+
+      assert {:error, {:missing_field, "x402Version"}} =
+               Bazaar.parse_resource(Map.delete(@valid_item, "x402Version"))
+
+      assert {:error, {:missing_field, "accepts"}} =
+               Bazaar.parse_resource(Map.delete(@valid_item, "accepts"))
+
+      assert {:error, {:missing_field, "lastUpdated"}} =
+               Bazaar.parse_resource(Map.delete(@valid_item, "lastUpdated"))
+    end
+
+    test "parse_resource/1 treats explicit nil optional fields as absent" do
+      item =
+        @valid_item
+        |> Map.put("description", nil)
+        |> Map.put("metadata", nil)
+
+      assert {:ok, parsed} = Bazaar.parse_resource(item)
+      assert parsed.description == nil
+      assert parsed.metadata == nil
+    end
+
     test "parse_resource/1 rejects mistyped optional fields" do
       assert {:error, {:invalid_field, "metadata"}} =
                Bazaar.parse_resource(%{@valid_item | "metadata" => "finance"})
@@ -550,6 +655,26 @@ defmodule X402.Extensions.BazaarTest do
       assert [^multi_network, ^legacy_amount] = Bazaar.filter_by_max_price(resources, 500)
       assert [^multi_network] = Bazaar.filter_by_max_price(resources, 250)
       assert [] = Bazaar.filter_by_max_price(resources, "50")
+    end
+
+    test "filter_by_max_price/2 skips entries without an amount or with junk accepts" do
+      amountless = %{
+        resource: "https://amountless.example",
+        accepts: [%{"scheme" => "exact", "network" => "eip155:1"}]
+      }
+
+      junk_accepts = %{
+        resource: "https://junk.example",
+        accepts: ["not-a-requirements-map"]
+      }
+
+      affordable = %{
+        resource: "https://cheap.example",
+        accepts: [%{"scheme" => "exact", "amount" => "100"}]
+      }
+
+      assert Bazaar.filter_by_max_price([amountless, junk_accepts, affordable], "500") ==
+               [affordable]
     end
 
     test "filter_by_max_price/2 raises on an unparsable maximum" do

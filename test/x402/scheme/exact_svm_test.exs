@@ -296,6 +296,48 @@ defmodule X402.Scheme.ExactSVMTest do
     test "signable? requires a requirements map" do
       refute ExactSVM.signable?(nil)
     end
+
+    test "signable? rejects requirements whose extra is not a map" do
+      refute ExactSVM.signable?(%{
+               "asset" => @usdc,
+               "payTo" => @pay_to,
+               "extra" => "nope"
+             })
+    end
+
+    test "accepts integer amounts" do
+      assert ExactSVM.sign(requirements(%{"amount" => 1000}), signer(), []) ==
+               {:ok, %{"transaction" => @reference_transaction}}
+    end
+
+    test "unknown mints with only :svm_decimals default to the SPL Token program" do
+      unknown_mint = Base58.encode(:crypto.strong_rand_bytes(32))
+      reqs = requirements(%{"asset" => unknown_mint})
+
+      assert {:ok, %{"transaction" => encoded}} =
+               ExactSVM.sign(reqs, signer(), svm_decimals: 9)
+
+      {:ok, decoded} = encoded |> Base.decode64!() |> Transaction.decode()
+      transfer_ix = Enum.at(decoded.instructions, 2)
+      assert transfer_ix.data == <<12, 1000::64-little, 9>>
+
+      {:ok, token_program} = Solana.decode_address(Solana.token_program())
+      assert Enum.at(decoded.static_accounts, transfer_ix.program_index) == token_program
+    end
+
+    test "known Token-2022 mints resolve to the Token-2022 program" do
+      usdg = "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH"
+
+      assert {:ok, %{"transaction" => encoded}} =
+               ExactSVM.sign(requirements(%{"asset" => usdg}), signer(), [])
+
+      {:ok, decoded} = encoded |> Base.decode64!() |> Transaction.decode()
+      transfer_ix = Enum.at(decoded.instructions, 2)
+      assert transfer_ix.data == <<12, 1000::64-little, 6>>
+
+      {:ok, token_2022} = Solana.decode_address(Solana.token_2022_program())
+      assert Enum.at(decoded.static_accounts, transfer_ix.program_index) == token_2022
+    end
   end
 
   describe "validate_payload/3" do
@@ -354,6 +396,13 @@ defmodule X402.Scheme.ExactSVMTest do
                {:error, {:invalid_scheme_payment, :missing_transaction}}
 
       assert ExactSVM.validate_payload(%{}, reqs, []) ==
+               {:error, {:invalid_scheme_payment, :missing_transaction}}
+    end
+
+    test "treats a non-map envelope as a missing transaction" do
+      {_payload, reqs} = signed_payload()
+
+      assert ExactSVM.validate_payload("nope", reqs, []) ==
                {:error, {:invalid_scheme_payment, :missing_transaction}}
     end
   end
@@ -542,6 +591,43 @@ defmodule X402.Scheme.ExactSVMTest do
 
       assert ExactSVM.precheck(%{"payload" => %{"transaction" => "!"}}, reqs, []) ==
                {:error, {:precheck_failed, :invalid_transaction}}
+    end
+
+    test "rejects valid Base64 that is not a Solana transaction" do
+      {_payload, reqs} = signed_payload()
+      garbage = Base.encode64(:crypto.strong_rand_bytes(50))
+
+      assert ExactSVM.precheck(%{"payload" => %{"transaction" => garbage}}, reqs, []) ==
+               {:error, {:precheck_failed, :invalid_transaction}}
+    end
+
+    test "rejects instructions referencing out-of-range account indices" do
+      {_payload, reqs} = signed_payload()
+
+      # Hand-crafted wire: 1 signature slot, two static accounts, and three
+      # instructions whose single account index (5) is out of range. The
+      # fee payer (index 0) is never referenced, so only the range check can
+      # reject it.
+      instruction = <<1, 1, 5, 0>>
+
+      message =
+        <<0x80, 1, 0, 0>> <>
+          <<2>> <>
+          :binary.copy(<<7>>, 32) <>
+          :binary.copy(<<8>>, 32) <>
+          :binary.copy(<<9>>, 32) <>
+          <<3>> <> instruction <> instruction <> instruction <> <<0>>
+
+      wire = <<1>> <> <<0::512>> <> message
+      payload = %{"payload" => %{"transaction" => Base.encode64(wire)}}
+
+      assert ExactSVM.precheck(payload, reqs, []) ==
+               {:error, {:precheck_failed, :invalid_transaction}}
+    end
+
+    test "skips the memo check when extra is not a map" do
+      {payload, reqs} = signed_payload()
+      assert ExactSVM.precheck(payload, Map.put(reqs, "extra", "nope"), []) == :ok
     end
   end
 

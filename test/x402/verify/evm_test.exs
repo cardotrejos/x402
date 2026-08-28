@@ -142,6 +142,52 @@ defmodule X402.Verify.EVMTest do
 
   defp authorization_state_request?(_request), do: false
 
+  # Like stub_rpc/2, but answers HTTP 500 whenever fail_500? matches the
+  # decoded request body — for driving non-JSONRPC transport failures into
+  # one specific call while the rest of the flow proceeds normally.
+  defp stub_rpc_500_on(%{bypass: bypass, finch: finch}, overrides, fail_500?) do
+    config = Map.merge(stub_defaults(), Map.new(overrides))
+    test_pid = self()
+
+    Bypass.expect(bypass, "POST", "/", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      decoded = Jason.decode!(body)
+
+      case fail_500?.(decoded) do
+        true ->
+          Plug.Conn.resp(conn, 500, "boom")
+
+        false ->
+          response = rpc_response(decoded, config, test_pid)
+
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.resp(200, Jason.encode!(response))
+      end
+    end)
+
+    {:ok, rpc} = RPC.new(rpc_url: "http://localhost:#{bypass.port}", finch: finch)
+    rpc
+  end
+
+  defp rpc_response(requests, config, test_pid) when is_list(requests) do
+    diagnosis? = diagnosis_batch?(requests)
+    Enum.map(requests, &handle_rpc(&1, config, test_pid, diagnosis?))
+  end
+
+  defp rpc_response(request, config, test_pid),
+    do: handle_rpc(request, config, test_pid, false)
+
+  defp single_call?(%{"method" => "eth_call", "params" => [%{"data" => data} | _rest]}, selector),
+    do: String.starts_with?(data, selector)
+
+  defp single_call?(_decoded, _selector), do: false
+
+  defp diagnosis_batch?(requests) when is_list(requests),
+    do: Enum.any?(requests, &authorization_state_request?/1)
+
+  defp diagnosis_batch?(_decoded), do: false
+
   defp handle_rpc(
          %{"id" => id, "method" => method, "params" => params},
          config,
@@ -157,6 +203,8 @@ defmodule X402.Verify.EVMTest do
   end
 
   defp rpc_result("eth_chainId", [], %{chain_id: :invalid}, _diagnosis?), do: {:ok, "0x"}
+
+  defp rpc_result("eth_chainId", [], %{chain_id: {:raw, value}}, _diagnosis?), do: {:ok, value}
 
   defp rpc_result("eth_chainId", [], config, _diagnosis?),
     do: {:ok, "0x" <> Integer.to_string(config.chain_id, 16)}
@@ -772,6 +820,33 @@ defmodule X402.Verify.EVMTest do
                EVM.verify(payload, requirements, level: :full, rpc: rpc)
     end
 
+    test "treats a non-string payer bytecode result as no code", context do
+      rpc = stub_rpc(context, %{code: %{String.downcase(@asset) => "0x6001", @payer => 123}})
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert {:ok, %{signature_type: :eoa}} =
+               EVM.verify(payload, requirements, level: :full, rpc: rpc)
+    end
+
+    test "fails closed on an unparsable chain id quantity", context do
+      rpc = stub_rpc(context, %{chain_id: {:raw, "0xzz"}})
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert EVM.verify(payload, requirements, level: :full, rpc: rpc) ==
+               {:error, {:rpc_error, {:invalid_response, "0xzz"}}}
+    end
+
+    test "fails closed when the simulation call fails at transport level", context do
+      rpc = stub_rpc_500_on(context, %{}, &single_call?(&1, "0xe3ee160e"))
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert EVM.verify(payload, requirements, level: :full, rpc: rpc) ==
+               {:error, {:rpc_error, {:http_error, 500}}}
+    end
+
     test "accepts EOA signatures with a 0/1 recovery byte", context do
       rpc = stub_rpc(context, %{})
       requirements = requirements()
@@ -902,6 +977,20 @@ defmodule X402.Verify.EVMTest do
 
       assert EVM.verify(contract_payload(requirements), requirements, level: :full, rpc: rpc) ==
                {:error, {:invalid, :invalid_signature}}
+    end
+
+    test "fails closed when isValidSignature fails at transport level", context do
+      rpc =
+        stub_rpc_500_on(
+          context,
+          %{code: %{String.downcase(@asset) => "0x6001", @smart_wallet => "0x6001"}},
+          &single_call?(&1, "0x1626ba7e")
+        )
+
+      requirements = requirements()
+
+      assert EVM.verify(contract_payload(requirements), requirements, level: :full, rpc: rpc) ==
+               {:error, {:rpc_error, {:http_error, 500}}}
     end
 
     test "unwraps ERC-6492 for a deployed wallet and passes the inner signature", context do
@@ -1064,6 +1153,20 @@ defmodule X402.Verify.EVMTest do
                {:error, {:invalid, :simulation_failed}}
     end
 
+    test "fails closed when the multicall simulation fails at transport level", context do
+      rpc = stub_rpc_500_on(context, %{}, &single_call?(&1, "0x82ad56cb"))
+      requirements = requirements()
+
+      assert EVM.verify(
+               counterfactual_payload(requirements),
+               requirements,
+               level: :full,
+               rpc: rpc,
+               eip6492_allowed_factories: [@factory]
+             ) ==
+               {:error, {:rpc_error, {:http_error, 500}}}
+    end
+
     test "rejects a counterfactual wrapper with an empty inner signature", context do
       rpc = stub_rpc(context, %{})
       requirements = requirements()
@@ -1152,6 +1255,32 @@ defmodule X402.Verify.EVMTest do
 
     test "tolerates an undecodable token name string", context do
       assert verify_with_revert(context, %{token_name: {:raw, "0x12"}}) ==
+               {:error, {:invalid, :simulation_failed}}
+    end
+
+    test "tolerates non-string probe results and a failing balance probe", context do
+      # authorizationState and name() return JSON numbers (not hex strings),
+      # and the diagnosis balanceOf reverts — none of it is conclusive.
+      assert verify_with_revert(context, %{
+               authorization_state: {:raw, 42},
+               token_name: {:raw, 42},
+               diagnosis_balance: :revert
+             }) ==
+               {:error, {:invalid, :simulation_failed}}
+    end
+
+    test "fails closed when the diagnosis batch fails at transport level", context do
+      rpc =
+        stub_rpc_500_on(
+          context,
+          %{simulate: {:revert, "opaque failure"}},
+          &diagnosis_batch?/1
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert EVM.verify(payload, requirements, level: :full, rpc: rpc) ==
                {:error, {:invalid, :simulation_failed}}
     end
 

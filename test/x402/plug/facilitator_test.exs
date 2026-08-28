@@ -22,6 +22,16 @@ defmodule X402.Plug.FacilitatorTest do
 
   setup [:setup_bypass, :setup_finch]
 
+  defmodule UnreadableBodyAdapter do
+    @moduledoc false
+
+    # Wraps the Plug test adapter but fails every body read, driving the
+    # read_body {:error, reason} branch.
+    defdelegate send_resp(state, status, headers, body), to: Plug.Adapters.Test.Conn
+
+    def read_req_body(_state, _opts), do: {:error, :timeout}
+  end
+
   # -- Fixtures ---------------------------------------------------------------
 
   defp requirements(overrides \\ %{}) do
@@ -300,6 +310,25 @@ defmodule X402.Plug.FacilitatorTest do
 
       assert conn.status == 413
       assert json_response(conn) == %{"error" => "payload_too_large"}
+    end
+
+    test "rejects an unreadable body with 400", context do
+      options = plug_options(context)
+
+      conn = conn(:post, "/verify", "ignored")
+      {Plug.Adapters.Test.Conn, state} = conn.adapter
+
+      conn =
+        %{conn | adapter: {UnreadableBodyAdapter, state}}
+        |> put_req_header("content-type", "application/json")
+        |> FacilitatorPlug.call(options)
+
+      assert conn.status == 400
+
+      assert json_response(conn) == %{
+               "error" => "invalid_request",
+               "reason" => "unreadable_body"
+             }
     end
   end
 

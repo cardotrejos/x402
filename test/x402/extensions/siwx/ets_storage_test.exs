@@ -55,6 +55,51 @@ defmodule X402.Extensions.SIWX.ETSStorageTest do
       assert ETSStorage.put(storage, "0xabc", "/paid/resource", %{}, -1) ==
                {:error, :invalid_arguments}
     end
+
+    test "returns not_found for malformed get inputs" do
+      {storage, _table} = start_storage()
+
+      assert ETSStorage.get(storage, :bad, "/paid/resource") == {:error, :not_found}
+      assert ETSStorage.get(storage, "0xabc", nil) == {:error, :not_found}
+    end
+
+    test "returns :ok for malformed delete inputs" do
+      {storage, _table} = start_storage()
+
+      assert ETSStorage.delete(storage, :bad, "/paid/resource") == :ok
+      assert ETSStorage.delete(storage, "0xabc", nil) == :ok
+    end
+
+    test "get/2, put/4, and delete/2 use the default storage server" do
+      # Register the default name with a test-specific table so the default
+      # delegates are exercised without claiming the default table name.
+      start_supervised!(
+        {ETSStorage, name: X402.Extensions.SIWX.ETSStorage, table: unique_atom("default_table")}
+      )
+
+      assert :ok = ETSStorage.put("0xabc", "/paid/resource", %{"tx" => "0x1"}, 5_000)
+
+      assert {:ok, record} = ETSStorage.get("0xabc", "/paid/resource")
+      assert record.payment_proof == %{"tx" => "0x1"}
+
+      assert :ok = ETSStorage.delete("0xabc", "/paid/resource")
+      assert ETSStorage.get("0xabc", "/paid/resource") == {:error, :not_found}
+    end
+
+    test "put/5 refuses new entries once max_size is reached" do
+      name = unique_atom("storage")
+      table = unique_atom("table")
+
+      storage = start_supervised!({ETSStorage, name: name, table: table, max_size: 1})
+
+      assert :ok = ETSStorage.put(storage, "0xabc", "/paid/resource", %{"tx" => "0x1"}, 5_000)
+
+      # Updating an existing key never grows the table and stays allowed.
+      assert :ok = ETSStorage.put(storage, "0xabc", "/paid/resource", %{"tx" => "0x2"}, 5_000)
+
+      assert ETSStorage.put(storage, "0xdef", "/paid/resource", %{"tx" => "0x3"}, 5_000) ==
+               {:error, :storage_full}
+    end
   end
 
   describe "ttl behavior" do

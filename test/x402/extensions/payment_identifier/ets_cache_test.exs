@@ -118,6 +118,66 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
     assert {:hit, :verified} = ETSCache.get(cache, "payment-1")
   end
 
+  test "get/2 with a named cache reads the ETS table directly" do
+    name = String.to_atom("ets_cache_named_#{System.unique_integer([:positive, :monotonic])}")
+
+    start_supervised!(%{
+      id: {:ets_cache, System.unique_integer([:positive, :monotonic])},
+      start: {ETSCache, :start_link, [[name: name, ttl_ms: 60_000]]}
+    })
+
+    assert :ok = ETSCache.put(name, "payment-1", :verified)
+
+    # A registered atom name is also the named-table name — the lookup happens
+    # in the calling process without a GenServer round trip.
+    assert {:hit, :verified} = ETSCache.get(name, "payment-1")
+    assert :miss = ETSCache.get(name, "payment-unknown")
+  end
+
+  test "get/2 with a named cache treats expired direct reads as misses" do
+    name = String.to_atom("ets_cache_expired_#{System.unique_integer([:positive, :monotonic])}")
+
+    start_supervised!(%{
+      id: {:ets_cache, System.unique_integer([:positive, :monotonic])},
+      start: {ETSCache, :start_link, [[name: name, ttl_ms: 10, cleanup_interval_ms: 60_000]]}
+    })
+
+    assert :ok = ETSCache.put(name, "payment-1", :verified)
+    Process.sleep(20)
+
+    assert :miss = ETSCache.get(name, "payment-1")
+  end
+
+  test "get/2 falls back to the server when the atom is not a named table" do
+    # Started under a :global name, so the cache owns an unnamed table.
+    global_name = {:global, {:ets_cache_global, System.unique_integer([:positive, :monotonic])}}
+
+    pid =
+      start_supervised!(%{
+        id: {:ets_cache, System.unique_integer([:positive, :monotonic])},
+        start: {ETSCache, :start_link, [[name: global_name, ttl_ms: 60_000]]}
+      })
+
+    alias_name =
+      String.to_atom("ets_cache_alias_#{System.unique_integer([:positive, :monotonic])}")
+
+    Process.register(pid, alias_name)
+
+    assert :ok = ETSCache.put(alias_name, "payment-1", :verified)
+
+    # :ets.lookup(alias_name, ...) raises ArgumentError (no such table), so
+    # the read is served through the GenServer instead.
+    assert {:hit, :verified} = ETSCache.get(alias_name, "payment-1")
+  end
+
+  test "put_new/3 rejects invalid values and payment identifiers" do
+    cache = start_cache(ttl_ms: 1_000)
+
+    assert {:error, :invalid_cache_value} = ETSCache.put_new(cache, "payment-1", :unknown)
+    assert {:error, :invalid_payment_id} = ETSCache.put_new(cache, :invalid, :verified)
+    assert :miss = ETSCache.get(cache, "payment-1")
+  end
+
   test "put_new/3 refuses new entries at max_size without evicting live claims" do
     cache = start_cache(ttl_ms: 1_000, max_size: 2)
 

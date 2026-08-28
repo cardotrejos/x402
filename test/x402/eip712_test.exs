@@ -145,4 +145,25 @@ defmodule X402.EIP712Test do
       assert EIP712.digest(%{}, <<0::256>>) == {:error, {:missing_field, "name"}}
     end
   end
+
+  describe "word encoders" do
+    test "encode_address/1 rejects non-binary values" do
+      assert EIP712.encode_address(nil) == {:error, :invalid_address}
+      assert EIP712.encode_address(42) == {:error, :invalid_address}
+    end
+
+    test "encode_bytes32/1 rejects values without a 0x prefix" do
+      assert EIP712.encode_bytes32(String.duplicate("ab", 32)) == {:error, :invalid_bytes32}
+      assert EIP712.encode_bytes32(nil) == {:error, :invalid_bytes32}
+    end
+
+    test "encode_dynamic_bytes/1 does not pad 32-byte-aligned data" do
+      aligned = :binary.copy(<<0xAB>>, 32)
+
+      assert EIP712.encode_dynamic_bytes(aligned) ==
+               <<32::unsigned-big-integer-size(256)>> <> aligned
+
+      assert EIP712.encode_dynamic_bytes(<<>>) == <<0::unsigned-big-integer-size(256)>>
+    end
+  end
 end

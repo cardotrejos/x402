@@ -192,5 +192,74 @@ defmodule X402.Solana.TransactionTest do
       truncated = <<2>> <> <<0::512>> <> <<0::512>> <> body <> <<1, 7>>
       assert Transaction.decode(truncated) == {:error, :invalid_transaction}
     end
+
+    test "rejects an empty message section" do
+      # Zero signatures and nothing after them: there is no message to parse.
+      assert Transaction.decode(<<0>>) == {:error, :invalid_transaction}
+    end
+
+    test "rejects a message body shorter than the three-byte header" do
+      # v0 version prefix followed by a single header byte.
+      assert Transaction.decode(<<0, 0x80, 1>>) == {:error, :invalid_transaction}
+    end
+
+    test "rejects an instruction section shorter than its declared count" do
+      # Header claims one instruction but the section is empty.
+      message =
+        <<0x80, 1, 0, 0>> <>
+          <<1>> <> :binary.copy(<<7>>, 32) <> :binary.copy(<<9>>, 32) <> <<1>>
+
+      assert Transaction.decode(<<0>> <> message) == {:error, :invalid_transaction}
+    end
+  end
+
+  describe "account ordering case tiebreak" do
+    # Three valid 32-byte addresses whose Base58 strings differ only in
+    # letter case, so the case-insensitive primary comparison ties and the
+    # @solana/kit lowercase-first tiebreak decides the order — plus two
+    # addresses whose binary order ("Z" before "a") is the reverse of their
+    # case-insensitive order ("a" before "z").
+    @fold_low "9fqXgrwWsBPkaXj1GYZLxGnBKqeNZYJ1TxR8MxZ1Wyzk"
+    @fold_up_f "9FqXgrwWsBPkaXj1GYZLxGnBKqeNZYJ1TxR8MxZ1Wyzk"
+    @fold_up_q "9fQXgrwWsBPkaXj1GYZLxGnBKqeNZYJ1TxR8MxZ1Wyzk"
+    @lower_a "akCe1Z7oU33i21MxoQC8mHVMyEXewLrQn3WvCsEq1B6"
+    @upper_z "ZA24VttNsMsrMtaz2xxzSXnK4SS1EEGD7Nz7cZ7MPNe"
+
+    test "case-insensitively equal addresses sort lowercase-first" do
+      group = [@fold_low, @fold_up_f, @fold_up_q, @lower_a, @upper_z]
+
+      for address <- group do
+        assert {:ok, pubkey} = Solana.decode_address(address)
+        assert byte_size(pubkey) == 32
+      end
+
+      instruction = %{
+        program: Solana.memo_program(),
+        accounts:
+          Enum.map(group, fn address ->
+            %{address: address, signer?: false, writable?: true}
+          end),
+        data: "x"
+      }
+
+      {:ok, compiled} = Transaction.compile(@fee_payer, [instruction], @blockhash)
+      {:ok, decoded} = Transaction.decode(Transaction.serialize(compiled, %{}))
+
+      decoded_accounts =
+        Enum.map(decoded.static_accounts, fn pubkey -> X402.Base58.encode(pubkey) end)
+
+      # Writable non-signers sort between the fee payer and the read-only
+      # program, case-insensitively ("a…" before "Z…"), with ties broken
+      # lowercase-first at the earliest differing position.
+      assert decoded_accounts == [
+               @fee_payer,
+               @fold_low,
+               @fold_up_q,
+               @fold_up_f,
+               @lower_a,
+               @upper_z,
+               Solana.memo_program()
+             ]
+    end
   end
 end

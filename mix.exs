@@ -18,6 +18,15 @@ defmodule X402.MixProject do
       # Hex
       description: @description,
       package: package(),
+      hex: [
+        # cowlib advisories with no fixed release yet (2.19.0 is the latest);
+        # cowlib is test-only here, via bypass -> plug_cowboy -> cowboy.
+        ignore_advisories: [
+          "EEF-CVE-2026-43966",
+          "EEF-CVE-2026-43969",
+          "EEF-CVE-2026-43971"
+        ]
+      ],
 
       # Docs
       name: "X402",
@@ -26,7 +35,7 @@ defmodule X402.MixProject do
       docs: docs(),
 
       # Testing
-      test_coverage: [tool: ExCoveralls, minimum_coverage: 90],
+      test_coverage: [tool: ExCoveralls, minimum_coverage: 95],
 
       # Dialyzer
       dialyzer: [
