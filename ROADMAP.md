@@ -5,14 +5,14 @@
 > [docs/ecosystem-comparison.md](docs/ecosystem-comparison.md) (§8); item tags
 > (P0.1, P1.4, …) reference its numbering.
 
-## Current State (v0.5.x)
+## Current State (v0.6.x)
 
 ✅ x402 v2 protocol primitives (PaymentRequired / PaymentSignature / PaymentResponse, 8KB header caps)
 ✅ Plug middleware (PaymentGate): verify-before-handler, settle-after-response, replay claim, extension echo
 ✅ Facilitator client (verify/settle) with CDP JWT auth and Ecto-style runtime config
 ✅ Extensions: payment_identifier (ETS cache), SIWX (local EIP-191 recovery), bazaar builder
 ✅ Lifecycle hooks, telemetry spans, wallet validation (EVM + Solana)
-✅ >90% coverage, dialyzer-clean, live CDP smoke tests, published on Hex.pm
+✅ 95% coverage floor, dialyzer-clean, live CDP smoke tests, published on Hex.pm
 
 ## Gap-closure sprint — all P0/P1/P2 items shipped
 
@@ -54,10 +54,17 @@ covers EVM (`exact`/`upto`) and Solana (`exact`) schemes.
 
 ## Next up — production polish (v1.0)
 
+Release gates for the stable API:
+
+- [ ] Independent security audit of the crypto verification and settlement paths
+- [ ] Official upstream e2e harness acceptance plus a passing cross-language run
+- [ ] Live EVM exact/upto and SVM exact settlement matrix, including Redis replay
+  protection and pending-settlement reconciliation
+- [ ] Public API, error-contract, and migration-policy stability review
+
 - [ ] LiveDashboard integration, rate limiting per wallet, multi-facilitator failover
 - [ ] Guides: "Build a paid API in 5 minutes", "x402 for AI agents", "Deploying on Fly.io"
 - [ ] Example Phoenix app, `mix x402.gen.paywall` generator
-- [ ] Security audit of crypto verification paths
 - [ ] Hex v1.0 publish
 
 ## Follow-ups noted during the sprint — closed 2026-08-28

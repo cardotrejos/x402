@@ -6,7 +6,7 @@ configuration examples (#3277)").
 
 The component itself is `upstream/servers/elixir/http/bandit/` in this
 directory — copy it verbatim to `e2e/servers/elixir/http/bandit/` in the
-foundation repo. It depends on the published Hex package (`{:x402, "~> 0.5"}`),
+foundation repo. It depends on the published Hex package (`{:x402, "~> 0.6.0"}`),
 ships its own `install.sh` / `build.sh` / `run.sh`, and declares a full local
 `test.config.json` overlay (endpoints, environment, capability matrix), so the
 harness does not need catalog-driven config synthesis for Elixir.

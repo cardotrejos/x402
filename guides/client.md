@@ -29,7 +29,7 @@ Add the optional dependencies the payer needs — `finch` for HTTP and
 ```elixir
 def deps do
   [
-    {:x402, "~> 0.6"},
+    {:x402, "~> 0.6.0"},
     {:finch, "~> 0.19"},
     {:ex_secp256k1, "~> 0.8.0"},
     {:ex_keccak, "~> 0.7.8"}

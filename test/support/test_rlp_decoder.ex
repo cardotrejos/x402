@@ -15,27 +15,27 @@ defmodule X402.TestRLPDecoder do
 
   def decode(<<byte, rest::binary>>) when byte <= 0xB7 do
     length = byte - 0x80
-    <<payload::binary-size(length), rest::binary>> = rest
+    <<payload::binary-size(^length), rest::binary>> = rest
     {payload, rest}
   end
 
   def decode(<<byte, rest::binary>>) when byte <= 0xBF do
     length_size = byte - 0xB7
-    <<length::unsigned-big-integer-size(length_size)-unit(8), rest::binary>> = rest
-    <<payload::binary-size(length), rest::binary>> = rest
+    <<length::unsigned-big-integer-size(^length_size)-unit(8), rest::binary>> = rest
+    <<payload::binary-size(^length), rest::binary>> = rest
     {payload, rest}
   end
 
   def decode(<<byte, rest::binary>>) when byte <= 0xF7 do
     length = byte - 0xC0
-    <<payload::binary-size(length), rest::binary>> = rest
+    <<payload::binary-size(^length), rest::binary>> = rest
     {decode_list(payload, []), rest}
   end
 
   def decode(<<byte, rest::binary>>) do
     length_size = byte - 0xF7
-    <<length::unsigned-big-integer-size(length_size)-unit(8), rest::binary>> = rest
-    <<payload::binary-size(length), rest::binary>> = rest
+    <<length::unsigned-big-integer-size(^length_size)-unit(8), rest::binary>> = rest
+    <<payload::binary-size(^length), rest::binary>> = rest
     {decode_list(payload, []), rest}
   end
 

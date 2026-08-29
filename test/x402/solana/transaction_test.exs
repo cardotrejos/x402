@@ -142,7 +142,7 @@ defmodule X402.Solana.TransactionTest do
       # the trailing address-table-lookup section.
       %{bytes: <<0x80, body::binary>>} = compiled()
       body_size = byte_size(body) - 1
-      <<legacy_message::binary-size(body_size), 0>> = body
+      <<legacy_message::binary-size(^body_size), 0>> = body
 
       wire = <<2>> <> <<0::512>> <> <<0::512>> <> legacy_message
 
@@ -186,7 +186,7 @@ defmodule X402.Solana.TransactionTest do
 
       %{bytes: bytes} = compiled()
       body_size = byte_size(bytes) - 1
-      <<body::binary-size(body_size), 0>> = bytes
+      <<body::binary-size(^body_size), 0>> = bytes
 
       # ALT count says 1 but only a single byte of the table follows.
       truncated = <<2>> <> <<0::512>> <> <<0::512>> <> body <> <<1, 7>>
