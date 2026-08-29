@@ -18,7 +18,8 @@ letting the SDK handle the `402 → sign → retry` dance.
    settlement receipt.
 
 The SDK signs the `exact` scheme (EIP-3009) and the `upto` scheme
-(Permit2) on EVM (`eip155:*`) networks.
+(Permit2) on EVM (`eip155:*`) networks, and the `exact` scheme on Solana
+(`solana:*`) networks (see below).
 
 ## Quick start with Finch
 
@@ -143,7 +144,7 @@ facilitator can settle it. Two things to know:
 
 The signed maximum is not what you pay — the server meters actual usage
 and settles for less (or nothing). See the
-[Plug Integration](plug-integration.md) guide for the server half.
+[Plug/Phoenix Integration](plug-integration.html) guide for the server half.
 
 ## Gas-sponsoring extensions
 
@@ -209,7 +210,9 @@ the payer's Ed25519 key, and leaves the fee payer's signature slot empty.
 The server's sponsor (`extra.feePayer`, **required** in the advertised
 requirements) verifies and co-signs at settlement, so the payer never pays
 network fees. On-chain verification and settlement stay with the
-facilitator; the SDK never talks to a Solana RPC node.
+facilitator; the signing path never talks to a Solana RPC node. The SDK
+can also be that facilitator — see
+[Run Your Own Facilitator](facilitator.html).
 
 ```elixir
 {:ok, signer} = X402.Signer.SolanaKey.new(System.fetch_env!("SOLANA_PAYER_KEY"))
@@ -220,8 +223,8 @@ facilitator; the SDK never talks to a Solana RPC node.
     # Only needed when the server's 402 does not include an
     # extra.recentBlockhash hint: bring a blockhash yourself...
     svm_blockhash: recent_blockhash
-    # ...or let the client fetch one through your RPC layer:
-    # svm_blockhash_fetcher: fn _network -> MyApp.RPC.latest_blockhash() end
+    # ...or let the client fetch one on demand — see :svm_blockhash_fetcher
+    # below.
   )
 ```
 
@@ -233,12 +236,31 @@ Two option pairs matter for less common setups:
 
 * **Blockhash** — servers should advertise `extra.recentBlockhash` in
   their requirements (it saves the client an RPC round-trip); when they
-  do, no option is needed. Otherwise pass `:svm_blockhash` or
-  `:svm_blockhash_fetcher`.
+  do, no option is needed. Otherwise pass `:svm_blockhash`, or
+  `:svm_blockhash_fetcher` — a 1-arity fun receiving the CAIP-2 network
+  and returning `{:ok, blockhash}`.
 * **Asset metadata** — `TransferChecked` needs the mint's decimals and
   owning token program. Well-known stablecoins (USDC, USDT, USDG, PYUSD,
   CASH on mainnet/devnet/testnet) are built in; for other mints pass
   `:svm_decimals` and `:svm_token_program`.
+
+`X402.Solana.RPC.get_latest_blockhash/2` — Solana JSON-RPC over an
+`X402.RPC` endpoint — makes a ready-made fetcher:
+
+```elixir
+{:ok, rpc} =
+  X402.RPC.new(rpc_url: "https://api.mainnet-beta.solana.com", finch: MyApp.Finch)
+
+{:ok, payload} =
+  X402.Client.build_payment(payment_required, signer,
+    network: "solana:*",
+    svm_blockhash_fetcher: fn _network ->
+      with {:ok, %{blockhash: blockhash}} <- X402.Solana.RPC.get_latest_blockhash(rpc) do
+        {:ok, blockhash}
+      end
+    end
+  )
+```
 
 Custom Solana signers implement the optional
 `X402.Signer.sign_ed25519/2` callback instead of `sign_eip712/3` — see

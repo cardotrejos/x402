@@ -1,13 +1,24 @@
 # Getting Started
 
-This guide adds an x402 v2 payment gate to an Elixir application.
+This guide adds an x402 v2 payment gate to an Elixir application. Gating
+is one of four roles the SDK covers end to end:
+
+- **Pay** for x402-protected resources from Elixir —
+  [Paying for Resources](client.html)
+- **Gate** your own routes behind payment — this guide, then
+  [Plug/Phoenix Integration](plug-integration.html) for the full option
+  reference
+- **Verify** payments locally instead of trusting a remote facilitator —
+  [Local Payment Verification](local-verification.html)
+- **Run the facilitator** yourself, on EVM and Solana —
+  [Run Your Own Facilitator](facilitator.html)
 
 ## Install the integrations you use
 
 ```elixir
 def deps do
   [
-    {:x402, "~> 0.4"},
+    {:x402, "~> 0.6"},
     {:finch, "~> 0.19"},
     {:plug, "~> 1.14"}
   ]

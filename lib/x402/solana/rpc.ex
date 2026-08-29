@@ -20,7 +20,7 @@ defmodule X402.Solana.RPC do
 
   All transport, TLS, and telemetry behaviour is inherited from `X402.RPC`
   (events carry the Solana method name as `:method` metadata), and errors are
-  `X402.RPC.error/0` values — node-side failures come back as
+  `t:X402.RPC.error/0` values — node-side failures come back as
   `{:error, {:jsonrpc_error, %{code: _, message: _, data: _}}}`.
   """
 

@@ -1,6 +1,6 @@
 # Architecture — x402 Elixir SDK
 
-> Last updated: 2026-08-15
+> Last updated: 2026-08-28
 
 ## Overview
 
@@ -9,7 +9,7 @@ A pure Elixir library implementing the x402 HTTP payment protocol. Ships as a He
 ## Design Philosophy
 
 - **Zero lock-in**: works with any facilitator, chain, or framework
-- **Minimal deps**: only `jason` and `nimble_options` are required
+- **Minimal deps**: only `jason`, `nimble_options`, and `telemetry` are required
 - **Behaviours over config**: extensibility via `@callback`, not application environment
 - **Flat modules**: short, discoverable names (`X402.Wallet`, not `X402.Utils.Validators.Wallet`)
 
@@ -23,16 +23,45 @@ X402                         # Top-level convenience API (delegates to submodule
 ├── PaymentRequirements      # Validate and match v2 accepted requirements
 ├── PaymentSignature         # Decode and validate PAYMENT-SIGNATURE header
 ├── PaymentResponse          # Encode PAYMENT-RESPONSE header
+├── Client                   # Payer: select, sign, 402 → sign → retry
+│   └── Finch                # HTTP payer flow over Finch (optional)
+├── Signer                   # Behaviour — LocalKey (secp256k1), SolanaKey (Ed25519)
+├── Scheme                   # Behaviour + Registry — ExactEVM, UptoEVM, ExactSVM
+├── EIP3009 / EIP712 / Permit2  # EVM authorization building and typed-data signing
 ├── Facilitator              # GenServer — HTTP client for /verify + /settle
-│   └── HTTP                 # Transport implementation (uses Finch, optional)
+│   ├── HTTP                 # Transport implementation (uses Finch, optional)
+│   ├── Engine               # Facilitator role, EVM — verify/settle/supported,
+│   │                        #   ERC-6492 counterfactual deploy-then-settle,
+│   │                        #   Transfer-event receipt verification
+│   ├── SVMEngine            # Facilitator role, Solana — co-sign fee payer,
+│   │                        #   broadcast, confirm, duplicate-settlement dedup
+│   ├── NonceManager         # Serialized fee-payer nonces for concurrent settles
+│   └── PendingSettlementStore  # Behaviour + ETS adapter — settlement_pending
+│                            #   reconciliation (delete-before-reconcile)
+├── Verify
+│   ├── EVM                  # Local verify checklist (EIP-712, ERC-1271/6492,
+│   │                        #   balance, simulation) at explicit levels
+│   └── SVM                  # Local verify checklist (Ed25519 signatures,
+│                            #   fee-payer isolation, instruction whitelist)
+├── RPC                      # Minimal JSON-RPC transport (EVM and Solana hosts)
+├── RLP / Transaction        # EIP-1559 typed-transaction encoding for settlement
+├── Solana                   # Address, PDA, and ATA primitives (+ Base58)
+│   ├── RPC                  # Solana JSON-RPC calls over X402.RPC
+│   └── Transaction          # v0 message compile/serialize/decode, co-signing
 ├── Plug
-│   └── PaymentGate          # Drop-in Plug middleware for Phoenix/Plug pipelines
+│   ├── PaymentGate          # Drop-in Plug middleware for Phoenix/Plug pipelines
+│   └── Facilitator          # Facilitator API endpoint — one engine or many
+│                            #   (engines: routed by scheme/network)
+├── MCP                      # Paid MCP tools — Server and Client transports
+├── Paywall                  # Browser 402 page behaviour + Default renderer
 ├── Wallet                   # EVM (secp256k1) + Solana (ed25519) address validation
-├── Hooks                    # Behaviour: before_verify / after_verify / on_failure
+├── Hooks                    # Behaviour: before/after verify and settle
 ├── Telemetry                # Telemetry event definitions and metadata
 └── Extensions
-    ├── PaymentIdentifier    # Idempotency — pluggable cache (ETS default)
-    └── SIWX                 # Sign-In-With-X (wallet-authenticated repeat access)
+    ├── PaymentIdentifier    # Idempotency — pluggable cache (ETS, Redis)
+    ├── SIWX                 # Sign-In-With-X (wallet-authenticated repeat access)
+    ├── OfferReceipt         # Signed offers and receipts (EIP-712 + JWS)
+    └── Bazaar, gas sponsoring extensions
 ```
 
 ## Payment Flow (SDK perspective)
@@ -53,13 +82,17 @@ X402.Plug.PaymentGate
                 ├─ Match complete payload.accepted + extension echoes
                 │     no match → 402 + PAYMENT-REQUIRED
                 │
-                ├─ Facilitator.verify
-                │     invalid payment → 402; server/facilitator fault → 500
+                ├─ Inline local verification (optional :local_verification, exact-EVM)
+                │     rejection → 402; infrastructure failure → 500
+                │
+                ├─ Facilitator.verify + signature-bound replay claim (:claim_order)
+                │     invalid or replayed payment → 402; server/facilitator fault → 500
                 │
                 ├─ Assign payload/requirements → protected handler
                 │     handler status >= 400 → skip settlement
                 │
                 └─ Successful handler → Facilitator.settle before send
+                      settlement_pending → exactly one retried settle
                       success → PAYMENT-RESPONSE + original resource response
                       payment failure → 402; server/facilitator fault → 500
 ```
@@ -68,10 +101,11 @@ X402.Plug.PaymentGate
 
 | Dep | When Required |
 |-----|--------------|
-| `finch` | HTTP calls to facilitator (`X402.Facilitator`) |
-| `plug` | Phoenix/Plug middleware (`X402.Plug.PaymentGate`) |
-| `ex_secp256k1` | SIWX signature verification (EVM) |
-| `ex_keccak` | SIWX keccak hashing |
+| `finch` | HTTP calls to facilitator and RPC endpoints (`X402.Facilitator`, `X402.RPC`) |
+| `plug` | Phoenix/Plug middleware (`X402.Plug.PaymentGate`, `X402.Plug.Facilitator`) |
+| `ex_secp256k1` | EVM signing and signature recovery (client signing, SIWX, facilitator engine) |
+| `ex_keccak` | Keccak hashing (EIP-712, local verification, settlement transactions) |
+| `redix` | Redis payment-identifier cache adapter (`RedisCache`) |
 
 All optional integrations are guarded by dependency-availability checks. The
 package must compile successfully with `mix compile --no-optional-deps`.
@@ -100,21 +134,28 @@ validation may raise only in APIs whose contract explicitly uses
 ## Telemetry Events
 
 ```
-[:x402, :facilitator, :verify, :start]
-[:x402, :facilitator, :verify, :stop]
-[:x402, :facilitator, :verify, :exception]
-[:x402, :facilitator, :settle, :start]
-[:x402, :facilitator, :settle, :stop]
-[:x402, :facilitator, :settle, :exception]
-[:x402, :plug, :payment_required]
-[:x402, :plug, :payment_verified]
-[:x402, :plug, :payment_rejected]
+[:x402, :facilitator, :verify | :settle, :start | :stop | :exception]
+[:x402, :facilitator_engine, :verify | :settle]
+[:x402, :plug, :payment_required | :payment_verified | :payment_rejected]
+[:x402, :client, :select | :sign | :build | :request]
+[:x402, :verify, :evm | :svm]
+[:x402, :rpc, :request]
+[:x402, :payment_required | :payment_signature | :payment_response, ...]
 ```
 
-## v0.4 payment lifecycle
+The full event list lives in `X402.Telemetry`.
+
+## Payment lifecycle
 
 - The Plug validates a v2 payload and verifies payment before invoking the handler.
-- Settlement is deferred until a successful handler response is ready to send.
+- Replay claims use a signature-covered key per scheme family (EIP-3009
+  `from` + nonce, Permit2 owner + canonicalized nonce, SVM message hash;
+  raw-header hash for unknown schemes). The `paymentId` extension is decoded
+  and surfaced but is deliberately **not** the dedup key — it is
+  client-chosen and not covered by the payment signature.
+- Settlement is deferred until a successful handler response is ready to
+  send; a `settlement_pending` settle is retried exactly once, and engines
+  reconcile the retry against the already-broadcast transaction.
 - `"upto"` routes may replace the advertised maximum with the actual metered
   settlement amount through `put_settlement_amount/2`.
 - Missing facilitator decision fields fail closed, and internal/facilitator
