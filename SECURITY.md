@@ -17,28 +17,29 @@ receives security fixes.
 
 ## Trust model
 
-This library implements the **resource server** and **facilitator client**
-roles of the x402 payment protocol. Understanding what it does and does not
-verify matters for deploying it safely:
+This library implements the payer client, resource server, facilitator client,
+and self-hosted EVM/SVM facilitator roles of the x402 payment protocol.
+Understanding which checks are enabled in each deployment matters:
 
-- **Payment signature verification is delegated to the facilitator you
-  configure.** `X402.Plug.PaymentGate` validates payload structure, matches
-  requirements, and runs cheap local pre-checks (payTo binding, exact amount
-  equality, validity windows), but it performs no signature cryptography and
-  no on-chain checks. Your resource server's payment security equals your
-  facilitator's — choose one you trust, and note that no x402 SDK's server
-  role independently verifies settlement on-chain.
+- **Resource servers delegate verification and settlement to their configured
+  facilitator by default.** `X402.Plug.PaymentGate` always validates payload
+  structure, matches the complete advertised requirements, and runs the
+  registered scheme's local pre-checks. Exact-EVM routes can additionally run
+  `X402.Verify.EVM` at `:structural`, `:signature`, or `:full` through the
+  `:local_verification` option. This narrows trust in the facilitator but does
+  not replace the settle call; choose and authenticate a facilitator you trust,
+  or operate the bundled facilitator engines yourself.
 - **Facilitator transport is enforced to `https://`** (loopback exempt for
   development), with TLS peer verification and system CA certificates on the
   default pool. Per-request facilitator authentication (Coinbase CDP JWT) is
   supported via `X402.Facilitator.Auth`.
 - **Inbound payment headers are capped at 8 KB before any decoding** and
   fail closed on malformed Base64/JSON.
-- **Replay protection** in `X402.Plug.PaymentGate` (the payment-identifier
-  cache claim) is **per-node** with the bundled ETS adapter. In a clustered
-  deployment each node claims independently — use a shared adapter
-  (implementing `X402.Extensions.PaymentIdentifier.Cache`) if a duplicate
-  request served by a second node is unacceptable for your resource.
+- **Replay protection** in `X402.Plug.PaymentGate` is **per-node** with the
+  bundled ETS adapter. In a clustered deployment, configure a shared adapter;
+  `X402.Extensions.PaymentIdentifier.RedisCache` provides an atomic Redis
+  implementation. Replay keys for the built-in EVM and SVM schemes derive
+  from signature-covered payment identity rather than unsigned client fields.
 - **ERC-6492 counterfactual settlement is allowlist-gated.** The facilitator
   engine (`X402.Facilitator.Engine`) signs caller-supplied factory calldata
   only toward addresses explicitly listed in `:eip6492_allowed_factories`,
@@ -48,6 +49,15 @@ verify matters for deploying it safely:
   caller-supplied calldata. Allowlist only factories you have audited — a
   listed factory receives deployment transactions paid for by your fee
   payer.
+- **SVM duplicate-settlement protection is opt-in.** Production
+  `X402.Facilitator.SVMEngine` deployments should configure both
+  `:settlement_cache` and `:pending_settlement_store`. Without the cache,
+  concurrent settle calls can all broadcast; without the pending store, an
+  uncertain broadcast cannot be reconciled on retry.
+- **The cryptographic verification and transaction-settlement paths have not
+  yet received an independent third-party audit.** The project is still on a
+  pre-1.0 release line; apply normal defense in depth, conservative allowlists,
+  and testnet/live-smoke validation before handling production value.
 
 ## Known advisories affecting the wider x402 ecosystem
 
@@ -57,5 +67,5 @@ This SDK is not affected by, but its design responds to,
 on decoded `path_info` segments and carries regression tests for that bug
 class) and
 [GHSA-qr2g-p6q7-w82m](https://github.com/advisories/GHSA-qr2g-p6q7-w82m)
-(SVM duplicate settlement in the official SDKs — this SDK does not implement
-SVM settlement).
+(SVM duplicate settlement in the official SDKs — the bundled SVM engine has
+an atomic settlement-cache integration, but operators must configure it).

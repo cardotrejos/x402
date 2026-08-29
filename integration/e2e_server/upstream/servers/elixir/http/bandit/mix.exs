@@ -21,7 +21,7 @@ defmodule X402.E2EServer.MixProject do
   defp deps do
     [
       # The Elixir x402 SDK (https://hex.pm/packages/x402)
-      {:x402, "~> 0.5"},
+      {:x402, "~> 0.6.0"},
       {:bandit, "~> 1.0"},
       {:finch, "~> 0.19"},
       {:jason, "~> 1.2"}

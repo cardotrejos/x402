@@ -578,7 +578,7 @@ defmodule X402.Scheme.ExactSVMTest do
       # lookup entry: 32-byte table address, one writable index, none
       # read-only.
       body_size = byte_size(wire) - 1
-      <<body::binary-size(body_size), 0>> = wire
+      <<body::binary-size(^body_size), 0>> = wire
       with_alt = body <> <<1>> <> :binary.copy(<<7>>, 32) <> <<1, 200>> <> <<0>>
 
       alt_payload = put_in(payload["payload"], %{"transaction" => Base.encode64(with_alt)})

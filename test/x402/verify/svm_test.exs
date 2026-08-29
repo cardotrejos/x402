@@ -174,7 +174,7 @@ defmodule X402.Verify.SVMTest do
       # entry, and RE-SIGN the mutated message so the signature check
       # (which runs first) passes and the ALT rejection itself is hit.
       message_size = byte_size(decoded.message_bytes) - 1
-      <<body::binary-size(message_size), 0>> = decoded.message_bytes
+      <<body::binary-size(^message_size), 0>> = decoded.message_bytes
       alt_message = body <> <<1>> <> :binary.copy(<<7>>, 32) <> <<1, 200>> <> <<0>>
       client_signature = :crypto.sign(:eddsa, :none, alt_message, [@client_seed, :ed25519])
       wire = <<2>> <> <<0::512>> <> client_signature <> alt_message

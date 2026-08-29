@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-28
+
 ### Added
 
 - **SVM on-chain facilitator — `X402.Facilitator.SVMEngine`**: verify and
@@ -109,9 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account 0); `precheck/3` enforces the facilitator's static-path
   whitelist (spec §3.1: 3–7 instructions in the reference order, the
   5 lamports/CU cap, §2.1.1 fee payer isolation, transfer semantics, memo
-  enforcement) without any RPC. On-chain verification and settlement stay
-  facilitator-delegated; transactions using address lookup tables skip the
-  local pre-checks
+  enforcement) without any RPC. Full on-chain verification and settlement are
+  available through `X402.Verify.SVM` and `X402.Facilitator.SVMEngine`.
+  Transactions using address lookup tables bypass the pure `precheck/3`, then
+  the bundled verifier and engine reject them fail-closed because lookup-table
+  resolution is not implemented
 - **`X402.Signer.SolanaKey` and the optional `sign_ed25519/2` signer
   callback**: Ed25519 signing over OTP's `:crypto` (no new dependencies);
   `new/1` accepts a raw 32-byte seed, a 64-byte `solana-keygen` keypair,
@@ -401,8 +405,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documented the clustered-BEAM double-execution hazard of the per-node ETS
   replay cache in the `PaymentGate`, `Cache`, and `ETSCache` moduledocs
 - Added `SECURITY.md` — private vulnerability reporting, supported versions,
-  and the SDK's trust model (facilitator-delegated verification, transport
-  hardening, per-node replay cache caveat)
+  and the SDK's multi-role trust model: delegated versus optional local
+  verification, transport hardening, replay/settlement configuration, and the
+  pre-1.0 independent-audit boundary
 - Corrected the `X402.Facilitator.Auth.CDP.headers/2` doc: the JWT is signed
   fresh per facilitator operation, and transport retries within one operation
   reuse it inside its 120-second validity window
@@ -437,6 +442,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer occurs; `{:missing_fields, _}` remains for v2 `accepted` objects
   missing required PaymentRequirements fields.
   (Ecosystem report §8 P0.1.)
+
+### Client and transport additions
+
 - Payer client (report §8 P0.4): `X402.Client` — transport-agnostic core with
   `select_requirements/2` (filterable payment-option selection with a
   `max_amount` budget guard), `build_payment/3` (v2 `PaymentPayload` assembly

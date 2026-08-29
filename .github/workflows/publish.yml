@@ -9,15 +9,15 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: "1.20"
           otp-version: "29"
 
       - name: Cache deps
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             deps
@@ -26,15 +26,18 @@ jobs:
           restore-keys: ${{ runner.os }}-mix-
 
       - run: mix deps.get
-      - run: mix compile
+      - run: mix compile --warnings-as-errors
+
+      - name: Verify tag matches package version
+        run: |
+          package_version="$(mix run --no-start -e 'IO.write(Mix.Project.config()[:version])')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$tag_version" != "$package_version" ]; then
+            echo "Tag version $tag_version does not match package version $package_version"
+            exit 1
+          fi
 
       - name: Publish to Hex.pm
-        run: |
-          mix hex.publish --yes 2>&1 || mix hex.publish --yes --replace
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-
-      - name: Publish docs to HexDocs
-        run: mix hex.publish docs --yes
+        run: mix hex.publish --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
