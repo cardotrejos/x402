@@ -14,16 +14,17 @@ facilitator, chain, or web framework.
 
 ## Features
 
-- x402 v2 `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, and `PAYMENT-RESPONSE` headers
-- Complete v2 payment-requirement and extension-echo validation
-- Payer client with EIP-3009 signing and an automatic `402 → sign → retry` Finch flow
+- x402 v2 `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, and `PAYMENT-RESPONSE` headers with complete requirement and extension-echo validation
+- Payer client signing `"exact"` (EIP-3009), metered `"upto"` (Permit2), and Solana `"exact"` payments, with an automatic `402 → sign → retry` Finch flow
+- Plug/Phoenix payment gate with signature-bound replay protection, optional inline local verification, and settlement only after successful resource handling
+- Local payment verification without trusting a facilitator: EVM (EIP-712 + ERC-1271/6492, balance and simulation checks) and Solana (Ed25519, fee-payer isolation, instruction whitelist)
 - Facilitator `/verify` and `/settle` client with retries, hooks, and telemetry
-- Local payment verification (EIP-712 + ERC-1271/6492, balance and simulation checks) without trusting a facilitator
-- Plug/Phoenix payment gate that settles only after successful resource handling
-- `"exact"` and metered `"upto"` authorization flows
-- Optional payment-identifier idempotency cache and SIWX support
-- EVM and Solana wallet validation
-- Optional Finch, Plug, and cryptography dependencies
+- A runnable facilitator server for EVM and Solana from one Plug — ERC-6492 counterfactual settlement, ERC-20 Transfer-event proof of delivery, pending-settlement reconciliation
+- Paid MCP tools over the x402 MCP transport, server and client side
+- Browser paywall: a self-contained HTML 402 page with an EIP-1193 wallet flow
+- Pluggable payment schemes through the `X402.Scheme` behaviour
+- Extensions: payment-identifier idempotency (ETS or Redis), SIWX, signed offers and receipts, gas sponsoring, Bazaar discovery
+- Optional Finch, Plug, Redix, and cryptography dependencies
 
 ## Installation
 
@@ -89,6 +90,26 @@ with status 400 or greater are not settled.
 The verified payload and matched requirement are available to the handler as
 `conn.assigns.x402_payment_payload` and
 `conn.assigns.x402_payment_requirements`.
+
+## Run your own facilitator
+
+The SDK also implements the facilitator role itself — verify and settle
+payments on-chain instead of delegating to a hosted service:
+
+```elixir
+{:ok, engine} =
+  X402.Facilitator.Engine.new(rpc: rpc, signer: signer, networks: ["eip155:84532"])
+
+children = [
+  {Bandit, plug: {X402.Plug.Facilitator, engine: engine}, port: 4022}
+]
+```
+
+That serves `POST /verify`, `POST /settle`, and `GET /supported` over the
+standard facilitator wire protocol. Pass `engines: [evm_engine, svm_engine]`
+instead of `engine:` to serve EVM and Solana (`X402.Facilitator.SVMEngine`)
+from the same endpoint. See the
+[Run Your Own Facilitator](https://hexdocs.pm/x402/facilitator.html) guide.
 
 ## Metered `"upto"` payments
 
@@ -235,8 +256,13 @@ Facilitator requests use the v2 wire object:
 ## Documentation
 
 - [Getting Started](https://hexdocs.pm/x402/getting-started.html)
+- [Paying for Resources](https://hexdocs.pm/x402/client.html)
 - [Plug/Phoenix Integration](https://hexdocs.pm/x402/plug-integration.html)
+- [Custom Payment Schemes](https://hexdocs.pm/x402/custom-schemes.html)
+- [Paid MCP Tools](https://hexdocs.pm/x402/mcp.html)
+- [Browser Paywall](https://hexdocs.pm/x402/paywall.html)
 - [Local Payment Verification](https://hexdocs.pm/x402/local-verification.html)
+- [Run Your Own Facilitator](https://hexdocs.pm/x402/facilitator.html)
 - [Live Smoke Tests](https://hexdocs.pm/x402/live-smoke-tests.html)
 - [API Reference](https://hexdocs.pm/x402/api-reference.html)
 - [Official x402 v2 specification](https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md)

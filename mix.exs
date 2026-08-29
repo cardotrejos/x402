@@ -158,13 +158,16 @@ defmodule X402.MixProject do
           X402.Client.Finch,
           X402.Signer,
           X402.Signer.LocalKey,
+          X402.Signer.SolanaKey,
           X402.EIP3009,
-          X402.EIP712
+          X402.EIP712,
+          X402.Permit2
         ],
         "Facilitator Client": [
           X402.Facilitator,
           X402.Facilitator.Auth,
           X402.Facilitator.Auth.CDP,
+          X402.Facilitator.Error,
           X402.Facilitator.HTTP,
           X402.Hooks,
           X402.Hooks.Context,
@@ -179,6 +182,7 @@ defmodule X402.MixProject do
           X402.Scheme,
           X402.Scheme.Registry,
           X402.Scheme.ExactEVM,
+          X402.Scheme.ExactSVM,
           X402.Scheme.UptoEVM,
           X402.Scheme.EVM
         ],
@@ -189,17 +193,31 @@ defmodule X402.MixProject do
         ],
         "Local Verification": [
           X402.Verify.EVM,
+          X402.Verify.SVM,
           X402.RPC,
           X402.ERC6492
         ],
         "Facilitator Server": [
           X402.Facilitator.Engine,
+          X402.Facilitator.SVMEngine,
+          X402.Facilitator.NonceManager,
+          X402.Facilitator.PendingSettlementStore,
+          X402.Facilitator.PendingSettlementStore.ETS,
           X402.Plug.Facilitator,
           X402.RLP,
           X402.Transaction
         ],
+        Solana: [
+          X402.Solana,
+          X402.Solana.RPC,
+          X402.Solana.Transaction,
+          X402.Base58
+        ],
         Utilities: [
-          X402.Wallet
+          X402.Wallet,
+          X402.Telemetry,
+          X402.Behaviour,
+          X402.Utils
         ],
         Extensions: [
           X402.Extensions.Bazaar,
