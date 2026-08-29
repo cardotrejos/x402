@@ -224,7 +224,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     typed-transaction encoders (no new dependencies), tested against the
     published RLP specification vectors and a signed-transaction
     sender-recovery proof.
-  - `X402.EIP3009.transfer_calldata/2` — the `transferWithAuthorization`
+  - `X402.EIP3009.transfer_calldata/3` — the `transferWithAuthorization`
     calldata builder (both the `(v, r, s)` and dynamic-`bytes` variants),
     extracted from `X402.Verify.EVM` so verification's simulation and the
     engine's settlement sign the exact same bytes; plus
