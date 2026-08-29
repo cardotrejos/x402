@@ -80,10 +80,15 @@ x402 v2, its `accepted` must match an advertised option exactly (including
 `extra` preservation), and advertised `extensions` must be echoed without
 dropping values.
 
-`payment_identifier_cache:` enables replay protection — the same
-`X402.Extensions.PaymentIdentifier.ETSCache` option the Plug gate takes. Each
-payment proof is atomically claimed before settlement, so the same signed
-payment cannot be settled twice.
+`payment_identifier_cache:` enables replay protection — an
+`X402.Extensions.PaymentIdentifier.ETSCache` server or any
+`X402.Extensions.PaymentIdentifier.Cache` adapter, the same option the Plug
+gate takes. Each payment proof is atomically claimed before settlement, so
+the same signed payment cannot be settled twice. The claim key is a
+deterministic hash of the signed scheme payload — never the
+client-controlled `paymentId` extension — so neither re-encoding the
+payment envelope nor varying `paymentId` can mint a fresh claim for the
+same signed authorization.
 
 To advertise the price outside a rejection (for example in a `tools/list`
 response), use `X402.MCP.Server.payment_required_result/2`.

@@ -7,15 +7,19 @@ scheme means writing **one module** and passing it as an option; no core
 module needs to change.
 
 The built-ins cover `exact` (`X402.Scheme.ExactEVM`) and `upto`
-(`X402.Scheme.UptoEVM`) on EVM (`eip155:*`) networks. Resolution — exact
-CAIP-2 matches beating wildcards, user modules beating built-ins — is
-handled by `X402.Scheme.Registry`.
+(`X402.Scheme.UptoEVM`) on EVM (`eip155:*`) networks, and `exact`
+(`X402.Scheme.ExactSVM`) on Solana (`solana:*`) networks. Resolution —
+exact CAIP-2 matches beating wildcards, user modules beating built-ins —
+is handled by `X402.Scheme.Registry`.
 
 ## Writing a scheme module
 
 Implement `X402.Scheme`. Only `c:X402.Scheme.scheme/0` and
 `c:X402.Scheme.networks/0` are required; implement the callbacks for the
-roles your scheme plays:
+roles your scheme plays. A fourth optional callback,
+`c:X402.Scheme.signable?/1`, lets `X402.Client.select_requirements/2`
+skip advertised entries the module cannot sign (the built-in `upto`
+scheme uses it to skip entries missing `extra.facilitatorAddress`):
 
 ```elixir
 defmodule MyApp.SolanaExact do
@@ -52,6 +56,11 @@ defmodule MyApp.SolanaExact do
 end
 ```
 
+(`exact` on `solana:*` now ships built-in as `X402.Scheme.ExactSVM` — the
+sketch above shows the shape such a module takes. A user module listed in
+`:schemes` is consulted before the built-ins, so registering your own
+overrides it.)
+
 ## Registering it
 
 There is no global registry and no application environment — scheme modules
@@ -85,6 +94,17 @@ Kinds with no registered module keep their historical neutral behavior:
 validation passes through with `:ok`, the gate skips pre-checks (the
 facilitator remains the authority), and the client returns
 `{:error, {:unsupported_kind, scheme, network}}`.
+
+## Replay keys for custom schemes
+
+`X402.Plug.PaymentGate`'s replay protection derives canonical,
+signature-covered replay keys only for the built-in kinds (`exact` and
+`upto` on `eip155:*`, `exact` on `solana:*`). Every other kind — custom
+schemes included — falls back to hashing the raw `PAYMENT-SIGNATURE`
+header, so only byte-identical replays are deduplicated: re-encoding the
+same signed proof (different JSON key order, whitespace, or Base64
+variant) mints a distinct key, and catching such duplicates is left to
+the facilitator.
 
 See the `X402.Scheme` module documentation for the full callback reference
 and error conventions.
