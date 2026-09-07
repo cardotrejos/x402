@@ -6,7 +6,7 @@ The Elixir SDK for the x402 HTTP payment protocol — published on Hex.pm. A **l
 ## Quick Context
 - **Language:** Elixir (OTP)
 - **Published:** Hex.pm (`x402 ~> 0.6.0`)
-- **CI:** GitHub Actions → `mix test --cover`
+- **CI:** GitHub Actions; required checks live in `.github/workflows/ci.yml`
 - **Docs:** Generated via ExDoc, hosted on hexdocs.pm
 
 ## Module Map
@@ -27,7 +27,7 @@ lib/x402/telemetry.ex          — Telemetry event definitions
 ## Key Commands
 ```bash
 mix test                   # Run test suite
-mix test --cover           # With coverage (target >90%)
+mix coveralls              # CI coverage; threshold is configured in mix.exs
 mix dialyzer               # Type checking
 mix docs                   # Generate ExDoc
 MIX_ENV=test mix coveralls # ExCoveralls report
@@ -54,7 +54,7 @@ mix compile --no-optional-deps  # Must compile without Finch
     X402_PAYER_KEY=... X402_SETTLE=1 \
     mix test test/x402/facilitator/auth/cdp_live_test.exs --only smoke
   ```
-- >90% line coverage required
+- Run affected tests while editing. Before declaring CI readiness, use `.github/workflows/ci.yml` and the coverage threshold in `mix.exs` (currently 95%). Preserve optional-dependency compilation and the downstream consumer check for packaging/API changes. Live payment tests remain explicit opt-in; never enable settlement just to satisfy a routine check.
 
 ## Protocol Reference
 - Headers: `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE` (all Base64-encoded JSON)
