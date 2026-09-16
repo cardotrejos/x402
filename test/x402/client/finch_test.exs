@@ -10,6 +10,8 @@ defmodule X402.Client.FinchTest do
   alias X402.PaymentSignature
   alias X402.Plug.PaymentGate
   alias X402.Signer.LocalKey
+  alias X402.Signer.SolanaKey
+  alias X402.Solana.Transaction
 
   import X402.TestHelpers
 
@@ -60,6 +62,60 @@ defmodule X402.Client.FinchTest do
   end
 
   describe "request/3 payment flow" do
+    test "accepts a SolanaKey and signs an SVM payment before retrying", %{
+      bypass: bypass,
+      finch: finch
+    } do
+      {:ok, signer} = SolanaKey.new(:binary.copy(<<1>>, 32))
+
+      requirements = %{
+        "scheme" => "exact",
+        "network" => "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        "amount" => "1000",
+        "asset" => "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "payTo" => "GyGKxMyg1p9SsHfm15MkNUu1u9TN2JtTspcdmrtGUdse",
+        "maxTimeoutSeconds" => 60,
+        "extra" => %{
+          "feePayer" => "9hSR6S7WPtxmTojgo6GG3k4yDPecgJY292j7xrsUGWBu",
+          "recentBlockhash" => "EZ3rST5dvHmbanh75jc4PuLfV96vp9fEYBVeNk4FfM1k"
+        }
+      }
+
+      payment_required = %{@payment_required | "accepts" => [requirements]}
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "GET", "/solana", fn conn ->
+        assert Conn.get_req_header(conn, "payment-signature") == []
+        {:ok, header} = PaymentRequired.encode(payment_required)
+
+        Bypass.expect_once(bypass, "GET", "/solana", fn retry ->
+          [payment_header] = Conn.get_req_header(retry, "payment-signature")
+          send(test_pid, {:payment_header, payment_header})
+          Conn.resp(retry, 200, "paid")
+        end)
+
+        conn
+        |> Conn.put_resp_header("payment-required", header)
+        |> Conn.resp(402, "{}")
+      end)
+
+      assert {:ok, %{status: 200, body: "paid"}} =
+               FinchClient.request(finch, url(bypass, "/solana"), signer: signer)
+
+      assert_received {:payment_header, header}
+      assert {:ok, payload} = PaymentSignature.decode_and_validate(header, requirements)
+      assert payload["accepted"] == requirements
+      assert {:ok, transaction} = Base.decode64(payload["payload"]["transaction"])
+      assert {:ok, decoded} = Transaction.decode(transaction)
+      assert [<<0::512>>, signature] = decoded.signatures
+      {:ok, public_key} = X402.Solana.decode_address(signer.address)
+
+      assert :crypto.verify(:eddsa, :none, decoded.message_bytes, signature, [
+               public_key,
+               :ed25519
+             ])
+    end
+
     test "pays a 402 and returns the settled response", %{
       bypass: bypass,
       finch: finch,

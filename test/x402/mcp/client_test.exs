@@ -8,7 +8,10 @@ defmodule X402.MCP.ClientTest do
   alias X402.MCP
   alias X402.MCP.Client
   alias X402.MCP.Server
+  alias X402.PaymentSignature
   alias X402.Signer.LocalKey
+  alias X402.Signer.SolanaKey
+  alias X402.Solana.Transaction
 
   # A real caller-side X402.Facilitator over a Bypass HTTP stub (the
   # facilitator client executes verify/settle in the calling process).
@@ -139,6 +142,46 @@ defmodule X402.MCP.ClientTest do
   end
 
   describe "call/3 payment flow" do
+    test "accepts a SolanaKey and signs an SVM payment before retrying" do
+      {:ok, signer} = SolanaKey.new(:binary.copy(<<1>>, 32))
+
+      requirements = %{
+        "scheme" => "exact",
+        "network" => "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        "amount" => "1000",
+        "asset" => "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "payTo" => "GyGKxMyg1p9SsHfm15MkNUu1u9TN2JtTspcdmrtGUdse",
+        "maxTimeoutSeconds" => 60,
+        "extra" => %{
+          "feePayer" => "9hSR6S7WPtxmTojgo6GG3k4yDPecgJY292j7xrsUGWBu",
+          "recentBlockhash" => "EZ3rST5dvHmbanh75jc4PuLfV96vp9fEYBVeNk4FfM1k"
+        }
+      }
+
+      payment_required = %{@payment_required | "accepts" => [requirements]}
+      {:ok, required_result} = MCP.payment_required_result(payment_required)
+      call_fun = tracking_fun([required_result, @ok_result])
+
+      assert {:ok, %{result: @ok_result, paid: true}} =
+               Client.call(@request, call_fun, signer: signer)
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, retried}
+      refute_received {:tool_called, _request}
+      assert {:ok, payload} = MCP.fetch_payment(retried)
+      assert {:ok, ^payload} = PaymentSignature.validate(payload, requirements)
+      assert payload["accepted"] == requirements
+      assert {:ok, transaction} = Base.decode64(payload["payload"]["transaction"])
+      assert {:ok, decoded} = Transaction.decode(transaction)
+      assert [<<0::512>>, signature] = decoded.signatures
+      {:ok, public_key} = X402.Solana.decode_address(signer.address)
+
+      assert :crypto.verify(:eddsa, :none, decoded.message_bytes, signature, [
+               public_key,
+               :ed25519
+             ])
+    end
+
     test "signs and retries once with the payment in _meta" do
       paid_result =
         MCP.put_payment_response(@ok_result, %{"success" => true, "network" => @network})

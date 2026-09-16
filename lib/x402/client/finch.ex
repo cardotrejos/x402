@@ -191,7 +191,8 @@ defmodule X402.Client.Finch do
   @doc false
   @spec validate_signer(term()) :: {:ok, struct()} | {:error, String.t()}
   def validate_signer(%module{} = signer) do
-    case X402.Behaviour.implements?(module, address: 1, sign_eip712: 3) do
+    case X402.Behaviour.implements?(module, address: 1, sign_eip712: 3) or
+           X402.Behaviour.implements?(module, address: 1, sign_ed25519: 2) do
       true -> {:ok, signer}
       false -> {:error, "expected a struct implementing X402.Signer"}
     end
