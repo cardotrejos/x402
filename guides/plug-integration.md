@@ -21,6 +21,7 @@ The plug accepts these options (validated via `NimbleOptions`):
 | `:paywall` | `module()` | no | `nil` | Browser paywall renderer implementing `X402.Paywall` — see the [Browser Paywall](paywall.html) guide |
 | `:siwx` | `keyword()` | no | `nil` | Sign-In-With-X configuration — `X402.Extensions.SIWX.Server.new/1` options (`:domain`, `:uri`, `:supported_chains` required); see "Sign-In-With-X" |
 | `:extensions` | `[module() \| {module(), keyword()}]` | no | `[]` | `X402.Extension` adapters that advertise, validate, and observe protocol extensions on every gated request; see "Extension Adapters" |
+| `:rate_limit` | `keyword()` | no | `nil` | Per-wallet verified-payment limit; requires `:limit` and `:window_ms` |
 
 > **Important:** When `:payment_identifier_cache` is not configured, the plug
 > emits a runtime warning. Without it, concurrent identical requests can
@@ -417,6 +418,24 @@ authority for every payment either way. See the
 [Local Payment Verification](local-verification.html) guide for the levels,
 their capability requirements, and ERC-6492 counterfactual handling.
 
+## Per-wallet rate limits
+
+Add `rate_limit: [limit: 60, window_ms: 60_000]` to the gate options to allow
+60 verified payments per wallet per fixed window. Denied requests receive
+HTTP 429, `error: "rate_limited"`, and a `Retry-After` header in seconds.
+The handler and settlement do not run; the replay claim is released.
+
+The limiter counts requests **after** verification. An unsigned payer field
+cannot consume another wallet's allowance. This still costs a verification
+round-trip, so use an edge/IP limiter to protect against unauthenticated floods.
+SIWX access and requests exempted by hooks do not count as payments.
+
+The default `X402.RateLimiter.ETS` store is per-node. Use `store: {module, ref}`
+with an `X402.RateLimiter` implementation for shared limits. Store failures
+allow requests by default; set `on_error: :deny` to fail closed. `key: :ip`
+or a function of the verified request context supports other grouping policies.
+See `X402.RateLimiter` for the full options.
+
 ## Replay Protection
 
 A valid payment proof can be presented many times — concurrently to the same
@@ -708,6 +727,7 @@ the protected handler runs:
 | `:x402_siwx_address` | The wallet address of a request authenticated through Sign-In-With-X instead of paying (only set on that path; the payment assigns above are absent then) |
 | `:x402_siwx_chain_id` | The CAIP-2 chain the Sign-In-With-X proof was signed for (set together with `:x402_siwx_address`) |
 | `:x402_path_params` | The values captured by the route's `:param` segments (set on every request matching a `:param` route, paid or not; absent for exact and glob routes) |
+| `:x402_rate_limit` | `%{key: key, remaining: count, limit: limit, window_ms: window_ms}` when the configured limiter permits the payment |
 
 Your controller can access these:
 
@@ -837,6 +857,7 @@ The plug follows the x402 v2 HTTP transport status mapping:
 | **402** | Payment required (no `PAYMENT-SIGNATURE` header), no matching requirements, a duplicate payment proof, a local pre-check or local-verification rejection, facilitator verification/settlement failure, or a `SIGN-IN-WITH-X` proof that fails verification or belongs to an address with no payment record |
 | **400** | Malformed `PAYMENT-SIGNATURE` header, invalid Base64, invalid JSON, payload too large, wrong `x402Version`, a scheme payload validation failure, a malformed or missing-but-required payment identifier, an extension adapter or builder-code validation failure, or an undecodable `SIGN-IN-WITH-X` header |
 | **409** | A `payment-identifier` id reused for a request with a different fingerprint (`payment_identifier_conflict`) |
+| **429** | A verified payment exceeded `:rate_limit`; `Retry-After` gives the wait in seconds |
 | **500** | Facilitator transport failure, malformed facilitator response, local-verification infrastructure failure (missing dependency, RPC error, chain-id mismatch), a dynamic route function returning an error or invalid value, an `on_protected_request/2` hook that raises or returns an invalid value, invalid server-provided settlement amount, or response-encoding failure |
 
 ## Telemetry Events
@@ -850,6 +871,7 @@ The plug emits these telemetry events:
 | `[:x402, :plug, :payment_verified]` | Payment successfully verified and settled |
 | `[:x402, :plug, :payment_rejected]` | Payment rejected (invalid payload, no match, verification failed, a hook or dynamic-route error, etc.) |
 | `[:x402, :plug, :siwx_authenticated]` | A `SIGN-IN-WITH-X` proof from a previously paying address let the handler run without payment |
+| `[:x402, :plug, :rate_limited]` | A verified payment exceeded its limit; metadata includes `:payer`, `:key`, and `:retry_after_ms` |
 
 Metadata always includes `:method` and `:path`. Every event except an
 unmatched `:pass_through` adds `:route`; `:payment_rejected` adds
@@ -864,6 +886,31 @@ when the facilitator's settle response carried the sidechannel; and
 `:siwx_authenticated` adds `:address` and `:chain_id`. Deprecated wire
 formats additionally emit `[:x402, :payment_identifier, :legacy]` and
 `[:x402, :siwx, :legacy]`.
+
+### LiveDashboard and local statistics
+
+Applications using Phoenix LiveDashboard can add
+`{:telemetry_metrics, "~> 1.0"}` to their dependencies and use its Metrics page:
+
+```elixir
+live_dashboard "/dashboard", metrics: X402.Telemetry.Metrics
+```
+
+The SDK does not depend on Phoenix. Other reporters can use
+`X402.Telemetry.Metrics.metrics/1` with `only: [:plug, :facilitator]` or
+`except:` filters. Definitions cover event counters and facilitator span
+durations; they do not invent durations for events that only emit counts.
+
+Without a metrics reporter, attach the in-memory aggregator once at application
+startup and read it when needed:
+
+```elixir
+:ok = X402.Telemetry.Stats.attach()
+stats = X402.Telemetry.Stats.snapshot()
+```
+
+`detach/0` stops collection and drops the table. These statistics are local
+to the node and are not a durable payment ledger.
 
 ## Full Example
 
