@@ -20,6 +20,7 @@ The plug accepts these options (validated via `NimbleOptions`):
 | `:local_verification` | `atom() \| keyword()` | no | `nil` | Inline cryptographic verification of exact-EVM payments before the facilitator verify (see "Local Verification") |
 | `:paywall` | `module()` | no | `nil` | Browser paywall renderer implementing `X402.Paywall` — see the [Browser Paywall](paywall.html) guide |
 | `:siwx` | `keyword()` | no | `nil` | Sign-In-With-X configuration — `X402.Extensions.SIWX.Server.new/1` options (`:domain`, `:uri`, `:supported_chains` required); see "Sign-In-With-X" |
+| `:extensions` | `[module() \| {module(), keyword()}]` | no | `[]` | `X402.Extension` adapters that advertise, validate, and observe protocol extensions on every gated request; see "Extension Adapters" |
 
 > **Important:** When `:payment_identifier_cache` is not configured, the plug
 > emits a runtime warning. Without it, concurrent identical requests can
@@ -49,14 +50,14 @@ plug X402.Plug.PaymentGate,
 | Option | Type | Required | Description |
 |--------|------|----------|-------------|
 | `:method` | `atom()` | **yes** | HTTP method (`:get`, `:post`, `:put`, `:delete`, `:patch`, `:head`, `:options`, `:trace`, or `:any` for all) |
-| `:path` | `String.t()` | **yes** | Route path. Exact matches (`/api/data`) or glob patterns (`/api/*`) |
-| `:accepts` | `[map()]` | no | Multiple payment options (see "Multiple Accepts" below) |
+| `:path` | `String.t()` | **yes** | Route path. Exact matches (`/api/data`), glob patterns (`/api/*`), or templates with `:param` segments (`/api/users/:id`) — see "Path Parameters" |
+| `:accepts` | `[map()] \| (conn -> [map()])` | no | Multiple payment options (see "Multiple Accepts" below), or a 1-arity function of the conn returning them (see "Dynamic Pricing") |
 | `:scheme` | `String.t()` | no | `"exact"` (default), `"upto"`, or the scheme name of a module passed in the plug's `:schemes` option — see the [Custom Payment Schemes](custom-schemes.html) guide |
-| `:price` | `String.t()` | conditionally | Payment amount in atomic token units. Required when `:accepts` is empty |
+| `:price` | `String.t() \| (conn -> String.t())` | conditionally | Payment amount in atomic token units, or a 1-arity function of the conn returning one. Required when `:accepts` is empty |
 | `:network` | `String.t()` | conditionally | CAIP-2 network identifier (e.g. `"eip155:8453"`) |
 | `:asset` | `String.t()` | conditionally | Token contract address |
-| `:pay_to` | `String.t()` | conditionally | Recipient wallet address |
-| `:description` | `String.t()` | no | Resource description (default: `"Payment required"`) |
+| `:pay_to` | `String.t() \| (conn -> String.t())` | conditionally | Recipient wallet address, or a 1-arity function of the conn returning one |
+| `:description` | `String.t() \| (conn -> String.t())` | no | Resource description (default: `"Payment required"`), or a 1-arity function of the conn returning one |
 | `:mime_type` | `String.t()` | no | Resource MIME type (default: `"application/json"`) |
 | `:service_name` | `String.t()` | no | `ResourceInfo.serviceName`: non-empty printable ASCII, at most 32 characters (`X402.Extensions.Bazaar.Metadata.valid_service_name?/1`) |
 | `:tags` | `[String.t()]` | no | `ResourceInfo.tags`: at most 5 unique (case-insensitive) entries, each under the `:service_name` rule (`X402.Extensions.Bazaar.Metadata.sanitize_tags/1`) |
@@ -64,6 +65,7 @@ plug X402.Plug.PaymentGate,
 | `:max_timeout_seconds` | `pos_integer()` | no | Max payment completion time (default: `60`) |
 | `:extra` | `map()` | no | Scheme-specific extra fields |
 | `:extensions` | `map()` | no | Protocol extensions advertised in `PAYMENT-REQUIRED` |
+| `:bazaar` | `keyword()` | no | `X402.Extensions.Bazaar.build_extension/1` options advertising the route in the bazaar under `extensions["bazaar"]` (see "Path Parameters") |
 
 When `:accepts` is empty (the default), a single payment option is built from
 the top-level `:scheme`, `:price`, `:network`, `:asset`, and `:pay_to` fields.
@@ -140,6 +142,88 @@ The amount may be a non-negative integer or a digit-only string. It is written
 to `PaymentRequirements.amount` for `/settle` and must not exceed the
 advertised maximum. The maximum is settled when no override is supplied.
 
+### Dynamic Pricing
+
+`:price`, `:pay_to`, `:description`, and `:accepts` — and `:price` /
+`:pay_to` inside each `:accepts` entry — may be 1-arity functions of the
+`Plug.Conn` instead of static values. They are evaluated on every gated
+request, once, before the 402 advertisement is built and before the
+client's `accepted` requirements are matched, so a single request always
+sees one set of terms:
+
+```elixir
+%{
+  method: :get,
+  path: "/api/report/:format",
+  price: fn conn ->
+    case conn.assigns.x402_path_params["format"] do
+      "pdf" -> "20000"
+      _other -> "10000"
+    end
+  end,
+  pay_to: fn conn -> MyApp.Billing.receiver_for(conn.assigns.current_tenant) end,
+  network: "eip155:8453",
+  asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+}
+```
+
+The paying request evaluates the functions again on its own conn, and the
+resulting requirements are what the echoed `accepted` must match — so
+anything the function reads must be stable between the unpaid and paid
+requests (path parameters, headers, a session), not a clock or a random
+value. A function returns the plain value or `{:ok, value}`; returning
+`{:error, reason}` — or a value that fails the same validation as its
+static counterpart (atomic-unit amounts, known schemes, the
+`authorization` payment flow) — answers **500** and emits
+`[:x402, :plug, :payment_rejected]` with
+`reason: {:dynamic_route_error, reason}`. The reason never reaches the
+client.
+
+### Path Parameters
+
+A route `:path` may be a template with `:param` segments. Each parameter
+matches exactly one non-empty path segment, and the captured values are
+assigned as `:x402_path_params` on every gated request — paid or not — so
+they are available to dynamic pricing functions, hooks, and your handler:
+
+```elixir
+%{
+  method: :get,
+  path: "/api/users/:id/reports/:report_id",
+  price: "10000",
+  network: "eip155:8453",
+  asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  pay_to: "0xYourWalletAddress"
+}
+
+# GET /api/users/42/reports/7
+conn.assigns.x402_path_params
+#=> %{"id" => "42", "report_id" => "7"}
+```
+
+The advertised `resource.url` is always the concrete request URL. To list
+the route in a facilitator's bazaar, add the `:bazaar` option — a keyword
+list of `X402.Extensions.Bazaar.build_extension/1` options — and the 402
+additionally advertises the discovery extension under
+`extensions["bazaar"]`. For `:param` routes the extension carries the
+template as the top-level `routeTemplate` catalog key and the captured
+values as `info.input.pathParams`, per the
+[bazaar spec](https://github.com/x402-foundation/x402/blob/main/specs/extensions/bazaar.md);
+glob routes cannot be advertised:
+
+```elixir
+%{
+  method: :get,
+  path: "/api/users/:id",
+  price: "10000",
+  network: "eip155:8453",
+  asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  pay_to: "0xYourWalletAddress",
+  service_name: "MyApp Users",
+  bazaar: [method: :get, output: [type: "json"]]
+}
+```
+
 ## Lifecycle Hooks
 
 Hooks let you intercept the payment flow for logging, custom validation, or
@@ -185,6 +269,128 @@ plug X402.Plug.PaymentGate,
   hooks: MyApp.PaymentHooks,
   routes: [...]
 ```
+
+### Request hooks
+
+Beyond the six facilitator callbacks, the same module may define two
+**optional** resource-server callbacks, mirroring the reference resource
+server's `onProtectedRequest` and `onVerifiedPaymentCanceled`. Both
+receive an `X402.Hooks.RequestContext` — the `conn`, the matched `route`,
+`method`, `path`, `path_params`, and the `requirements` and `extensions`
+about to be advertised:
+
+- `on_protected_request/2` runs for every request that matches a gated
+  route, before any payment processing. Return `{:cont, context}` to
+  proceed — optionally with `context.requirements` or
+  `context.extensions` replaced for this request (a per-caller discount,
+  say); `{:halt, {status, body}}` to answer directly with the
+  JSON-encoded `body`; or `{:halt, :skip_payment}` to run the handler
+  unpaid. An exception or an unexpected return value fails closed with
+  **500**.
+- `on_verified_payment_canceled/2` runs when a payment the facilitator
+  already verified is **not** settled: the handler answered with a status
+  of 400 or above (metadata `reason: :handler_failed` with
+  `:response_status`), or settlement failed before a transaction was
+  broadcast (`reason: :settlement_failed` with `:error`). Its return
+  value is ignored and exceptions are logged, so it is the place for
+  compensating side effects — undo a quota increment, log a refundable
+  authorization. The context carries the verified `payload` and
+  `matched_requirements`.
+
+```elixir
+defmodule MyApp.PaymentHooks do
+  @behaviour X402.Hooks
+  require Logger
+
+  # ... the six facilitator callbacks as above ...
+
+  @impl true
+  def on_protected_request(context, _metadata) do
+    case Plug.Conn.get_req_header(context.conn, "x-api-key") do
+      [key] ->
+        if MyApp.Partners.allowlisted?(key),
+          do: {:halt, :skip_payment},
+          else: {:cont, context}
+
+      _none ->
+        {:cont, context}
+    end
+  end
+
+  @impl true
+  def on_verified_payment_canceled(context, metadata) do
+    Logger.warning("verified payment not settled",
+      reason: metadata.reason,
+      path: context.path,
+      payer: get_in(context.payload, ["payload", "authorization", "from"])
+    )
+  end
+end
+```
+
+A `{:halt, :skip_payment}` emits `[:x402, :plug, :pass_through]` with
+`reason: :hook_skipped`; a `{:halt, {status, body}}` emits
+`[:x402, :plug, :payment_rejected]` with `reason: {:hook_halted, status}`.
+`X402.Hooks.Default` implements neither callback, so existing hook modules
+keep working unchanged.
+
+## Extension Adapters
+
+The `:extensions` option takes `X402.Extension` adapters — `module` or
+`{module, opts}` — that each package one protocol extension's server-side
+lifecycle, so the gate advertises, validates, and observes it from a single
+option instead of you wiring each step per route:
+
+```elixir
+plug X402.Plug.PaymentGate,
+  facilitator: MyApp.Facilitator,
+  payment_identifier_cache: MyApp.PaymentCache,
+  extensions: [
+    {X402.Extensions.PaymentIdentifier.Adapter, required: true},
+    {X402.Extensions.BuilderCode.Adapter, app_code: "my_app", service_codes: ["my_svc"]}
+  ],
+  routes: [...]
+```
+
+On every 402 each adapter's advertisement is merged over the route's
+static `:extensions` map; on every payment the adapter's `validate/3`
+runs after the generic extension echo check (a failure answers **400**
+`invalid_payload` with telemetry reason `{:extension_invalid, key, reason}`);
+and `after_verify/4` / `after_settle/4` are notified with the
+facilitator's results. Adapter options are validated once, at init, so an
+invalid `app_code:` is a configuration error that raises.
+
+Two adapters ship with the SDK:
+
+- `X402.Extensions.PaymentIdentifier.Adapter` (`required:`, default
+  `false`) advertises the payment-identifier extension; the id
+  validation, `required` rule, fingerprint binding, and
+  `:x402_payment_id` assign described under "Payment Identifiers" apply
+  exactly as they do to a static route entry.
+- `X402.Extensions.BuilderCode.Adapter` (`app_code:` required,
+  `service_codes:` at most 5) advertises the
+  [builder-code extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/builder_code.md)
+  — ERC-8021 on-chain attribution — and checks the client's echo with
+  `X402.Extensions.BuilderCode.validate_echo/2`.
+
+Write your own by implementing `X402.Extension`: only `key/0` is required;
+`init/1`, `advertise/2` (receives the `X402.Hooks.RequestContext`, may
+return `nil` to advertise nothing), `validate/3`, `after_verify/4`, and
+`after_settle/4` are optional. Sign-In-With-X keeps its dedicated `:siwx`
+option and bazaar discovery its `:bazaar` route option; both compose with
+adapters.
+
+### Builder code
+
+Whether or not a route advertises `builder-code` — statically through
+`X402.Extensions.BuilderCode.extension/2` or with the adapter above — a
+payment that echoes `extensions["builder-code"]` is checked: malformed
+codes (`^[a-z0-9_]{1,32}$`) and more than ten service codes answer **400**
+`invalid_payload` (telemetry reason `{:invalid_builder_code, detail}`),
+and an app code that differs from the advertised one is an
+`:extension_echo_mismatch` (**400**). The resource server does nothing
+else with the codes: they travel to the facilitator inside the payload,
+which encodes them into the settlement calldata.
 
 ## Local Verification
 
@@ -501,6 +707,7 @@ the protected handler runs:
 | `:x402_extension_responses` | The facilitator's verify-time `EXTENSION-RESPONSES` outcomes, keyed by extension name (only set when the facilitator sent a valid sidechannel) |
 | `:x402_siwx_address` | The wallet address of a request authenticated through Sign-In-With-X instead of paying (only set on that path; the payment assigns above are absent then) |
 | `:x402_siwx_chain_id` | The CAIP-2 chain the Sign-In-With-X proof was signed for (set together with `:x402_siwx_address`) |
+| `:x402_path_params` | The values captured by the route's `:param` segments (set on every request matching a `:param` route, paid or not; absent for exact and glob routes) |
 
 Your controller can access these:
 
@@ -628,9 +835,9 @@ The plug follows the x402 v2 HTTP transport status mapping:
 | Status | When |
 |--------|------|
 | **402** | Payment required (no `PAYMENT-SIGNATURE` header), no matching requirements, a duplicate payment proof, a local pre-check or local-verification rejection, facilitator verification/settlement failure, or a `SIGN-IN-WITH-X` proof that fails verification or belongs to an address with no payment record |
-| **400** | Malformed `PAYMENT-SIGNATURE` header, invalid Base64, invalid JSON, payload too large, wrong `x402Version`, a scheme payload validation failure, a malformed or missing-but-required payment identifier, or an undecodable `SIGN-IN-WITH-X` header |
+| **400** | Malformed `PAYMENT-SIGNATURE` header, invalid Base64, invalid JSON, payload too large, wrong `x402Version`, a scheme payload validation failure, a malformed or missing-but-required payment identifier, an extension adapter or builder-code validation failure, or an undecodable `SIGN-IN-WITH-X` header |
 | **409** | A `payment-identifier` id reused for a request with a different fingerprint (`payment_identifier_conflict`) |
-| **500** | Facilitator transport failure, malformed facilitator response, local-verification infrastructure failure (missing dependency, RPC error, chain-id mismatch), invalid server-provided settlement amount, or response-encoding failure |
+| **500** | Facilitator transport failure, malformed facilitator response, local-verification infrastructure failure (missing dependency, RPC error, chain-id mismatch), a dynamic route function returning an error or invalid value, an `on_protected_request/2` hook that raises or returns an invalid value, invalid server-provided settlement amount, or response-encoding failure |
 
 ## Telemetry Events
 
@@ -638,20 +845,25 @@ The plug emits these telemetry events:
 
 | Event | When |
 |-------|------|
-| `[:x402, :plug, :pass_through]` | Route did not match — request passes through unguarded |
+| `[:x402, :plug, :pass_through]` | Route did not match — request passes through unguarded — or an `on_protected_request/2` hook returned `{:halt, :skip_payment}` (`reason: :hook_skipped`, with `:route`) |
 | `[:x402, :plug, :payment_required]` | 402 returned — no `PAYMENT-SIGNATURE` header |
 | `[:x402, :plug, :payment_verified]` | Payment successfully verified and settled |
-| `[:x402, :plug, :payment_rejected]` | Payment rejected (invalid payload, no match, verification failed, etc.) |
+| `[:x402, :plug, :payment_rejected]` | Payment rejected (invalid payload, no match, verification failed, a hook or dynamic-route error, etc.) |
 | `[:x402, :plug, :siwx_authenticated]` | A `SIGN-IN-WITH-X` proof from a previously paying address let the handler run without payment |
 
-Metadata always includes `:method` and `:path`. Every event except
-`:pass_through` adds `:route`; `:payment_rejected` adds `:reason`
-(`{:siwx, code}` for a failed Sign-In-With-X proof); `:payment_verified`
-adds `:payment_id` when the client echoed a payment identifier extension
-and `:extension_responses` when the facilitator's settle response carried
-the sidechannel; and `:siwx_authenticated` adds `:address` and
-`:chain_id`. Deprecated wire formats additionally emit
-`[:x402, :payment_identifier, :legacy]` and `[:x402, :siwx, :legacy]`.
+Metadata always includes `:method` and `:path`. Every event except an
+unmatched `:pass_through` adds `:route`; `:payment_rejected` adds
+`:reason` — `{:siwx, code}` for a failed Sign-In-With-X proof,
+`{:hook_halted, status}` when `on_protected_request/2` answered the
+request itself, `{:dynamic_route_error, reason}` when a dynamic route
+function failed, `{:extension_invalid, key, reason}` when an extension
+adapter rejected the echo, and `{:invalid_builder_code, detail}` for a
+malformed builder code; `:payment_verified` adds `:payment_id` when the
+client echoed a payment identifier extension and `:extension_responses`
+when the facilitator's settle response carried the sidechannel; and
+`:siwx_authenticated` adds `:address` and `:chain_id`. Deprecated wire
+formats additionally emit `[:x402, :payment_identifier, :legacy]` and
+`[:x402, :siwx, :legacy]`.
 
 ## Full Example
 

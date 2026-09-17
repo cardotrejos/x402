@@ -63,22 +63,26 @@ IO.inspect(receipt["transaction"], label: "settlement tx")
 retries **once** — a payment is never signed or sent twice for the same call.
 Responses that do not require payment pass through untouched.
 
-### Budgets and consent
+### Spend controls and consent
 
-Two options keep an automated payer in check:
+An automated payer signs whatever a server asks for unless you cap it.
+Four options do, and they compose:
 
-- `:max_amount` — an atomic-unit ceiling. Payment options above it are never
-  selected; if nothing affordable is offered you get
+- `:max_amount` — an atomic-unit ceiling per payment. Payment options above
+  it are never selected; if nothing affordable is offered you get
   `{:error, :no_acceptable_requirements}`.
-- `:on_payment_required` — a hook invoked with the decoded `PaymentRequired`
-  map *before* anything is signed. Return `:cancel` to abort with
-  `{:error, :payment_cancelled}`:
+- `:policies` — selection policies (see "Policies" below).
+- `:budget` — a session budget shared across requests (see "Budgets"
+  below).
+- `:on_payment_required` — a consent hook invoked with the decoded
+  `PaymentRequired` map *before* anything is signed. Return `:cancel` to
+  abort with `{:error, :payment_cancelled}`:
 
 ```elixir
 X402.Client.Finch.request(MyApp.Finch, url,
   signer: signer,
   on_payment_required: fn payment_required ->
-    case MyApp.Budget.approve(payment_required["accepts"]) do
+    case MyApp.Approvals.approve(payment_required["accepts"]) do
       :ok -> :ok
       :denied -> :cancel
     end
@@ -86,7 +90,128 @@ X402.Client.Finch.request(MyApp.Finch, url,
 )
 ```
 
+When none of `:max_amount`, `:policies`, or `:budget` is given,
+`X402.Client.Finch` and `X402.MCP.Client` log a warning once per VM.
+
 You can also pin the payment with `:network`, `:scheme`, and `:asset` filters.
+
+#### Policies
+
+A policy is a 2-arity function of a candidate `accepts` entry and the
+decoded `PaymentRequired` map (`nil` when selecting from a bare list). It
+returns `true` to accept the entry, `false` to skip it, or
+`{:error, reason}` to abort selection with that error. Policies run last,
+after the scheme and `:max_amount` filters, and every policy must accept
+an entry for it to be selected. `X402.Client.Policy` ships the common ones:
+
+```elixir
+alias X402.Client.Policy
+
+X402.Client.Finch.request(MyApp.Finch, url,
+  signer: signer,
+  policies: [
+    Policy.max_amount("1000000"),
+    Policy.networks(["eip155:8453", "solana:*"]),
+    Policy.assets(["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]),
+    Policy.schemes(["exact"]),
+    fn requirements, _payment_required ->
+      requirements["payTo"] in MyApp.trusted_receivers()
+    end
+  ]
+)
+```
+
+`networks/1` accepts a trailing `*` as a prefix wildcard; `assets/1`
+compares case-insensitively. The same option is accepted by
+`X402.Client.select_requirements/2`, `X402.Client.build_payment/3`, and
+`X402.MCP.Client.call/3`.
+
+#### Budgets
+
+`:max_amount` and policies judge one payment at a time. `X402.Client.Budget`
+caps what a client commits to across requests: a process with a hard
+`:limit` and optional `:per_asset` limits, in atomic units. Start it in
+your supervision tree and pass it to the drivers:
+
+```elixir
+# In your supervision tree
+children = [
+  {X402.Client.Budget,
+   name: MyApp.PayerBudget,
+   limit: "5000000",
+   per_asset: %{"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" => "1000000"}}
+]
+
+# Per request
+X402.Client.Finch.request(MyApp.Finch, url,
+  signer: signer,
+  max_amount: "10000",
+  budget: MyApp.PayerBudget
+)
+
+X402.Client.Budget.spent(MyApp.PayerBudget)
+#=> %{total: 10000, per_asset: %{"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => 10000}}
+```
+
+The driver reserves the selected amount atomically after the payload is
+built and before the paid retry is sent, so concurrent requests cannot
+collectively overspend; a reservation that does not fit fails the request
+with `{:error, {:budget_exceeded, details}}` (`details.scope` is `:total`
+or `:asset`) and nothing is sent. The reservation is released when the
+payment is not accepted — a transport error on the retry, or a non-2xx
+response without a successful `PAYMENT-RESPONSE` receipt. Everything else
+counts as spent, whether or not the facilitator actually settled: the
+budget is a cap on what the client has *authorized*, not a ledger of
+on-chain transfers. `reserve/3`, `release/3`, and `spent/1` are public for
+transports you drive yourself.
+
+### Lifecycle hooks
+
+For anything beyond selection — auditing, pinning a different entry,
+recovering from a signing failure — implement `X402.Client.Hooks` and pass
+it as `hooks:` to `X402.Client.build_payment/3`,
+`X402.Client.Finch.request/3`, or `X402.MCP.Client.call/3`. The callbacks
+mirror the reference client's `onBeforePaymentCreation`,
+`onAfterPaymentCreation`, and `onPaymentCreationFailure`:
+
+```elixir
+defmodule MyApp.PaymentHooks do
+  @behaviour X402.Client.Hooks
+  require Logger
+
+  @impl true
+  def before_payment(context, _metadata) do
+    # context.requirements is the selected entry; replace it or halt.
+    if context.requirements["payTo"] in MyApp.trusted_receivers(),
+      do: {:cont, context},
+      else: {:halt, :untrusted_receiver}
+  end
+
+  @impl true
+  def after_payment(context, metadata) do
+    Logger.info("signed payment", scheme: metadata.scheme, network: metadata.network)
+    {:cont, context}
+  end
+
+  @impl true
+  def on_payment_failure(context, _metadata), do: {:cont, context}
+end
+```
+
+- `before_payment/2` runs after an entry is selected and before anything
+  is signed. `{:cont, context}` continues — with `context.requirements`
+  replaced, if you changed it; `{:halt, reason}` aborts with
+  `{:error, {:hook_halted, :before_payment, reason}}`.
+- `after_payment/2` runs once the payload is signed and enriched;
+  `context.payload` may be replaced and becomes the returned payload.
+- `on_payment_failure/2` runs when signing or enrichment fails;
+  `{:cont, context}` continues the failure (with `context.error` possibly
+  replaced) and `{:recover, payload}` turns it into `{:ok, payload}`.
+
+Selection failures (`:no_acceptable_requirements`) happen before any hook
+runs. A callback that raises yields
+`{:error, {:hook_callback_failed, callback, reason}}`, and one returning
+outside its contract `{:error, {:hook_invalid_return, callback, value}}`.
 
 ## Bring your own HTTP client
 
@@ -108,6 +233,64 @@ alias X402.{Client, PaymentRequired}
 
 `Client.select_requirements/2` is also public if you want to inspect or
 choose the payment option yourself before signing.
+
+## `exact` payments through Permit2
+
+The exact-EVM scheme defines several *asset transfer methods*, selected by
+the requirements' `extra.assetTransferMethod`. Absent (or `"eip3009"`)
+means the default EIP-3009 `TransferWithAuthorization` flow shown above.
+When a server advertises `"permit2"` — for tokens without EIP-3009
+support — `build_payment/3` signs a Permit2 `PermitWitnessTransferFrom`
+instead, with no change to your code:
+
+```elixir
+# One entry of the 402's `accepts`:
+%{
+  "scheme" => "exact",
+  "network" => "eip155:8453",
+  "amount" => "10000",
+  "asset" => "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "payTo" => "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+  "maxTimeoutSeconds" => 300,
+  "extra" => %{"assetTransferMethod" => "permit2"}
+}
+
+{:ok, payload} = X402.Client.build_payment(payment_required, signer)
+
+payload["payload"]
+#=> %{
+#     "signature" => "0x...",
+#     "permit2Authorization" => %{
+#       "from" => "0x<payer>",
+#       "permitted" => %{"token" => <the requirements' "asset">, "amount" => "10000"},
+#       "spender" => "0x402085c248EeA27D92E8b30b2C58ed07f9E20001",
+#       "nonce" => "0x...",
+#       "deadline" => "1789...",
+#       "witness" => %{"to" => "0x2096...287C", "validAfter" => "0"}
+#     }
+#   }
+```
+
+The scheme payload carries `permit2Authorization` rather than
+`authorization`. Its `spender` is the `x402ExactPermit2Proxy`
+(`X402.Permit2.exact_proxy_address/0`), the only contract able to consume
+the permit; the witness binds the server's `payTo`; `permitted.amount` is
+the exact amount that will be settled; and the permit is valid immediately
+and expires after `maxTimeoutSeconds`. The EIP-712 domain is the canonical
+Permit2 domain, so — unlike EIP-3009 — the requirements need no
+`extra.name` / `extra.version`. As with `upto`, the payer must have
+approved the canonical Permit2 contract for the token once (see the
+[gas-sponsoring extensions](#gas-sponsoring-extensions) for
+facilitator-funded alternatives), and `X402.Permit2.sign_exact/2` is
+available if you want to sign without going through the client.
+
+Any other transfer method is rejected: an `accepts` entry declaring
+`"erc7710"` is not signable (`X402.Scheme.ExactEVM.transfer_method/1`
+returns `{:error, {:unsupported_transfer_method, "erc7710"}}`), so
+selection skips it in favour of another entry — or fails with
+`{:error, :no_acceptable_requirements}` when it is the only one — and
+signing such requirements directly returns the
+`{:unsupported_transfer_method, _}` error.
 
 ## Metered `upto` payments
 
@@ -242,14 +425,88 @@ protocol forbids constructing a payment for a flow you do not implement. A
 `PAYMENT-REQUIRED` offering only such entries yields
 `{:error, :no_acceptable_requirements}`.
 
+## Builder codes
+
+The [builder-code extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/builder_code.md)
+carries ERC-8021 attribution codes that the facilitator encodes into the
+settlement transaction's calldata. A server advertises its app code under
+`extensions["builder-code"]`; a client echoes it and attaches up to 5
+service codes of its own through
+`X402.Extensions.BuilderCode.enricher/1`, on the same `:extensions` option:
+
+```elixir
+alias X402.Extensions.BuilderCode
+
+{:ok, payload} =
+  X402.Client.build_payment(payment_required, signer,
+    extensions: [BuilderCode.enricher(service_codes: "my_client")]
+  )
+
+payload["extensions"]["builder-code"]["info"]
+#=> %{"a" => "my_app", "s" => ["my_client"]}
+```
+
+Codes match `^[a-z0-9_]{1,32}$`; the enricher raises on a malformed one.
+When the server advertised the extension, its `info` (including `a`) and
+`schema` are echoed unchanged and your codes are prepended to any server
+codes, client first and deduplicated, as the reference client merges
+them. When it did not, only `%{"info" => %{"s" => codes}}` is attached —
+never an `a` — as the spec's client behaviour prescribes; pass
+`always: false` to make the enricher a no-op for such servers instead.
+The resource server validates the echo (a changed `a` is rejected) and
+forwards the codes to the facilitator.
+
 ## Signing in with X
 
 When a server advertises the
 [sign-in-with-x extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/sign-in-with-x.md)
 under `extensions["sign-in-with-x"]` of its 402, a wallet that already
 paid for the resource can come back and prove its identity instead of
-paying again. The client half is manual for now — automatic handling in
-`X402.Client.Finch` is planned for 0.8.0 — and takes three calls:
+paying again. `X402.Client.Finch.request/3` (and `X402.MCP.Client.call/3`)
+drive it automatically with the `:siwx` option:
+
+```elixir
+{:ok, %{status: 200, siwx_authenticated: true}} =
+  X402.Client.Finch.request(MyApp.Finch, "https://api.example.com/premium-data",
+    signer: signer,
+    max_amount: "10000",
+    siwx: [chain_id: :auto]
+  )
+```
+
+With `:siwx` set, a 402 that advertises a challenge is answered before
+anything is paid: the client signs the challenge
+(`X402.Client.SIWX.authenticate/4`) and retries the request with the
+`SIGN-IN-WITH-X` header and no payment. A response that is not another
+402 comes back as-is, with `siwx_authenticated: true` for a 2xx — the
+server remembered your address. A second 402 means the address has not
+paid yet (or its record expired): the normal payment flow continues from
+that response, and the paid request carries a proof for the new
+challenge so the server records the payer for next time. The response's
+`siwx_authenticated` is `false` on that path.
+
+The option is a keyword list of `X402.Client.SIWX` options:
+
+- `chain_id:` (required) — the CAIP-2 chain to sign for, or `:auto` to
+  pick the first entry of the challenge's `supportedChains` the signer can
+  sign (EVM signers map to `eip155:*`, Solana signers to `solana:*`).
+- `domain:` — the challenge `domain` you expect. Defaults to the resource
+  URL's host on HTTP; required for MCP, where there is no URL.
+- `address:` — the address placed in the proof (the signer's when omitted).
+- `signature_scheme:` — an optional `signatureScheme` hint copied into the
+  proof.
+
+A challenge whose `domain` or `uri` is not bound to the resource's origin
+is refused (`{:error, {:siwx, :domain_mismatch}}` /
+`{:siwx, :uri_mismatch}`), as is one listing no chain the signer can sign
+(`{:siwx, :unsupported_chain}`). Every attempt emits
+`[:x402, :client, :siwx]` with `:transport`, `:chain_id`, and `:outcome`
+(`:authenticated` or `:payment_required`) — or `:reason` on error.
+
+### Signing a challenge yourself
+
+With another HTTP client, or to control the flow, the underlying pieces
+are three calls:
 
 ```elixir
 alias X402.Extensions.SIWX
@@ -388,4 +645,5 @@ sign with a signer that lacks its callback returns
 
 The client emits `[:x402, :client, :select]`, `[:x402, :client, :sign]`,
 `[:x402, :client, :build]`, and `[:x402, :client, :request]` events with a
-`:status` of `:ok` or `:error` — see `X402.Telemetry`.
+`:status` of `:ok` or `:error`, and `[:x402, :client, :siwx]` when it
+answers a Sign-In-With-X challenge — see `X402.Telemetry`.

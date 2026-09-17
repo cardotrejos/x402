@@ -113,6 +113,38 @@ the same id. The pre-0.7.0 `"paymentIdentifier"` format is still accepted
 but deprecated (removed in 1.0.0) and emits
 `[:x402, :payment_identifier, :legacy]`.
 
+### Builder codes
+
+A payment echoing the
+[builder-code extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/builder_code.md)
+is validated whether or not you advertise it (with
+`extensions: %{"builder-code" => X402.Extensions.BuilderCode.extension("my_app")}`):
+malformed codes or more than ten service codes yield `invalid_payload`,
+and an app code that differs from the advertised one is an extension echo
+mismatch. The codes travel to the facilitator inside the payload, which
+encodes them into the settlement calldata.
+
+### Lifecycle hooks
+
+The `hooks:` module (an `X402.Hooks` implementation, as for the Plug gate)
+may define the two optional resource-server callbacks, which receive an
+`X402.Hooks.RequestContext` with `transport: :mcp`, the `request` params,
+the `tool` name, and the advertised `requirements` and `extensions`:
+
+- `on_protected_request/2` runs on every call before the payment is
+  inspected. Continue with `{:cont, context}` (optionally with replaced
+  requirements or extensions), answer with `{:halt, {status, body}}` — an
+  `isError` result carrying `body` in `structuredContent` — or run the
+  handler unpaid with `{:halt, :skip_payment}` (telemetry
+  `[:x402, :mcp, :pass_through]`, `reason: :hook_skipped`).
+- `on_verified_payment_canceled/2` runs when a verified payment is not
+  settled: the handler returned an error result
+  (`reason: :handler_failed`), raised or threw (`:handler_raised`, with
+  `:error`), or settlement failed (`:settlement_failed`, with `:error`).
+
+See the [Plug/Phoenix Integration](plug-integration.html) guide for an
+example module.
+
 To advertise the price outside a rejection (for example in a `tools/list`
 response), use `X402.MCP.Server.payment_required_result/2`.
 
@@ -182,17 +214,57 @@ and may return the tool result map directly, `{:ok, result}`, or
 results and in `402`/`-32042` JSON-RPC errors (the SEP-1036 elicitation code
 some MCP stacks use for payment flows).
 
-Guardrails, matching `X402.Client.Finch`:
+Guardrails, matching `X402.Client.Finch` (the
+[client guide](client.html) covers each in depth):
 
-- **`max_amount:`** — the budget guard; options above it are never selected.
-  `network:`, `scheme:`, and `asset:` filter selection the same way.
+- **`max_amount:`** — a per-payment ceiling; options above it are never
+  selected. `network:`, `scheme:`, and `asset:` filter selection the same
+  way.
+- **`policies:`** — `X402.Client.Policy` functions (`max_amount/1`,
+  `networks/1`, `assets/1`, `schemes/1`, or your own); every policy must
+  accept an entry for it to be selected.
+- **`budget:`** — an `X402.Client.Budget` shared across calls. The selected
+  amount is reserved before the paid retry and released when that retry
+  comes back as another payment-required result without a successful
+  receipt; a reservation that does not fit fails the call with
+  `{:error, {:budget_exceeded, details}}`.
 - **`on_payment_required:`** — a veto hook invoked with the decoded
   `PaymentRequired` before anything is signed. Return `:cancel` to abort with
   `{:error, :payment_cancelled}`.
+- **`hooks:`** — an `X402.Client.Hooks` module run around payment creation
+  (`before_payment/2`, `after_payment/2`, `on_payment_failure/2`).
 - **Never pays twice** — at most one payment retry per call; a second
   payment-required response is returned as-is, and requests that already
   carry `_meta["x402/payment"]` are refused with
   `{:error, :payment_already_attempted}`.
+
+When none of `max_amount:`, `policies:`, or `budget:` is given a warning is
+logged once per VM.
+
+### Signing in with X
+
+With `siwx:` configured the client answers a `sign-in-with-x` challenge
+advertised in the payment-required result before paying: the tool call is
+retried with the proof in `_meta["x402/sign-in-with-x"]` and no payment.
+A result that is not payment-required is returned with
+`siwx_authenticated: true`; another payment-required result continues
+with the payment flow, the paid call carrying a proof for the new
+challenge so the server records the payer. MCP resources have no HTTP
+origin, so pass `domain:` to pin the challenge to the server you expect:
+
+```elixir
+X402.MCP.Client.call(request, &MyMCP.call_tool/1,
+  signer: signer,
+  max_amount: "10000",
+  siwx: [chain_id: :auto, domain: "mcp.example.com"]
+)
+```
+
+`chain_id:` is a CAIP-2 chain or `:auto` (the first advertised chain the
+signer can sign); `address:` and `signature_scheme:` are optional. If you
+drive the retry yourself, `X402.MCP.put_siwx/2` attaches a proof to a
+request's `_meta` and `X402.MCP.fetch_siwx/1` reads it back;
+`X402.MCP.siwx_meta_key/0` returns the key.
 
 If your MCP client library exposes request `_meta` but you want to drive the
 retry yourself, `X402.MCP.Client.build_payment_meta/3` turns a
@@ -211,8 +283,13 @@ end
 
 - `[:x402, :mcp, :payment_required]` — server advertised payment requirements
 - `[:x402, :mcp, :payment_verified]` — server verified and settled a payment
-- `[:x402, :mcp, :payment_rejected]` — server rejected a payment (`:reason`)
+- `[:x402, :mcp, :payment_rejected]` — server rejected a payment (`:reason`;
+  `{:hook_halted, status}` when `on_protected_request/2` answered the call)
+- `[:x402, :mcp, :pass_through]` — an `on_protected_request/2` hook let the
+  handler run unpaid (`reason: :hook_skipped`)
 - `[:x402, :mcp, :call]` — client drove a tool call (`:status`, `:paid`)
+- `[:x402, :client, :siwx]` — client answered a Sign-In-With-X challenge
+  (`transport: :mcp`, `:chain_id`, `:outcome` or `:reason`)
 
 All events carry `%{count: 1}` measurements.
 

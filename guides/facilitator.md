@@ -5,8 +5,9 @@ payments — and until now, running one meant trusting a hosted service or
 writing your own from scratch. `X402.Facilitator.Engine` (EVM),
 `X402.Facilitator.SVMEngine` (Solana), and `X402.Plug.Facilitator` turn
 this SDK into the facilitator itself: a supervised, self-hosted
-verify/settle service for the `exact` scheme, speaking the same wire
-protocol as the reference facilitators.
+verify/settle service for the `exact` scheme (EIP-3009 and Permit2
+transfer methods) and, on EVM, the metered `upto` scheme, speaking the
+same wire protocol as the reference facilitators.
 
 The engines assemble pieces you may already use — `X402.Verify.EVM` and
 `X402.Verify.SVM` for the full local verification checklists, `X402.RPC`
@@ -174,6 +175,24 @@ canonical cross-SDK `invalidReason` strings. See the
 [Local Payment Verification](local-verification.html) guide for the full
 checklist.
 
+The engine handles every EVM payment kind the verifier does. For `exact`
+requirements declaring `extra.assetTransferMethod: "permit2"` and for
+`upto`, the payload carries a Permit2 `permit2Authorization` and the
+verifier runs the Permit2 checklist instead (spender is the x402 proxy,
+witness recipient, deadline / `validAfter`, amount, token, signature),
+simulating the proxy's `settle` at `:full`. `upto` has one extra
+constraint: the engine only accepts payments whose requirements'
+`extra.facilitatorAddress` — bound into the signed witness — is this
+engine's signer address, because the `x402UptoPermit2Proxy` lets no other
+sender settle; anyone else's is rejected with `upto_facilitator_mismatch`.
+
+`Engine.supported/1` (`GET /supported`) therefore advertises one `exact`
+and one `upto` kind per configured network, no extensions, and the
+signer's address under `"signers" => %{"eip155:*" => [address]}`.
+Resource servers advertising `upto` routes forward that address as
+`extra.facilitatorAddress` (`X402.Facilitator.supported/1` on the client
+side) so clients bind it into their permits.
+
 **SVM** — `SVMEngine.verify/3` runs `X402.Verify.SVM` at `:full`,
 mirroring the exact-SVM specification's static verification path:
 fee-payer identity (the requirements' `extra.feePayer` must be this
@@ -200,11 +219,17 @@ touching the chain.
 **EVM** — after checking the pending store (next section) and
 re-verifying:
 
-1. Builds `transferWithAuthorization` calldata with
-   `X402.EIP3009.transfer_calldata/3` — the same builder verification
-   simulates with, so simulation and settlement cannot diverge. For a
-   verified counterfactual payment, the wallet is deployed first (see
-   Fee-payer safety below).
+1. Builds the settlement calldata with the same builder verification
+   simulates with, so simulation and settlement cannot diverge:
+   `X402.EIP3009.transfer_calldata/3` (`transferWithAuthorization` on the
+   `asset`) for EIP-3009; `X402.Permit2.exact_settle_calldata/2`
+   (`x402ExactPermit2Proxy.settle`) for exact-Permit2; and
+   `X402.Permit2.upto_settle_calldata/3` (`x402UptoPermit2Proxy.settle`
+   for the requirements' `amount`, which re-verification proved to be at
+   most the signed `permitted.amount`) for `upto`. The Permit2
+   transactions target the fixed proxy addresses, never a caller-supplied
+   contract. For a verified counterfactual payment, the wallet is deployed
+   first (see Fee-payer safety below).
 2. Fetches gas and fee data in one batched RPC round-trip:
    `eth_estimateGas` (a revert here is itself a simulation failure and
    rejects the settlement), `eth_maxPriorityFeePerGas` + `eth_feeHistory`
@@ -219,8 +244,10 @@ re-verifying:
 5. Checks the confirmed receipt for the matching ERC-20 `Transfer` event.
    A confirmed receipt only proves the transaction did not revert; the
    `Transfer(from, to, value)` log — checked against the *signed*
-   authorization's `from`, `to`, and `value` and emitted by the
-   requirements' `asset` contract — is what proves the payment moved.
+   authorization's `from`, `to`, and `value` (for Permit2, the permit's
+   `from`, `witness.to`, and `permitted.amount` — or the settled `amount`
+   for `upto`) and emitted by the requirements' `asset` contract — is
+   what proves the payment moved.
    A parseable receipt without the matching event is the terminal
    `invalid_exact_evm_transfer_event_mismatch`; logs the engine cannot
    read structurally leave the transfer unestablished and degrade to the
@@ -472,6 +499,41 @@ operation: it decodes to `nil` and emits
 `:x402_extension_responses` and attaches the settle-time ones to its
 `[:x402, :plug, :payment_verified]` telemetry — see the
 [Plug/Phoenix Integration](plug-integration.html) guide.
+
+## Querying a facilitator's bazaar
+
+The [bazaar extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/bazaar.md)
+gives a facilitator two read-only discovery endpoints, and the client
+side of `X402.Facilitator` covers both (neither runs `X402.Hooks`
+callbacks):
+
+- `X402.Facilitator.list_resources/2` — `GET /discovery/resources`, the
+  full catalog with offset pagination.
+- `X402.Facilitator.search_resources/2` — `GET /discovery/search`, a
+  natural-language search. `:query` is required; `:type` (`"http"` or
+  `"mcp"`), `:pay_to`, `:scheme`, `:network`, and `:extensions` filter;
+  `:limit` and `:cursor` are advisory. The response carries
+  `:resources` (raw string-keyed maps), `:partial_results` (`true` when
+  the facilitator truncated the match list, `nil` when it did not say),
+  and `:pagination` with an opaque `cursor` — pass it back as `:cursor`
+  for the next page until it is `nil`:
+
+```elixir
+{:ok, %{resources: resources, pagination: %{cursor: cursor}}} =
+  X402.Facilitator.search_resources(MyApp.Facilitator,
+    query: "weather forecast APIs",
+    network: "eip155:8453",
+    limit: 10
+  )
+```
+
+Both validate the response fail-closed (a malformed body is
+`{:error, %X402.Facilitator.Error{type: :malformed_facilitator_response}}`)
+and accept a bare keyword list to target the default facilitator name.
+`X402.Extensions.Bazaar.list_resources/2` and
+`X402.Extensions.Bazaar.search/2` wrap them and parse every entry into
+typed maps, which the pure `filter_by_network/2`, `filter_by_scheme/2`,
+and `filter_by_max_price/2` helpers narrow client-side.
 
 ## Production notes
 
