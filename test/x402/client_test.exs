@@ -16,12 +16,40 @@ defmodule X402.ClientTest.BogusSignScheme do
   def sign(_requirements, _signer, _opts), do: :bogus
 end
 
+defmodule X402.ClientTest.ScriptedHooks do
+  @moduledoc false
+  # Hooks whose behaviour each test scripts through the process dictionary
+  # (hooks run in the calling process). Every invocation is reported back.
+  @behaviour X402.Client.Hooks
+
+  @impl X402.Client.Hooks
+  def before_payment(context, metadata), do: run(:before_payment, context, metadata)
+
+  @impl X402.Client.Hooks
+  def after_payment(context, metadata), do: run(:after_payment, context, metadata)
+
+  @impl X402.Client.Hooks
+  def on_payment_failure(context, metadata), do: run(:on_payment_failure, context, metadata)
+
+  defp run(callback, context, metadata) do
+    send(self(), {:hook, callback, context, metadata})
+
+    case Process.get({:hook_script, callback}) do
+      nil -> {:cont, context}
+      script -> script.(context, metadata)
+    end
+  end
+end
+
 defmodule X402.ClientTest do
   use ExUnit.Case, async: true
 
   doctest X402.Client
 
   alias X402.Client
+  alias X402.Client.Hooks.Context
+  alias X402.Client.Policy
+  alias X402.ClientTest.ScriptedHooks
   alias X402.PaymentRequirements
   alias X402.PaymentSignature
   alias X402.Signer.LocalKey
@@ -191,6 +219,66 @@ defmodule X402.ClientTest do
     test "raises on invalid options" do
       assert_raise NimbleOptions.ValidationError, fn ->
         Client.select_requirements(@payment_required, network: 123)
+      end
+    end
+
+    test "policies filter the signable candidates in order" do
+      cheap = Map.put(@evm_requirements, "amount", "100")
+      payment_required = %{"accepts" => [@evm_requirements, cheap]}
+      test_pid = self()
+
+      seen = fn requirements, seen_payment_required ->
+        send(test_pid, {:policy, requirements["amount"], seen_payment_required})
+        true
+      end
+
+      assert Client.select_requirements(payment_required,
+               policies: [seen, Policy.max_amount("500")]
+             ) == {:ok, cheap}
+
+      assert_received {:policy, "10000", ^payment_required}
+      assert_received {:policy, "100", ^payment_required}
+
+      # Bare lists pass nil as the payment_required.
+      assert Client.select_requirements([cheap], policies: [seen]) == {:ok, cheap}
+      assert_received {:policy, "100", nil}
+
+      assert Client.select_requirements(payment_required,
+               policies: [Policy.networks(["solana:*"])]
+             ) == {:error, :no_acceptable_requirements}
+    end
+
+    test "policies only see entries this client could sign" do
+      test_pid = self()
+
+      seen = fn requirements, _payment_required ->
+        send(test_pid, {:policy, requirements})
+        true
+      end
+
+      payment_required = %{"accepts" => [@solana_requirements, @evm_requirements]}
+
+      assert Client.select_requirements(payment_required, policies: [seen]) ==
+               {:ok, @evm_requirements}
+
+      assert_received {:policy, @evm_requirements}
+      refute_received {:policy, @solana_requirements}
+    end
+
+    test "a policy returning {:error, reason} aborts selection with that reason" do
+      cheap = Map.put(@evm_requirements, "amount", "100")
+      budget = fn _requirements, _payment_required -> {:error, {:budget_exceeded, :daily}} end
+
+      assert Client.select_requirements([@evm_requirements, cheap], policies: [budget]) ==
+               {:error, {:budget_exceeded, :daily}}
+
+      invalid = fn _requirements, _payment_required -> :maybe end
+
+      assert Client.select_requirements([@evm_requirements], policies: [invalid]) ==
+               {:error, {:invalid_policy_result, :maybe}}
+
+      assert_raise NimbleOptions.ValidationError, fn ->
+        Client.select_requirements([@evm_requirements], policies: [fn _one -> true end])
       end
     end
   end
@@ -483,6 +571,183 @@ defmodule X402.ClientTest do
                )
 
       assert plain["extensions"] == %{}
+    end
+  end
+
+  describe "build_payment/3 :hooks" do
+    setup do
+      {:ok, signer: signer()}
+    end
+
+    test "runs before and after hooks with the context and metadata", %{signer: signer} do
+      assert {:ok, payload} =
+               Client.build_payment(@payment_required, signer,
+                 hooks: ScriptedHooks,
+                 max_amount: "10000"
+               )
+
+      assert_received {:hook, :before_payment, %Context{} = before, metadata}
+      assert before.payment_required == @payment_required
+      assert before.requirements == @evm_requirements
+      assert before.opts[:max_amount] == "10000"
+      assert before.payload == nil
+
+      assert metadata == %{
+               operation: :build_payment,
+               hook_module: ScriptedHooks,
+               scheme: "exact",
+               network: "eip155:84532"
+             }
+
+      assert_received {:hook, :after_payment, %Context{payload: ^payload}, _metadata}
+      refute_received {:hook, :on_payment_failure, _context, _metadata}
+    end
+
+    test "before_payment may replace the selected requirements", %{signer: signer} do
+      cheap = Map.put(@evm_requirements, "amount", "100")
+
+      Process.put({:hook_script, :before_payment}, fn context, _metadata ->
+        {:cont, %{context | requirements: cheap}}
+      end)
+
+      assert {:ok, payload} =
+               Client.build_payment(@payment_required, signer, hooks: ScriptedHooks)
+
+      assert payload["accepted"] == cheap
+      assert payload["payload"]["authorization"]["value"] == "100"
+    end
+
+    test "before_payment may halt", %{signer: signer} do
+      Process.put({:hook_script, :before_payment}, fn _context, _metadata ->
+        {:halt, :too_expensive}
+      end)
+
+      assert Client.build_payment(@payment_required, signer, hooks: ScriptedHooks) ==
+               {:error, {:hook_halted, :before_payment, :too_expensive}}
+
+      refute_received {:hook, :after_payment, _context, _metadata}
+      refute_received {:hook, :on_payment_failure, _context, _metadata}
+    end
+
+    test "after_payment may replace the payload", %{signer: signer} do
+      Process.put({:hook_script, :after_payment}, fn context, _metadata ->
+        {:cont, %{context | payload: Map.put(context.payload, "tagged", true)}}
+      end)
+
+      assert {:ok, payload} =
+               Client.build_payment(@payment_required, signer, hooks: ScriptedHooks)
+
+      assert payload["tagged"] == true
+    end
+
+    test "on_payment_failure sees the error and may replace it or recover", %{signer: signer} do
+      missing_domain = Map.put(@evm_requirements, "extra", %{})
+
+      assert Client.build_payment(missing_domain, signer, hooks: ScriptedHooks) ==
+               {:error, {:missing_extra, "name"}}
+
+      assert_received {:hook, :on_payment_failure,
+                       %Context{error: {:missing_extra, "name"}} = ctx, _}
+
+      assert ctx.payment_required == nil
+      refute_received {:hook, :after_payment, _context, _metadata}
+
+      Process.put({:hook_script, :on_payment_failure}, fn context, _metadata ->
+        {:cont, %{context | error: :rewritten}}
+      end)
+
+      assert Client.build_payment(missing_domain, signer, hooks: ScriptedHooks) ==
+               {:error, :rewritten}
+
+      recovered = %{"x402Version" => 2, "accepted" => missing_domain, "payload" => %{}}
+
+      Process.put({:hook_script, :on_payment_failure}, fn _context, _metadata ->
+        {:recover, recovered}
+      end)
+
+      assert Client.build_payment(missing_domain, signer, hooks: ScriptedHooks) ==
+               {:ok, recovered}
+    end
+
+    test "selection failures return before any hook runs", %{signer: signer} do
+      assert Client.build_payment(@payment_required, signer,
+               hooks: ScriptedHooks,
+               max_amount: "1"
+             ) == {:error, :no_acceptable_requirements}
+
+      refute_received {:hook, _callback, _context, _metadata}
+    end
+
+    test "invalid returns are reported per callback", %{signer: signer} do
+      Process.put({:hook_script, :before_payment}, fn _context, _metadata -> :ok end)
+
+      assert Client.build_payment(@payment_required, signer, hooks: ScriptedHooks) ==
+               {:error, {:hook_invalid_return, :before_payment, :ok}}
+
+      Process.put({:hook_script, :before_payment}, fn context, _metadata ->
+        {:cont, %{context | requirements: "nope"}}
+      end)
+
+      assert {:error, {:hook_invalid_return, :before_payment, {:cont, %Context{}}}} =
+               Client.build_payment(@payment_required, signer, hooks: ScriptedHooks)
+
+      Process.delete({:hook_script, :before_payment})
+
+      Process.put({:hook_script, :after_payment}, fn context, _metadata ->
+        {:cont, %{context | payload: nil}}
+      end)
+
+      assert {:error, {:hook_invalid_return, :after_payment, {:cont, %Context{}}}} =
+               Client.build_payment(@payment_required, signer, hooks: ScriptedHooks)
+
+      Process.put({:hook_script, :after_payment}, fn _context, _metadata -> {:halt, :no} end)
+
+      assert Client.build_payment(@payment_required, signer, hooks: ScriptedHooks) ==
+               {:error, {:hook_invalid_return, :after_payment, {:halt, :no}}}
+
+      Process.delete({:hook_script, :after_payment})
+      missing_domain = Map.put(@evm_requirements, "extra", %{})
+
+      Process.put({:hook_script, :on_payment_failure}, fn _context, _metadata ->
+        {:recover, "payload"}
+      end)
+
+      assert Client.build_payment(missing_domain, signer, hooks: ScriptedHooks) ==
+               {:error,
+                {:hook_invalid_return, :on_payment_failure, {:invalid_recovery_result, "payload"}}}
+
+      Process.put({:hook_script, :on_payment_failure}, fn _context, _metadata -> :ignored end)
+
+      assert Client.build_payment(missing_domain, signer, hooks: ScriptedHooks) ==
+               {:error, {:hook_invalid_return, :on_payment_failure, :ignored}}
+    end
+
+    test "exceptions and exits inside hooks become hook_callback_failed", %{signer: signer} do
+      Process.put({:hook_script, :before_payment}, fn _context, _metadata ->
+        raise ArgumentError, "boom"
+      end)
+
+      assert {:error, {:hook_callback_failed, :before_payment, {:exception, %ArgumentError{}}}} =
+               Client.build_payment(@payment_required, signer, hooks: ScriptedHooks)
+
+      Process.delete({:hook_script, :before_payment})
+      Process.put({:hook_script, :after_payment}, fn _context, _metadata -> throw(:away) end)
+
+      assert Client.build_payment(@payment_required, signer, hooks: ScriptedHooks) ==
+               {:error, {:hook_callback_failed, :after_payment, {:throw, :away}}}
+
+      Process.delete({:hook_script, :after_payment})
+      missing_domain = Map.put(@evm_requirements, "extra", %{})
+      Process.put({:hook_script, :on_payment_failure}, fn _context, _metadata -> exit(:bye) end)
+
+      assert Client.build_payment(missing_domain, signer, hooks: ScriptedHooks) ==
+               {:error, {:hook_callback_failed, :on_payment_failure, {:exit, :bye}}}
+    end
+
+    test "rejects modules that do not implement the behaviour", %{signer: signer} do
+      assert_raise NimbleOptions.ValidationError, ~r/X402.Client.Hooks/, fn ->
+        Client.build_payment(@payment_required, signer, hooks: Enum)
+      end
     end
   end
 

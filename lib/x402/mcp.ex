@@ -25,6 +25,13 @@ defmodule X402.MCP do
   keys, but the x402 `_meta` entries themselves always use the spec's string
   keys `"x402/payment"` and `"x402/payment-response"`.
 
+  ## Sign-In-With-X over MCP
+
+  The MCP transport spec does not say how a `sign-in-with-x` proof travels;
+  this library carries the same Base64 value the HTTP `SIGN-IN-WITH-X`
+  header holds in request `_meta["x402/sign-in-with-x"]` (`put_siwx/2`,
+  `fetch_siwx/1`), mirroring the payment entry.
+
   ## Telemetry
 
   The MCP transport emits the following events, each with `%{count: 1}`
@@ -42,6 +49,7 @@ defmodule X402.MCP do
 
   @payment_meta_key "x402/payment"
   @payment_response_meta_key "x402/payment-response"
+  @siwx_meta_key "x402/sign-in-with-x"
 
   # Legacy x402 JSON-RPC error code carrying PaymentRequired in error data.
   @payment_required_code 402
@@ -73,6 +81,62 @@ defmodule X402.MCP do
   """
   @spec payment_response_meta_key() :: String.t()
   def payment_response_meta_key, do: @payment_response_meta_key
+
+  @doc since: "0.8.0"
+  @doc """
+  Returns the request `_meta` key carrying a Sign-In-With-X proof.
+
+  ## Examples
+
+      iex> X402.MCP.siwx_meta_key()
+      "x402/sign-in-with-x"
+  """
+  @spec siwx_meta_key() :: String.t()
+  def siwx_meta_key, do: @siwx_meta_key
+
+  @doc since: "0.8.0"
+  @doc """
+  Attaches a Sign-In-With-X proof (the Base64 `SIGN-IN-WITH-X` header
+  value) to a tool-call request's `_meta`.
+
+  ## Examples
+
+      iex> request = %{"name" => "search"}
+      iex> X402.MCP.put_siwx(request, "eyJkb21haW4iOiJhcGkuZXhhbXBsZS5jb20ifQ==")
+      %{"name" => "search", "_meta" => %{"x402/sign-in-with-x" => "eyJkb21haW4iOiJhcGkuZXhhbXBsZS5jb20ifQ=="}}
+  """
+  @spec put_siwx(map(), String.t()) :: map()
+  def put_siwx(request, proof) when is_map(request) and is_binary(proof) do
+    put_meta_entry(request, @siwx_meta_key, proof)
+  end
+
+  @doc since: "0.8.0"
+  @doc """
+  Fetches the Sign-In-With-X proof from a tool-call request's `_meta`.
+
+  Returns the Base64 value as sent; decode it with
+  `X402.Extensions.SIWX.decode_signed/1`.
+
+  ## Examples
+
+      iex> request = %{"name" => "search", "_meta" => %{"x402/sign-in-with-x" => "abc"}}
+      iex> X402.MCP.fetch_siwx(request)
+      {:ok, "abc"}
+
+      iex> X402.MCP.fetch_siwx(%{"name" => "search", "_meta" => %{"x402/sign-in-with-x" => ""}})
+      :error
+  """
+  @spec fetch_siwx(map()) :: {:ok, String.t()} | :error
+  def fetch_siwx(request) when is_map(request) do
+    with meta when is_map(meta) <- Utils.map_value(request, @meta_keys),
+         proof when is_binary(proof) and proof != "" <- Map.get(meta, @siwx_meta_key) do
+      {:ok, proof}
+    else
+      _other -> :error
+    end
+  end
+
+  def fetch_siwx(_request), do: :error
 
   @doc since: "0.6.0"
   @doc """
@@ -364,7 +428,7 @@ defmodule X402.MCP do
     end
   end
 
-  @spec put_meta_entry(map(), String.t(), map()) :: map()
+  @spec put_meta_entry(map(), String.t(), map() | String.t()) :: map()
   defp put_meta_entry(map, key, value) do
     meta =
       case Utils.map_value(map, @meta_keys) do

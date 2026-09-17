@@ -3,8 +3,13 @@ defmodule X402.MCP.ClientTest do
 
   doctest X402.MCP.Client
 
+  import ExUnit.CaptureLog
+
+  alias X402.Client.Budget
+  alias X402.Client.Policy
   alias X402.EIP3009
   alias X402.Extensions.PaymentIdentifier.ETSCache
+  alias X402.Extensions.SIWX
   alias X402.MCP
   alias X402.MCP.Client
   alias X402.MCP.Server
@@ -331,6 +336,324 @@ defmodule X402.MCP.ClientTest do
 
       assert Client.call(@request, call_fun, signer: signer()) ==
                {:error, :invalid_tool_result}
+    end
+  end
+
+  describe "call/3 spend controls" do
+    @no_spend_limit_key {X402.Client, :no_spend_limit_warned}
+
+    test "warns once per VM when no spend limit is configured" do
+      :persistent_term.erase(@no_spend_limit_key)
+
+      first =
+        capture_log(fn ->
+          assert {:ok, %{paid: false}} =
+                   Client.call(@request, tracking_fun([@ok_result]), signer: signer())
+        end)
+
+      assert first =~ "[X402.MCP.Client] no spend limit is configured"
+
+      second =
+        capture_log(fn ->
+          assert {:ok, %{paid: false}} =
+                   Client.call(@request, tracking_fun([@ok_result]), signer: signer())
+        end)
+
+      refute second =~ "no spend limit"
+
+      :persistent_term.erase(@no_spend_limit_key)
+      budget = start_supervised!({Budget, limit: 1})
+
+      limited =
+        capture_log(fn ->
+          for opts <- [
+                [max_amount: "1"],
+                [policies: [Policy.max_amount("1")]],
+                [budget: budget]
+              ] do
+            assert {:ok, %{paid: false}} =
+                     Client.call(@request, tracking_fun([@ok_result]), [signer: signer()] ++ opts)
+          end
+        end)
+
+      refute limited =~ "no spend limit"
+    end
+
+    test "policies narrow the advertised requirements" do
+      call_fun = tracking_fun([payment_required_result()])
+
+      assert Client.call(@request, call_fun,
+               signer: signer(),
+               policies: [Policy.networks(["solana:*"])]
+             ) == {:error, :no_acceptable_requirements}
+
+      assert_received {:tool_called, @request}
+      refute_received {:tool_called, _request}
+    end
+
+    test "hooks are forwarded to X402.Client.build_payment/3" do
+      defmodule HaltingHooks do
+        @moduledoc false
+        @behaviour X402.Client.Hooks
+
+        @impl X402.Client.Hooks
+        def before_payment(_context, metadata), do: {:halt, {:mcp, metadata.network}}
+
+        @impl X402.Client.Hooks
+        def after_payment(context, _metadata), do: {:cont, context}
+
+        @impl X402.Client.Hooks
+        def on_payment_failure(context, _metadata), do: {:cont, context}
+      end
+
+      call_fun = tracking_fun([payment_required_result()])
+
+      assert Client.call(@request, call_fun, signer: signer(), hooks: HaltingHooks) ==
+               {:error, {:hook_halted, :before_payment, {:mcp, @network}}}
+
+      assert_received {:tool_called, @request}
+      refute_received {:tool_called, _request}
+    end
+
+    test "reserves against the budget and keeps the amount when the tool answers" do
+      budget = start_supervised!({Budget, limit: 15_000})
+      call_fun = tracking_fun([payment_required_result(), @ok_result])
+
+      assert {:ok, %{paid: true}} =
+               Client.call(@request, call_fun, signer: signer(), budget: budget)
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, _paying}
+
+      assert Budget.spent(budget) == %{
+               total: 10_000,
+               per_asset: %{String.downcase(@asset) => 10_000}
+             }
+
+      call_fun = tracking_fun([payment_required_result()])
+
+      assert {:error, {:budget_exceeded, %{scope: :total, spent: 10_000, amount: 10_000}}} =
+               Client.call(@request, call_fun, signer: signer(), budget: budget)
+
+      assert_received {:tool_called, @request}
+      refute_received {:tool_called, _request}
+    end
+
+    test "releases the reservation when the paid retry is rejected or fails" do
+      budget = start_supervised!({Budget, limit: 10_000})
+
+      call_fun = tracking_fun([payment_required_result(), payment_required_result()])
+
+      assert {:ok, %{paid: true, result: rejected}} =
+               Client.call(@request, call_fun, signer: signer(), budget: budget)
+
+      assert {:ok, _payment_required} = MCP.fetch_payment_required(rejected)
+      assert Budget.spent(budget).total == 0
+
+      call_fun = tracking_fun([payment_required_result(), {:error, :closed}])
+
+      assert Client.call(@request, call_fun, signer: signer(), budget: budget) ==
+               {:error, {:transport_error, :closed}}
+
+      assert Budget.spent(budget).total == 0
+
+      # A payment-required result that still carries a successful receipt
+      # means the money moved: it stays spent.
+      settled =
+        MCP.put_payment_response(payment_required_result(), %{
+          "success" => true,
+          "transaction" => "0xabc",
+          "network" => @network
+        })
+
+      call_fun = tracking_fun([payment_required_result(), settled])
+
+      assert {:ok, %{paid: true, payment_response: %{"success" => true}}} =
+               Client.call(@request, call_fun, signer: signer(), budget: budget)
+
+      assert Budget.spent(budget).total == 10_000
+    end
+
+    test "validates budget, policies, and hooks options" do
+      assert_raise NimbleOptions.ValidationError, ~r/budget/, fn ->
+        Client.call(@request, tracking_fun([]), signer: signer(), budget: "budget")
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/policies/, fn ->
+        Client.call(@request, tracking_fun([]), signer: signer(), policies: [& &1])
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/hooks/, fn ->
+        Client.call(@request, tracking_fun([]), signer: signer(), hooks: Enum)
+      end
+    end
+  end
+
+  describe "call/3 sign-in-with-x" do
+    @domain "mcp.example.com"
+    @siwx_server [
+      domain: @domain,
+      uri: "https://mcp.example.com",
+      supported_chains: [%{chain_id: @network}]
+    ]
+
+    defp challenge_result do
+      payment_required =
+        Map.put(@payment_required, "extensions", %{
+          "sign-in-with-x" => SIWX.challenge(@siwx_server)
+        })
+
+      {:ok, result} = MCP.payment_required_result(payment_required)
+      result
+    end
+
+    defp verify_proof(request) do
+      {:ok, proof} = MCP.fetch_siwx(request)
+      SIWX.verify(proof, @siwx_server)
+    end
+
+    test "authenticates a remembered payer without paying" do
+      signer = signer()
+      call_fun = tracking_fun([challenge_result(), @ok_result])
+
+      assert {:ok, response} =
+               Client.call(@request, call_fun,
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: [chain_id: @network, domain: @domain]
+               )
+
+      assert %{result: @ok_result, paid: false, siwx_authenticated: true, payment_response: nil} =
+               response
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, proving}
+      assert MCP.fetch_payment(proving) == :error
+      assert {:ok, %{address: address, chain_id: @network}} = verify_proof(proving)
+      assert address == signer.address
+      assert proving["arguments"] == @request["arguments"]
+    end
+
+    test "falls back to payment with a fresh proof when the address is unknown" do
+      signer = signer()
+      test_pid = self()
+
+      paid_result =
+        MCP.put_payment_response(@ok_result, %{
+          "success" => true,
+          "transaction" => "0xabc",
+          "network" => @network
+        })
+
+      call_fun = tracking_fun([challenge_result(), challenge_result(), paid_result])
+
+      assert {:ok, response} =
+               Client.call(@request, call_fun,
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: [chain_id: :auto, domain: @domain],
+                 on_payment_required: fn payment_required ->
+                   send(test_pid, {:consent, payment_required})
+                   :ok
+                 end
+               )
+
+      assert %{paid: true, siwx_authenticated: false, payment_response: %{"success" => true}} =
+               response
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, proving}
+      assert_received {:tool_called, paying}
+      refute_received {:tool_called, _request}
+
+      assert MCP.fetch_payment(proving) == :error
+      assert {:ok, first} = verify_proof(proving)
+      assert {:ok, second} = verify_proof(paying)
+      assert first.fields["nonce"] != second.fields["nonce"]
+
+      assert {:ok, payload} = MCP.fetch_payment(paying)
+      assert payload["payload"]["authorization"]["from"] == signer.address
+
+      assert_received {:consent, %{"extensions" => %{"sign-in-with-x" => %{"info" => info}}}}
+      assert info["nonce"] == second.fields["nonce"]
+      refute_received {:consent, _payment_required}
+    end
+
+    test "pays without a proof when the second challenge is gone" do
+      call_fun = tracking_fun([challenge_result(), payment_required_result(), @ok_result])
+
+      assert {:ok, %{paid: true, siwx_authenticated: false}} =
+               Client.call(@request, call_fun,
+                 signer: signer(),
+                 max_amount: "10000",
+                 siwx: [chain_id: @network, domain: @domain]
+               )
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, _proving}
+      assert_received {:tool_called, paying}
+      assert MCP.fetch_siwx(paying) == :error
+      assert {:ok, _payload} = MCP.fetch_payment(paying)
+    end
+
+    test "a payment-required JSON-RPC error answering the proof is paid too" do
+      error = %{"code" => 402, "message" => "Payment required", "data" => @payment_required}
+      call_fun = tracking_fun([challenge_result(), {:error, error}, @ok_result])
+
+      assert {:ok, %{paid: true, siwx_authenticated: false}} =
+               Client.call(@request, call_fun,
+                 signer: signer(),
+                 max_amount: "10000",
+                 siwx: [chain_id: @network, domain: @domain]
+               )
+    end
+
+    test "surfaces signing problems and transport errors" do
+      call_fun = tracking_fun([challenge_result()])
+
+      assert Client.call(@request, call_fun,
+               signer: signer(),
+               siwx: [chain_id: "eip155:1", domain: @domain]
+             ) == {:error, {:siwx, :unsupported_chain}}
+
+      call_fun = tracking_fun([challenge_result()])
+
+      assert Client.call(@request, call_fun,
+               signer: signer(),
+               siwx: [chain_id: @network, domain: "other.example.com"]
+             ) == {:error, {:siwx, :domain_mismatch}}
+
+      # Without a domain there is no HTTP origin to fall back on, so the
+      # challenge is signed unchecked: the option is what binds it.
+      call_fun = tracking_fun([challenge_result(), @ok_result])
+
+      assert {:ok, %{siwx_authenticated: true}} =
+               Client.call(@request, call_fun, signer: signer(), siwx: [chain_id: @network])
+
+      call_fun = tracking_fun([challenge_result(), {:error, :closed}])
+
+      assert Client.call(@request, call_fun,
+               signer: signer(),
+               siwx: [chain_id: @network, domain: @domain]
+             ) == {:error, {:transport_error, :closed}}
+    end
+
+    test "siwx: false and requests already carrying a proof are left alone" do
+      call_fun = tracking_fun([challenge_result(), @ok_result])
+
+      assert {:ok, %{paid: true, siwx_authenticated: false}} =
+               Client.call(@request, call_fun, signer: signer(), siwx: false)
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, paying}
+      assert MCP.fetch_siwx(paying) == :error
+      assert {:ok, _payload} = MCP.fetch_payment(paying)
+    end
+
+    test "validates siwx options" do
+      assert_raise NimbleOptions.ValidationError, ~r/chain_id/, fn ->
+        Client.call(@request, tracking_fun([]), signer: signer(), siwx: [address: "0x1"])
+      end
     end
   end
 

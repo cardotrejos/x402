@@ -23,6 +23,9 @@ defmodule X402.Telemetry do
   - `[:x402, :client, :sign]`
   - `[:x402, :client, :build]`
   - `[:x402, :client, :request]`
+  - `[:x402, :client, :siwx]` — a payer client answered a Sign-In-With-X
+    challenge (metadata `:transport`, `:chain_id`, and `:outcome` —
+    `:authenticated` or `:payment_required` — or `:reason` on error)
   - `[:x402, :rpc, :request]`
   - `[:x402, :verify, :evm]`
   - `[:x402, :verify, :svm]`
@@ -59,6 +62,7 @@ defmodule X402.Telemetry do
           | :verify
           | :settle
           | :legacy
+          | :siwx
   @type status :: :ok | :error
 
   @doc since: "0.1.0"
