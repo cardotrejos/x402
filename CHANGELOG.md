@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Authentication extensions**: `X402.Extensions.AuthHints` builds and
+  reads `auth-hints` declarations for OAuth2 and SIWX, scoped to accepted
+  payment indexes. `X402.Extensions.HTTPMessageSignatures` advertises
+  signature registration, algorithms, and tags. Both include gate adapters.
+  These are advertisements, not automatic credential acquisition or
+  authentication enforcement.
+- **HTTP message signatures**: `X402.HTTPSignature` implements a bounded
+  RFC 9421 request/response profile with Ed25519, ECDSA P-256, and
+  RSA-PSS-SHA512, structured fields, required-coverage and time checks,
+  response-to-request binding, and caller-controlled key lookup.
+  `X402.HTTPSignature.Key` imports/exports public JWKs and generates keys;
+  `X402.Plug.HTTPSignatureDirectory` serves a signed public directory with
+  runtime rotation. Negotiation, automatic key discovery, content-digest
+  validation, and nonce replay storage remain application responsibilities.
+- **Operations controls**: optional verified-payer/IP/custom-key rate
+  limits in the payment gate, a per-node ETS limiter, ordered facilitator
+  failover, optional `Telemetry.Metrics` definitions, and local telemetry
+  statistics. Denied payments return 429 without settlement. With fallbacks,
+  settlement makes one HTTP attempt per endpoint and only fails over on
+  proven non-delivery; TLS alerts, timeouts, and HTTP 5xx remain ambiguous.
+  Single-endpoint retries are unchanged.
 - **Permit2 transfer method for the `exact` EVM scheme**: requirements
   declaring `extra.assetTransferMethod: "permit2"` now run end to end
   alongside the default EIP-3009 flow. `X402.Scheme.ExactEVM` dispatches

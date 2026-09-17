@@ -137,6 +137,7 @@ defmodule X402.MixProject do
         LICENSE: [title: "License"],
         "guides/getting-started.md": [title: "Getting Started"],
         "guides/client.md": [title: "Paying for Resources"],
+        "guides/authentication.md": [title: "Authentication Extensions"],
         "guides/plug-integration.md": [title: "Plug/Phoenix Integration"],
         "guides/custom-schemes.md": [title: "Custom Payment Schemes"],
         "guides/mcp.md": [title: "Paid MCP Tools"],
@@ -187,6 +188,7 @@ defmodule X402.MixProject do
         ],
         "Plug Integration": [
           X402.Plug.PaymentGate,
+          X402.Plug.HTTPSignatureDirectory,
           X402.Paywall,
           X402.Paywall.Default,
           X402.RateLimiter,
@@ -236,13 +238,22 @@ defmodule X402.MixProject do
           X402.Behaviour,
           X402.Utils
         ],
+        "HTTP Message Signatures": [
+          X402.HTTPSignature,
+          X402.HTTPSignature.Key,
+          X402.HTTPSignature.StructuredField
+        ],
         Extensions: [
+          X402.Extensions.AuthHints,
+          X402.Extensions.AuthHints.Adapter,
           X402.Extensions.Bazaar,
           X402.Extensions.Bazaar.Metadata,
           X402.Extensions.BuilderCode,
           X402.Extensions.BuilderCode.Adapter,
           X402.Extensions.EIP2612GasSponsoring,
           X402.Extensions.ERC20ApprovalGasSponsoring,
+          X402.Extensions.HTTPMessageSignatures,
+          X402.Extensions.HTTPMessageSignatures.Adapter,
           X402.Extensions.PaymentIdentifier,
           X402.Extensions.PaymentIdentifier.Adapter,
           X402.Extensions.PaymentIdentifier.Cache,
