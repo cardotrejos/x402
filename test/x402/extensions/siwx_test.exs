@@ -1,5 +1,6 @@
 defmodule X402.Extensions.SIWXTest do
-  use ExUnit.Case, async: true
+  # The legacy-warning test mutates VM-wide persistent_term state.
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 
@@ -529,9 +530,19 @@ defmodule X402.Extensions.SIWXTest do
         nil
       )
 
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+      warning_key = {SIWX, :legacy_format_warned}
+      previous_warning = :persistent_term.get(warning_key, :unset)
 
-      :persistent_term.erase({SIWX, :legacy_format_warned})
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+
+        case previous_warning do
+          :unset -> :persistent_term.erase(warning_key)
+          value -> :persistent_term.put(warning_key, value)
+        end
+      end)
+
+      :persistent_term.erase(warning_key)
 
       log = capture_log(fn -> assert :ok = SIWX.legacy_notice(:gate) end)
       assert log =~ "deprecated"
