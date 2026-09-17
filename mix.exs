@@ -87,6 +87,9 @@ defmodule X402.MixProject do
       # Runtime instrumentation
       {:telemetry, "~> 1.0"},
 
+      # Metric definitions for LiveDashboard / reporters (optional)
+      {:telemetry_metrics, "~> 1.0", optional: true},
+
       # EVM signature verification (optional — only needed for SIWX)
       {:ex_secp256k1, "~> 0.8.0", optional: true},
       {:ex_keccak, "~> 0.7.8", optional: true},
