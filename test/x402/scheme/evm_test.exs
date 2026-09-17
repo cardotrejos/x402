@@ -169,4 +169,130 @@ defmodule X402.Scheme.EVMTest do
                {:error, {:precheck_failed, :invalid_authorization_timing}}
     end
   end
+
+  # -- permit2_precheck/3 -----------------------------------------------------
+
+  @asset "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+  @proxy "0x402085c248EeA27D92E8b30b2C58ed07f9E20001"
+
+  defp permit2_payload(authorization) do
+    %{"payload" => %{"signature" => "0xsig", "permit2Authorization" => authorization}}
+  end
+
+  defp valid_permit2_authorization(overrides \\ %{}) do
+    now = System.system_time(:second)
+
+    Map.merge(
+      %{
+        "from" => "0x2222222222222222222222222222222222222222",
+        "permitted" => %{"token" => @asset, "amount" => "10000"},
+        "spender" => @proxy,
+        "nonce" => "1",
+        "deadline" => Integer.to_string(now + 600),
+        "witness" => %{"to" => @receiver, "validAfter" => Integer.to_string(now - 60)}
+      },
+      overrides
+    )
+  end
+
+  defp permit2_requirements do
+    %{"scheme" => "exact", "payTo" => @receiver, "amount" => "10000", "asset" => @asset}
+  end
+
+  describe "permit2_precheck/3" do
+    test "passes a valid authorization with every option" do
+      assert EVM.permit2_precheck(
+               permit2_payload(valid_permit2_authorization()),
+               permit2_requirements(),
+               enforce_exact_amount: true,
+               spender: @proxy
+             ) == :ok
+    end
+
+    test "skips payloads without a permit2Authorization map" do
+      assert EVM.permit2_precheck(payload(valid_authorization()), permit2_requirements()) == :ok
+      assert EVM.permit2_precheck(%{"payload" => %{"permit2Authorization" => "x"}}, %{}) == :ok
+    end
+
+    test "tolerates malformed witness and permitted objects" do
+      authorization = valid_permit2_authorization(%{"witness" => "nope", "permitted" => 1})
+
+      assert EVM.permit2_precheck(permit2_payload(authorization), permit2_requirements(),
+               enforce_exact_amount: true
+             ) == :ok
+    end
+
+    test "rejects witness recipients that differ from payTo" do
+      authorization =
+        valid_permit2_authorization(%{
+          "witness" => %{
+            "to" => "0x9999999999999999999999999999999999999999",
+            "validAfter" => "0"
+          }
+        })
+
+      assert EVM.permit2_precheck(permit2_payload(authorization), permit2_requirements()) ==
+               {:error, {:precheck_failed, :pay_to_mismatch}}
+    end
+
+    test "enforces the permitted amount only when requested" do
+      authorization =
+        valid_permit2_authorization(%{"permitted" => %{"token" => @asset, "amount" => "9999"}})
+
+      assert EVM.permit2_precheck(permit2_payload(authorization), permit2_requirements(),
+               enforce_exact_amount: true
+             ) == {:error, {:precheck_failed, :amount_mismatch}}
+
+      assert EVM.permit2_precheck(permit2_payload(authorization), permit2_requirements()) == :ok
+    end
+
+    test "rejects tokens that differ from the asset, case-insensitively" do
+      lowercase =
+        valid_permit2_authorization(%{"permitted" => %{"token" => String.downcase(@asset)}})
+
+      assert EVM.permit2_precheck(permit2_payload(lowercase), permit2_requirements()) == :ok
+
+      other = valid_permit2_authorization(%{"permitted" => %{"token" => @receiver}})
+
+      assert EVM.permit2_precheck(permit2_payload(other), permit2_requirements()) ==
+               {:error, {:precheck_failed, :token_mismatch}}
+    end
+
+    test "checks the spender only when one is expected" do
+      authorization =
+        valid_permit2_authorization(%{"spender" => "0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002"})
+
+      assert EVM.permit2_precheck(permit2_payload(authorization), permit2_requirements()) == :ok
+
+      assert EVM.permit2_precheck(permit2_payload(authorization), permit2_requirements(),
+               spender: @proxy
+             ) == {:error, {:precheck_failed, :spender_mismatch}}
+
+      assert EVM.permit2_precheck(permit2_payload(authorization), permit2_requirements(),
+               spender: "0x4020a4f3b7b90cca423b9fabcc0ce57c6c240002"
+             ) == :ok
+    end
+
+    test "applies the settlement window to deadline and validAfter" do
+      now = System.system_time(:second)
+
+      expiring = valid_permit2_authorization(%{"deadline" => Integer.to_string(now + 2)})
+
+      assert EVM.permit2_precheck(permit2_payload(expiring), permit2_requirements()) ==
+               {:error, {:precheck_failed, :authorization_expired}}
+
+      future =
+        valid_permit2_authorization(%{
+          "witness" => %{"to" => @receiver, "validAfter" => Integer.to_string(now + 600)}
+        })
+
+      assert EVM.permit2_precheck(permit2_payload(future), permit2_requirements()) ==
+               {:error, {:precheck_failed, :authorization_not_yet_valid}}
+
+      malformed = valid_permit2_authorization(%{"deadline" => "soon"})
+
+      assert EVM.permit2_precheck(permit2_payload(malformed), permit2_requirements()) ==
+               {:error, {:precheck_failed, :invalid_authorization_timing}}
+    end
+  end
 end

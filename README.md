@@ -15,15 +15,16 @@ facilitator, chain, or web framework.
 ## Features
 
 - x402 v2 `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, and `PAYMENT-RESPONSE` headers with complete requirement and extension-echo validation
-- Payer client signing `"exact"` (EIP-3009), metered `"upto"` (Permit2), and Solana `"exact"` payments, with an automatic `402 → sign → retry` Finch flow
-- Plug/Phoenix payment gate with signature-bound replay protection, optional inline local verification, and settlement only after successful resource handling
+- Payer client signing `"exact"` (EIP-3009 or Permit2, selected by the server's `assetTransferMethod`), metered `"upto"` (Permit2), and Solana `"exact"` payments, with an automatic `402 → sign → retry` Finch flow, spend controls (per-payment caps, selection policies, a shared session budget), lifecycle hooks, and automatic Sign-In-With-X
+- Plug/Phoenix payment gate with signature-bound replay protection, optional inline local verification, settlement only after successful resource handling, dynamic per-request pricing, `:param` route templates, and request lifecycle hooks (`on_protected_request`, `on_verified_payment_canceled`)
 - Local payment verification without trusting a facilitator: EVM (EIP-712 + ERC-1271/6492, balance and simulation checks) and Solana (Ed25519, fee-payer isolation, instruction whitelist)
 - Facilitator `/verify` and `/settle` client with retries, hooks, telemetry, and the `EXTENSION-RESPONSES` sidechannel
-- A runnable facilitator server for EVM and Solana from one Plug — ERC-6492 counterfactual settlement, ERC-20 Transfer-event proof of delivery, pending-settlement reconciliation, per-extension outcome reporting
+- A runnable facilitator server for EVM and Solana from one Plug — EIP-3009, Permit2 `exact`, and `upto` settlement through the x402 Permit2 proxies, ERC-6492 counterfactual settlement, ERC-20 Transfer-event proof of delivery, pending-settlement reconciliation, per-extension outcome reporting
 - Paid MCP tools over the x402 MCP transport, server and client side
 - Browser paywall: a self-contained HTML 402 page with an EIP-1193 wallet flow
 - Pluggable payment schemes through the `X402.Scheme` behaviour
-- Extensions in their spec formats: payment-identifier idempotency with request binding (ETS or Redis), Sign-In-With-X wallet authentication for EVM and Solana (pay once, sign in after), signed offers and receipts, gas sponsoring, Bazaar discovery with validated service metadata
+- Extensions in their spec formats: payment-identifier idempotency with request binding (ETS or Redis), Sign-In-With-X wallet authentication for EVM and Solana (pay once, sign in after), builder-code attribution (ERC-8021), signed offers and receipts, gas sponsoring, Bazaar discovery with validated service metadata, dynamic-route templates, and natural-language search
+- Extension adapters (`X402.Extension`) that advertise, validate, and observe an extension from a single gate option
 - Optional Finch, Plug, Redix, and cryptography dependencies
 
 ## Installation

@@ -1,10 +1,16 @@
 defmodule X402.Client.FinchTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Plug.Conn
   alias X402.Client
+  alias X402.Client.Budget
   alias X402.Client.Finch, as: FinchClient
+  alias X402.Client.Policy
   alias X402.Extensions.PaymentIdentifier.ETSCache
+  alias X402.Extensions.SIWX
+  alias X402.Extensions.SIWX.ETSStorage
   alias X402.PaymentRequired
   alias X402.PaymentResponse
   alias X402.PaymentSignature
@@ -448,6 +454,596 @@ defmodule X402.Client.FinchTest do
       {:ok, header} = Client.encode_payment(payload)
 
       assert {:ok, _decoded} = PaymentSignature.decode_and_validate(header, @requirements)
+    end
+  end
+
+  describe "spend controls" do
+    @no_spend_limit_key {X402.Client, :no_spend_limit_warned}
+
+    test "warns once per VM when no spend limit is configured", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      :persistent_term.erase(@no_spend_limit_key)
+      Bypass.stub(bypass, "GET", "/free", fn conn -> Conn.resp(conn, 200, "free") end)
+
+      first =
+        capture_log(fn ->
+          assert {:ok, %{status: 200}} =
+                   FinchClient.request(finch, url(bypass, "/free"), signer: signer)
+        end)
+
+      assert first =~ "[X402.Client.Finch] no spend limit is configured"
+      assert first =~ "max_amount:"
+
+      second =
+        capture_log(fn ->
+          assert {:ok, %{status: 200}} =
+                   FinchClient.request(finch, url(bypass, "/free"), signer: signer)
+        end)
+
+      refute second =~ "no spend limit"
+
+      :persistent_term.erase(@no_spend_limit_key)
+
+      limited =
+        capture_log(fn ->
+          for opts <- [
+                [max_amount: "1"],
+                [policies: [Policy.max_amount("1")]],
+                [budget: start_supervised!({Budget, limit: 1}, id: :warn_budget)]
+              ] do
+            assert {:ok, %{status: 200}} =
+                     FinchClient.request(finch, url(bypass, "/free"), [signer: signer] ++ opts)
+          end
+        end)
+
+      refute limited =~ "no spend limit"
+    end
+
+    test "policies narrow what the client will pay", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      Bypass.expect_once(bypass, "GET", "/paid", fn conn -> respond_402(conn) end)
+
+      assert FinchClient.request(finch, url(bypass, "/paid"),
+               signer: signer,
+               policies: [Policy.networks(["solana:*"])]
+             ) == {:error, :no_acceptable_requirements}
+
+      Bypass.expect_once(bypass, "GET", "/paid", fn conn -> respond_402(conn) end)
+
+      assert FinchClient.request(finch, url(bypass, "/paid"),
+               signer: signer,
+               policies: [fn _requirements, _payment_required -> {:error, :nope} end]
+             ) == {:error, :nope}
+    end
+
+    test "reserves the amount against the budget and keeps it once the server answers 2xx", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      budget = start_supervised!({Budget, limit: "15000"})
+      counter = :counters.new(1, [])
+
+      Bypass.expect(bypass, "GET", "/paid", fn conn ->
+        case Conn.get_req_header(conn, "payment-signature") do
+          [] ->
+            respond_402(conn)
+
+          [_header] ->
+            :counters.add(counter, 1, 1)
+            Conn.resp(conn, 200, "paid")
+        end
+      end)
+
+      assert {:ok, %{status: 200}} =
+               FinchClient.request(finch, url(bypass, "/paid"), signer: signer, budget: budget)
+
+      assert Budget.spent(budget) == %{
+               total: 10_000,
+               per_asset: %{String.downcase(@contract) => 10_000}
+             }
+
+      # The second payment would exceed the budget: nothing is signed or sent.
+      assert {:error, {:budget_exceeded, details}} =
+               FinchClient.request(finch, url(bypass, "/paid"), signer: signer, budget: budget)
+
+      assert details == %{
+               scope: :total,
+               asset: @contract,
+               amount: 10_000,
+               limit: 15_000,
+               spent: 10_000
+             }
+
+      assert :counters.get(counter, 1) == 1
+      assert Budget.spent(budget).total == 10_000
+    end
+
+    test "releases the reservation when the paid retry is not accepted", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      budget = start_supervised!({Budget, limit: 10_000})
+
+      # Rejected payment: a second 402.
+      Bypass.expect(bypass, "GET", "/always-402", fn conn -> respond_402(conn) end)
+
+      assert {:ok, %{status: 402}} =
+               FinchClient.request(finch, url(bypass, "/always-402"),
+                 signer: signer,
+                 budget: budget
+               )
+
+      assert Budget.spent(budget).total == 0
+
+      # Server error without a receipt.
+      Bypass.expect(bypass, "GET", "/flaky", fn conn ->
+        case Conn.get_req_header(conn, "payment-signature") do
+          [] -> respond_402(conn)
+          [_header] -> Conn.resp(conn, 500, "oops")
+        end
+      end)
+
+      assert {:ok, %{status: 500}} =
+               FinchClient.request(finch, url(bypass, "/flaky"), signer: signer, budget: budget)
+
+      assert Budget.spent(budget).total == 0
+
+      # Transport error on the paid retry.
+      Bypass.expect(bypass, "GET", "/slow", fn conn ->
+        case Conn.get_req_header(conn, "payment-signature") do
+          [] ->
+            respond_402(conn)
+
+          [_header] ->
+            Process.sleep(300)
+            Conn.resp(conn, 200, "late")
+        end
+      end)
+
+      assert {:error, {:transport_error, _reason}} =
+               FinchClient.request(finch, url(bypass, "/slow"),
+                 signer: signer,
+                 budget: budget,
+                 receive_timeout_ms: 100
+               )
+
+      assert Budget.spent(budget).total == 0
+      Bypass.pass(bypass)
+    end
+
+    test "a successful receipt counts as spent even on a non-2xx status", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      budget = start_supervised!({Budget, limit: 10_000})
+
+      Bypass.expect(bypass, "GET", "/settled-anyway", fn conn ->
+        case Conn.get_req_header(conn, "payment-signature") do
+          [] ->
+            respond_402(conn)
+
+          [_header] ->
+            {:ok, response_header} = PaymentResponse.encode(@settlement)
+
+            conn
+            |> Conn.put_resp_header("payment-response", response_header)
+            |> Conn.resp(503, "settled but failed")
+        end
+      end)
+
+      assert {:ok, %{status: 503, payment_response: @settlement}} =
+               FinchClient.request(finch, url(bypass, "/settled-anyway"),
+                 signer: signer,
+                 budget: budget
+               )
+
+      assert Budget.spent(budget).total == 10_000
+    end
+
+    test "validates budget, policies, and hooks options", %{finch: finch, signer: signer} do
+      assert_raise NimbleOptions.ValidationError, ~r/budget/, fn ->
+        FinchClient.request(finch, "https://example.com", signer: signer, budget: "budget")
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/policies/, fn ->
+        FinchClient.request(finch, "https://example.com", signer: signer, policies: [& &1])
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/hooks/, fn ->
+        FinchClient.request(finch, "https://example.com", signer: signer, hooks: Enum)
+      end
+    end
+  end
+
+  describe "sign-in-with-x" do
+    @evm_chain "eip155:8453"
+    @solana_chain "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+
+    defp siwx_server_opts(bypass, chains \\ [@evm_chain]) do
+      [
+        domain: "localhost",
+        uri: "http://localhost:#{bypass.port}",
+        supported_chains: Enum.map(chains, &%{chain_id: &1})
+      ]
+    end
+
+    defp respond_402_with_challenge(conn, bypass, chains \\ [@evm_chain]) do
+      challenge = SIWX.challenge(siwx_server_opts(bypass, chains))
+
+      payment_required =
+        Map.put(@payment_required, "extensions", %{"sign-in-with-x" => challenge})
+
+      {:ok, header} = PaymentRequired.encode(payment_required)
+
+      conn
+      |> Conn.put_resp_header("payment-required", header)
+      |> Conn.resp(402, "{}")
+    end
+
+    defp verify_proof(conn, bypass, chains \\ [@evm_chain]) do
+      [header] = Conn.get_req_header(conn, "sign-in-with-x")
+      SIWX.verify(header, siwx_server_opts(bypass, chains))
+    end
+
+    test "authenticates a remembered payer without paying", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      test_pid = self()
+      handler_id = "finch-siwx-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:x402, :client, :siwx],
+        fn _event, _measurements, metadata, _config -> send(test_pid, {:siwx, metadata}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Bypass.expect(bypass, "GET", "/premium", fn conn ->
+        assert Conn.get_req_header(conn, "payment-signature") == []
+
+        case Conn.get_req_header(conn, "sign-in-with-x") do
+          [] ->
+            respond_402_with_challenge(conn, bypass)
+
+          [_header] ->
+            assert {:ok, identity} = verify_proof(conn, bypass)
+            send(test_pid, {:authenticated, identity})
+            Conn.resp(conn, 200, "welcome back")
+        end
+      end)
+
+      assert {:ok, response} =
+               FinchClient.request(finch, url(bypass, "/premium"),
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: [chain_id: @evm_chain]
+               )
+
+      assert %{status: 200, body: "welcome back", siwx_authenticated: true, payment_response: nil} =
+               response
+
+      assert_received {:authenticated, %{address: address, chain_id: @evm_chain}}
+      assert address == signer.address
+      assert_received {:siwx, %{status: :ok, transport: :http, outcome: :authenticated}}
+    end
+
+    test "falls back to payment with a fresh proof when the address is unknown", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      test_pid = self()
+
+      Bypass.expect(bypass, "GET", "/premium", fn conn ->
+        siwx = Conn.get_req_header(conn, "sign-in-with-x")
+        payment = Conn.get_req_header(conn, "payment-signature")
+
+        case {siwx, payment} do
+          {[], []} ->
+            respond_402_with_challenge(conn, bypass)
+
+          {[_proof], []} ->
+            assert {:ok, identity} = verify_proof(conn, bypass)
+            send(test_pid, {:proof_without_payment, identity.fields["nonce"]})
+            respond_402_with_challenge(conn, bypass)
+
+          {[_proof], [payment_header]} ->
+            assert {:ok, identity} = verify_proof(conn, bypass)
+            send(test_pid, {:proof_with_payment, identity.fields["nonce"], payment_header})
+            {:ok, response_header} = PaymentResponse.encode(@settlement)
+
+            conn
+            |> Conn.put_resp_header("payment-response", response_header)
+            |> Conn.resp(200, "paid")
+        end
+      end)
+
+      assert {:ok, response} =
+               FinchClient.request(finch, url(bypass, "/premium"),
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: [chain_id: :auto],
+                 on_payment_required: fn payment_required ->
+                   send(test_pid, {:consent, payment_required})
+                   :ok
+                 end
+               )
+
+      assert %{status: 200, body: "paid", siwx_authenticated: false} = response
+      assert response.payment_response == @settlement
+
+      assert_received {:proof_without_payment, first_nonce}
+      assert_received {:proof_with_payment, second_nonce, payment_header}
+      assert first_nonce != second_nonce
+      assert {:ok, payload} = PaymentSignature.decode_and_validate(payment_header, @requirements)
+      assert payload["payload"]["authorization"]["from"] == signer.address
+
+      # Consent was asked once, for the challenge that was actually paid.
+      assert_received {:consent, %{"extensions" => %{"sign-in-with-x" => %{"info" => info}}}}
+      assert info["nonce"] == second_nonce
+      refute_received {:consent, _payment_required}
+    end
+
+    test "chain_id: :auto follows the signer family", %{bypass: bypass, finch: finch} do
+      {:ok, signer} = SolanaKey.new(:binary.copy(<<1>>, 32))
+      chains = [@evm_chain, @solana_chain]
+      test_pid = self()
+
+      Bypass.expect(bypass, "GET", "/premium", fn conn ->
+        case Conn.get_req_header(conn, "sign-in-with-x") do
+          [] ->
+            respond_402_with_challenge(conn, bypass, chains)
+
+          [_header] ->
+            assert {:ok, identity} = verify_proof(conn, bypass, chains)
+            send(test_pid, {:authenticated, identity.chain_id})
+            Conn.resp(conn, 200, "welcome back")
+        end
+      end)
+
+      assert {:ok, %{status: 200, siwx_authenticated: true}} =
+               FinchClient.request(finch, url(bypass, "/premium"),
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: [chain_id: :auto]
+               )
+
+      assert_received {:authenticated, @solana_chain}
+    end
+
+    test "pays without a proof when the second 402 carries no challenge", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      test_pid = self()
+
+      Bypass.expect(bypass, "GET", "/premium", fn conn ->
+        siwx = Conn.get_req_header(conn, "sign-in-with-x")
+        payment = Conn.get_req_header(conn, "payment-signature")
+
+        case {siwx, payment} do
+          {[], []} ->
+            respond_402_with_challenge(conn, bypass)
+
+          {[_proof], []} ->
+            respond_402(conn)
+
+          {[], [_payment]} ->
+            send(test_pid, :paid_without_proof)
+            Conn.resp(conn, 200, "paid")
+        end
+      end)
+
+      assert {:ok, %{status: 200, siwx_authenticated: false}} =
+               FinchClient.request(finch, url(bypass, "/premium"),
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: [chain_id: @evm_chain]
+               )
+
+      assert_received :paid_without_proof
+    end
+
+    test "returns a rejected proof's response as-is", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      Bypass.expect(bypass, "GET", "/premium", fn conn ->
+        case Conn.get_req_header(conn, "sign-in-with-x") do
+          [] -> respond_402_with_challenge(conn, bypass)
+          [_header] -> Conn.resp(conn, 401, "invalid_siwx_signature")
+        end
+      end)
+
+      assert {:ok, %{status: 401, body: "invalid_siwx_signature", siwx_authenticated: false}} =
+               FinchClient.request(finch, url(bypass, "/premium"),
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: [chain_id: @evm_chain]
+               )
+    end
+
+    test "surfaces unsupported chains and origin mismatches as {:siwx, reason}", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      Bypass.expect_once(bypass, "GET", "/premium", fn conn ->
+        respond_402_with_challenge(conn, bypass)
+      end)
+
+      assert FinchClient.request(finch, url(bypass, "/premium"),
+               signer: signer,
+               max_amount: "10000",
+               siwx: [chain_id: "eip155:1"]
+             ) == {:error, {:siwx, :unsupported_chain}}
+
+      Bypass.expect_once(bypass, "GET", "/premium", fn conn ->
+        challenge =
+          SIWX.challenge(
+            domain: "api.example.com",
+            uri: "https://api.example.com",
+            supported_chains: [%{chain_id: @evm_chain}]
+          )
+
+        payment_required =
+          Map.put(@payment_required, "extensions", %{"sign-in-with-x" => challenge})
+
+        {:ok, header} = PaymentRequired.encode(payment_required)
+
+        conn
+        |> Conn.put_resp_header("payment-required", header)
+        |> Conn.resp(402, "{}")
+      end)
+
+      assert FinchClient.request(finch, url(bypass, "/premium"),
+               signer: signer,
+               max_amount: "10000",
+               siwx: [chain_id: @evm_chain]
+             ) == {:error, {:siwx, :domain_mismatch}}
+
+      Bypass.expect_once(bypass, "GET", "/premium", fn conn ->
+        respond_402_with_challenge(conn, bypass)
+      end)
+
+      {:ok, solana} = SolanaKey.new(:binary.copy(<<1>>, 32))
+
+      assert FinchClient.request(finch, url(bypass, "/premium"),
+               signer: solana,
+               max_amount: "10000",
+               siwx: [chain_id: :auto]
+             ) == {:error, {:siwx, :unsupported_chain}}
+    end
+
+    test "siwx: false and no challenge keep the plain payment flow", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      counter = :counters.new(1, [])
+
+      Bypass.expect(bypass, "GET", "/premium", fn conn ->
+        :counters.add(counter, 1, 1)
+        assert Conn.get_req_header(conn, "sign-in-with-x") == []
+
+        case Conn.get_req_header(conn, "payment-signature") do
+          [] -> respond_402_with_challenge(conn, bypass)
+          [_header] -> Conn.resp(conn, 200, "paid")
+        end
+      end)
+
+      assert {:ok, %{status: 200, siwx_authenticated: false}} =
+               FinchClient.request(finch, url(bypass, "/premium"),
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: false
+               )
+
+      assert :counters.get(counter, 1) == 2
+
+      Bypass.expect(bypass, "GET", "/plain", fn conn ->
+        assert Conn.get_req_header(conn, "sign-in-with-x") == []
+
+        case Conn.get_req_header(conn, "payment-signature") do
+          [] -> respond_402(conn)
+          [_header] -> Conn.resp(conn, 200, "paid")
+        end
+      end)
+
+      assert {:ok, %{status: 200, siwx_authenticated: false}} =
+               FinchClient.request(finch, url(bypass, "/plain"),
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: [chain_id: @evm_chain]
+               )
+    end
+
+    test "validates siwx options", %{finch: finch, signer: signer} do
+      assert_raise NimbleOptions.ValidationError, ~r/chain_id/, fn ->
+        FinchClient.request(finch, "https://example.com", signer: signer, siwx: [address: "0x1"])
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/siwx/, fn ->
+        FinchClient.request(finch, "https://example.com", signer: signer, siwx: true)
+      end
+    end
+
+    test "end to end: pay once with a proof, then sign in through the gate", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      facilitator = start_bypass_facilitator(self())
+      cache = start_supervised!({ETSCache, []})
+      suffix = System.unique_integer([:positive, :monotonic])
+      storage = :"finch_siwx_storage_#{suffix}"
+
+      start_supervised!({ETSStorage, name: storage, table: :"finch_siwx_storage_table_#{suffix}"})
+
+      nonce_cache =
+        start_supervised!({ETSCache, name: :"finch_siwx_nonces_#{suffix}"}, id: :siwx_nonces)
+
+      gate_opts =
+        PaymentGate.init(
+          facilitator: facilitator,
+          payment_identifier_cache: cache,
+          siwx:
+            siwx_server_opts(bypass) ++
+              [storage: {ETSStorage, storage}, nonce_cache: nonce_cache],
+          routes: [
+            %{
+              method: :get,
+              path: "/premium",
+              price: "10000",
+              network: "eip155:84532",
+              asset: @contract,
+              pay_to: @receiver,
+              max_timeout_seconds: 300,
+              extra: %{"name" => "USDC", "version" => "2"}
+            }
+          ]
+        )
+
+      Bypass.expect(bypass, "GET", "/premium", fn conn ->
+        conn = PaymentGate.call(conn, gate_opts)
+
+        case conn.halted do
+          true -> conn
+          false -> Conn.send_resp(conn, 200, ~s({"premium":true}))
+        end
+      end)
+
+      client_opts = [signer: signer, max_amount: "10000", siwx: [chain_id: :auto]]
+
+      # First visit: the proof is unknown, so the client pays (with the proof
+      # attached) and the gate records the payer at settlement.
+      assert {:ok, first} = FinchClient.request(finch, url(bypass, "/premium"), client_opts)
+
+      assert %{status: 200, siwx_authenticated: false, payment_response: %{"success" => true}} =
+               first
+
+      assert_received {:facilitator_settle, _payload, _requirements}
+
+      # Second visit: the proof alone opens the door.
+      assert {:ok, second} = FinchClient.request(finch, url(bypass, "/premium"), client_opts)
+      assert %{status: 200, siwx_authenticated: true, payment_response: nil} = second
+      assert second.body == ~s({"premium":true})
+      refute_received {:facilitator_settle, _payload, _requirements}
     end
   end
 

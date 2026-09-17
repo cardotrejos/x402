@@ -507,6 +507,90 @@ defmodule X402.Plug.PaymentGateSIWXTest do
       assert ETSStorage.get(storage, @receiver, @access_resource) == {:error, :not_found}
     end
 
+    for scheme <- ["exact", "upto"] do
+      test "#{scheme} Permit2 grants use only the verified authorization's from", %{
+        siwx: siwx,
+        storage: storage
+      } do
+        {:ok, %{body: body}} = @default_settle
+        settle = {:ok, %{status: 200, body: Map.delete(body, "payer")}}
+        facilitator = start_mock_facilitator(settle: settle)
+        scheme = unquote(scheme)
+        extra = %{"assetTransferMethod" => "permit2"}
+        route = Map.merge(@route, %{scheme: scheme, extra: extra})
+
+        payload =
+          valid_payment_payload()
+          |> put_in(["accepted", "scheme"], scheme)
+          |> put_in(["accepted", "extra"], extra)
+          |> put_in(["payload", "authorization", "from"], @address)
+          |> put_in(["payload", "permit2Authorization"], %{
+            "from" => @receiver,
+            "permitted" => %{"amount" => @amount}
+          })
+
+        for payload <- [
+              payload,
+              update_in(payload, ["payload"], &Map.delete(&1, "authorization"))
+            ] do
+          :ok = ETSStorage.delete(storage, @receiver, @access_resource)
+
+          paid =
+            conn(:get, "/api/resource")
+            |> put_req_header("payment-signature", encode_header(payload))
+            |> run_request(gate_opts(routes: [route], siwx: siwx, facilitator: facilitator))
+
+          assert paid.status == 200
+          assert {:ok, _record} = ETSStorage.get(storage, @receiver, @access_resource)
+          assert ETSStorage.get(storage, @address, @access_resource) == {:error, :not_found}
+        end
+      end
+    end
+
+    test "missing Permit2 from never falls back to an alternate EIP-3009 payer", %{
+      siwx: siwx,
+      storage: storage
+    } do
+      {:ok, %{body: body}} = @default_settle
+      settle = {:ok, %{status: 200, body: Map.delete(body, "payer")}}
+      facilitator = start_mock_facilitator(settle: settle)
+      extra = %{"assetTransferMethod" => "permit2"}
+      route = Map.put(@route, :extra, extra)
+
+      payload =
+        valid_payment_payload()
+        |> put_in(["accepted", "extra"], extra)
+        |> put_in(["payload", "permit2Authorization"], %{"permitted" => %{"amount" => @amount}})
+
+      paid =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", encode_header(payload))
+        |> run_request(gate_opts(routes: [route], siwx: siwx, facilitator: facilitator))
+
+      assert paid.status == 200
+      assert ETSStorage.get(storage, @receiver, @access_resource) == {:error, :not_found}
+    end
+
+    test "unknown transfer methods cannot provision a payload-derived grant", %{
+      siwx: siwx,
+      storage: storage
+    } do
+      {:ok, %{body: body}} = @default_settle
+      settle = {:ok, %{status: 200, body: Map.delete(body, "payer")}}
+      facilitator = start_mock_facilitator(settle: settle)
+      extra = %{"assetTransferMethod" => "custom"}
+      route = Map.put(@route, :extra, extra)
+      payload = put_in(valid_payment_payload(), ["accepted", "extra"], extra)
+
+      paid =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", encode_header(payload))
+        |> run_request(gate_opts(routes: [route], siwx: siwx, facilitator: facilitator))
+
+      assert paid.status == 200
+      assert ETSStorage.get(storage, @receiver, @access_resource) == {:error, :not_found}
+    end
+
     test "logs and still serves the response when storage rejects the record", %{cache: cache} do
       facilitator = start_mock_facilitator()
       siwx = @siwx ++ [storage: FailingStorage, nonce_cache: cache]

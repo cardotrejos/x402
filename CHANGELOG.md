@@ -9,6 +9,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Permit2 transfer method for the `exact` EVM scheme**: requirements
+  declaring `extra.assetTransferMethod: "permit2"` now run end to end
+  alongside the default EIP-3009 flow. `X402.Scheme.ExactEVM` dispatches
+  on `transfer_method/1` (absent or `"eip3009"`, `"permit2"`; anything
+  else — `"erc7710"` included — is `{:unsupported_transfer_method, value}`
+  and never selected by the client). `X402.Client.build_payment/3` signs a
+  Permit2 `PermitWitnessTransferFrom` through `X402.Permit2.sign_exact/2`
+  — spender `x402ExactPermit2Proxy` (`exact_proxy_address/0`), witness
+  `payTo`, permitted amount the exact `amount` — producing a
+  `%{"signature", "permit2Authorization"}` scheme payload;
+  `build_exact_authorization/2`, `domain/1`, and `digest/2` (the witness
+  shape selects the EIP-712 type) generalise the upto helpers, which remain
+  as aliases. `X402.Scheme.EVM.permit2_precheck/3` runs the local
+  pre-checks (recipient, amount, token, spender, validity window) before
+  the facilitator round-trip, and `X402.Facilitator.verify/2` and
+  `settle/2` reject an exact-Permit2 payload whose `permitted.amount`
+  differs from the requirements (`{:invalid_exact_payment,
+  :amount_mismatch}`) without calling out. `X402.Verify.EVM` detects the
+  payment `kind` (`:eip3009`, `:permit2_exact`, `:permit2_upto`) and runs
+  the reference facilitator's Permit2 checklist in order at every level —
+  scheme, network, spender, recipient, deadline, `validAfter`, amount,
+  token, signature — with `:full` additionally requiring the proxy to be
+  deployed, simulating the proxy's `settle` (`upto` as the witness
+  facilitator), classifying Permit2 / proxy custom errors by selector or
+  revert text, and diagnosing unexplained reverts via `PERMIT2()`,
+  `balanceOf`, and `allowance(payer, Permit2)`; the `permit2_*` and
+  `upto_*` reasons are new. `X402.Facilitator.Engine` settles exact-Permit2
+  and `upto` through the x402 proxies with calldata from
+  `X402.Permit2.exact_settle_calldata/2` / `upto_settle_calldata/3` (the
+  same encoders verification simulates with), `supported/1` advertises
+  `exact` and `upto` per network, and `upto` is routed only when
+  `extra.facilitatorAddress` is the engine's signer. `X402.Plug.PaymentGate`
+  selects replay identity using the matched requirements' transfer method,
+  ignoring unsigned alternate authorization fields, and derives exact-Permit2
+  keys from the signed permit's `from` + `nonce`; exact and upto share the
+  `evm-permit2:` prefix because Permit2
+  nonces are per owner, not per spender. SIWX payer fallback uses that same
+  requirements-bound authorization when settlement omits `payer`
+- **Resource-server lifecycle hooks — `X402.Hooks`
+  `on_protected_request/2` and `on_verified_payment_canceled/2`**: two
+  optional callbacks invoked by `X402.Plug.PaymentGate` and
+  `X402.MCP.Server` with an `X402.Hooks.RequestContext` (transport, conn
+  or MCP request, matched route, `method` / `path` / `path_params` or
+  `tool`, and the requirements and extensions about to be advertised),
+  mirroring the reference resource server's `onProtectedRequest` and
+  `onVerifiedPaymentCanceled`. `on_protected_request/2` runs before any
+  payment processing on every request matching a gated route or paid tool
+  and may continue with `{:cont, context}` — optionally replacing
+  `context.requirements` or `context.extensions` for that request, for a
+  per-caller discount — answer directly with `{:halt, {status, body}}`
+  (telemetry `reason: {:hook_halted, status}`), or let the handler run
+  unpaid with `{:halt, :skip_payment}` (`[:x402, :plug, :pass_through]` /
+  `[:x402, :mcp, :pass_through]` with `reason: :hook_skipped`); an
+  exception or invalid return fails closed with an internal error.
+  `on_verified_payment_canceled/2` runs when a payment the facilitator
+  verified is not settled — the handler answered a status of 400 or above
+  or returned an `isError` result (`reason: :handler_failed`), the MCP
+  handler raised (`:handler_raised`), or settlement failed before a
+  transaction was broadcast (`:settlement_failed`) — with its return value
+  ignored and exceptions logged. `X402.Hooks.Default` implements neither,
+  so existing hook modules keep working unchanged
+- **Extension adapters — `X402.Extension`**: a behaviour packaging one
+  protocol extension's server-side lifecycle (`key/0`, optional `init/1`,
+  `advertise/2`, `validate/3`, `after_verify/4`, `after_settle/4`) so the
+  gate runs it from a single option. `X402.Plug.PaymentGate` gains
+  `:extensions` — `[module | {module, opts}]` — whose adapters advertise
+  on every 402 (merged over each route's static `extensions` map),
+  validate the client's echo after the generic echo check (a failure
+  answers **400** `invalid_payload` with reason
+  `{:extension_invalid, key, reason}`), and are notified with the
+  facilitator's verify and settle results. Bundled adapters:
+  `X402.Extensions.PaymentIdentifier.Adapter` (`required:`) and
+  `X402.Extensions.BuilderCode.Adapter` (`app_code:`, `service_codes:`)
+- **Builder-code spec format — `X402.Extensions.BuilderCode`**: the
+  [builder-code extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/builder_code.md)
+  (ERC-8021 on-chain attribution). Servers advertise the app code and up
+  to 5 service codes with `extension/2`; clients echo it and attach up to
+  5 service codes of their own through `enricher/1` for
+  `X402.Client.build_payment/3`'s `:extensions` option (`always: true`
+  attaches `s` even when not advertised, never `a`). Codes match
+  `^[a-z0-9_]{1,32}$` (`valid_code?/1`); servers read an echo with
+  `extract/1` and enforce the spec's echo rules with `validate_echo/2`.
+  `X402.Plug.PaymentGate` and `X402.MCP.Server` run those rules on every
+  payload echoing `extensions["builder-code"]`, advertised or not:
+  malformed codes and more than ten service codes are rejected with
+  **400** `invalid_payload` (reason `{:invalid_builder_code, detail}`),
+  and an app code differing from the advertised one is an
+  `:extension_echo_mismatch`. The codes travel to the facilitator inside
+  the payload, which encodes them into the settlement calldata
+- **Dynamic route pricing in `X402.Plug.PaymentGate`**: the route fields
+  `:price`, `:pay_to`, `:description`, and `:accepts` — and `:price` /
+  `:pay_to` inside each `:accepts` entry — may be 1-arity functions of
+  the `Plug.Conn`, evaluated once per gated request before the 402
+  advertisement and before the client's `accepted` is matched. A
+  function returns the plain value or `{:ok, value}`; `{:error, reason}`
+  or an invalid value answers **500** and emits
+  `[:x402, :plug, :payment_rejected]` with
+  `reason: {:dynamic_route_error, reason}`, never reaching the client
+- **`:param` route patterns and the `:bazaar` route option in
+  `X402.Plug.PaymentGate`**: a route `:path` may be a template with
+  `:param` segments (`/api/users/:id`), each matching one non-empty
+  segment; the captured values are assigned as `:x402_path_params`
+  (`%{"id" => "42"}`) on every gated request, paid or not, and are
+  available to dynamic pricing functions and hooks. The `:bazaar` route
+  option (a keyword list of `X402.Extensions.Bazaar.build_extension/1`
+  options) advertises the discovery extension under
+  `extensions["bazaar"]` on every 402; for `:param` routes it carries
+  the template as the top-level `routeTemplate` catalog key and the
+  captured values as `info.input.pathParams`. Globs cannot be advertised
+- **Bazaar discovery search — `X402.Facilitator.search_resources/2` and
+  `X402.Extensions.Bazaar.search/2`**: the natural-language
+  `GET /discovery/search` endpoint. Parameters (`:query` required;
+  `:type`, `:pay_to`, `:scheme`, `:network`, `:extensions`, `:limit`,
+  `:cursor`) are validated with `NimbleOptions` and sent as query string
+  parameters; the response (`:resources`, `:partial_results`,
+  `:pagination` with an opaque `cursor`) is validated fail-closed.
+  `X402.Extensions.Bazaar.search/2` parses each entry into the same typed
+  maps as `list_resources/2`. Both accept a bare keyword list to target
+  the default facilitator name
+- **Client lifecycle hooks — `X402.Client.Hooks`**: `before_payment/2`
+  (after selection, before signing — may replace `context.requirements`
+  or `{:halt, reason}`), `after_payment/2` (may replace
+  `context.payload`), and `on_payment_failure/2` (may replace the error
+  or `{:recover, payload}`), mirroring the reference client's
+  `onBeforePaymentCreation` / `onAfterPaymentCreation` /
+  `onPaymentCreationFailure`, with `X402.Client.Hooks.Context` and the
+  no-op `X402.Client.Hooks.Default`. Passed as `hooks:` to
+  `X402.Client.build_payment/3`, `X402.Client.Finch.request/3`, and
+  `X402.MCP.Client.call/3`. Hook errors surface as
+  `{:hook_halted, callback, reason}`,
+  `{:hook_callback_failed, callback, reason}`, or
+  `{:hook_invalid_return, callback, value}`
+- **Client spend controls — `X402.Client.Policy` and
+  `X402.Client.Budget`**: the `policies:` option of
+  `X402.Client.select_requirements/2` (and every function and driver
+  built on it) takes 2-arity functions of the candidate requirements and
+  the `PaymentRequired` map returning `true`, `false`, or
+  `{:error, reason}`; every policy must accept an entry for it to be
+  selected. Ready-made ones: `max_amount/1`, `networks/1` (trailing `*`
+  wildcard), `assets/1` (case-insensitive), and `schemes/1`.
+  `X402.Client.Budget` is a session budget process (`start_link/1` with
+  `:limit` and optional `:per_asset`, `reserve/3`, `release/3`,
+  `spent/1`); the `budget:` driver option reserves the selected amount
+  before the paid retry is sent, fails with
+  `{:error, {:budget_exceeded, details}}` when a limit would be
+  exceeded, and releases the reservation when the payment is not
+  accepted. When none of `max_amount:`, `policies:`, or `budget:` is
+  configured, `X402.Client.Finch` and `X402.MCP.Client` log a one-time
+  warning that the client will sign any amount a server asks for
+- **Automatic Sign-In-With-X on the client — `X402.Client.SIWX`**: the
+  `siwx:` option of `X402.Client.Finch.request/3` and
+  `X402.MCP.Client.call/3` (`chain_id:` — a CAIP-2 chain or `:auto` to
+  pick the first advertised `supportedChains` entry the signer can sign
+  — plus optional `address:`, `signature_scheme:`, and `domain:`, the
+  latter required for MCP and defaulting to the resource URL's host on
+  HTTP). When the 402 advertises a `sign-in-with-x` challenge the client
+  signs it (`X402.Client.SIWX.authenticate/4`, refusing challenges not
+  bound to the expected origin, or lacking a trusted domain/resource URL;
+  domain matching ignores case without dropping port boundaries)
+  and retries with the proof and no
+  payment; a response that is not payment-required is returned with
+  `siwx_authenticated: true`, otherwise the payment flow continues with
+  the proof attached to the paid request too. MCP proofs travel in
+  request `_meta["x402/sign-in-with-x"]` (`X402.MCP.siwx_meta_key/0`,
+  `put_siwx/2`, `fetch_siwx/1`). Each attempt emits
+  `[:x402, :client, :siwx]` with `:transport`, `:chain_id`, and
+  `:outcome` (`:authenticated` or `:payment_required`) or `:reason`;
+  failures surface as `{:error, {:siwx, reason}}`
 - **Sign-In-With-X spec format — `X402.Extensions.SIWX`**: the
   [sign-in-with-x extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/sign-in-with-x.md)
   as the spec defines it, for EVM and Solana wallets. Servers advertise a
@@ -116,6 +284,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`X402.Client.Finch.request/3` and `X402.MCP.Client.call/3` responses
+  gain `:siwx_authenticated`** (`true` when the server accepted a
+  Sign-In-With-X proof instead of a payment); code that pattern-matches
+  the whole response map must allow it. Their error unions gain
+  `{:siwx, reason}`, `{:budget_exceeded, details}`, and the
+  `X402.Client.Hooks` hook errors
+- **`X402.Plug.PaymentGate` and `X402.MCP.Server` may now emit
+  `:pass_through` for a matched route or paid tool** — with
+  `reason: :hook_skipped` when `on_protected_request/2` returned
+  `{:halt, :skip_payment}` — where previously the event only meant "route
+  did not match". `:payment_rejected` gains the reasons
+  `{:hook_halted, status}` and `{:invalid_builder_code, detail}` on both
+  transports, and `{:dynamic_route_error, reason}` and
+  `{:extension_invalid, key, reason}` on the gate
 - `X402.Client` no longer selects requirements whose `extra.paymentFlow`
   names a flow it cannot run: only the default `"authorization"` flow
   (explicit or omitted) is recognized, so `upfront` and `escrow` entries —

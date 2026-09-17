@@ -45,6 +45,124 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     and
     [HTTP transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/http.md).
 
+    ## Route patterns and path parameters
+
+    A route `:path` is matched against the decoded request path in one of
+    three ways:
+
+    * an exact path (`/api/report`);
+    * a `*` glob (`/api/*`), where `*` matches any run of characters;
+    * a template with `:param` segments (`/api/users/:id`), where each
+      parameter matches one non-empty path segment. The captured values are
+      assigned as `:x402_path_params` (`%{"id" => "42"}`) on every gated
+      request, paid or not.
+
+    The advertised `resource.url` is always the concrete request URL. With
+    a `:bazaar` route option (a keyword list of
+    `X402.Extensions.Bazaar.build_extension/1` options), the 402 response
+    additionally advertises the discovery extension under
+    `extensions["bazaar"]`; for `:param` routes it carries the route's
+    template as the top-level `routeTemplate` catalog key and the captured
+    values as `info.input.pathParams`, per the bazaar spec:
+
+        %{
+          method: :get,
+          path: "/api/users/:id",
+          price: "10000",
+          ...,
+          bazaar: [method: :get, output: [type: "json"]]
+        }
+
+    ## Dynamic pricing
+
+    The route fields `:price`, `:pay_to`, `:description`, and `:accepts`
+    (as well as `:price` and `:pay_to` inside each `:accepts` entry) may be
+    1-arity functions of the `Plug.Conn`. They are evaluated on every gated
+    request — once, before the 402 advertisement and before the client's
+    `accepted` requirements are matched, so a single request always sees one
+    set of terms:
+
+        %{
+          method: :get,
+          path: "/api/report/:format",
+          price: fn conn ->
+            if conn.assigns.x402_path_params["format"] == "pdf", do: "20000", else: "10000"
+          end,
+          network: "eip155:8453",
+          asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          pay_to: "0x1111111111111111111111111111111111111111"
+        }
+
+    The paying request evaluates the functions again on its own conn; the
+    resulting requirements are what the client's echoed `accepted` must
+    match. A function returns the plain value or `{:ok, value}`; returning
+    `{:error, reason}` (or an invalid value) answers **500** and emits
+    `[:x402, :plug, :payment_rejected]` with
+    `reason: {:dynamic_route_error, reason}` — the reason never reaches the
+    client. Dynamic values are validated like their static counterparts
+    (atomic-unit amounts, known schemes, the `authorization` payment flow).
+
+    ## Lifecycle hooks
+
+    Beyond the facilitator hooks (`X402.Hooks` `before_*` / `after_*` /
+    `on_*_failure`), the `:hooks` module may define two optional
+    resource-server callbacks:
+
+    * `c:X402.Hooks.on_protected_request/2` runs for every request that
+      matches a gated route, before any payment processing, with an
+      `X402.Hooks.RequestContext` carrying the conn, the matched route, the
+      resolved requirements, and the extensions about to be advertised. It
+      may continue (optionally replacing `requirements` or `extensions` for
+      this request — a per-caller discount, say), halt with
+      `{:halt, {status, body}}` (the JSON-encoded body is sent as-is), or
+      halt with `{:halt, :skip_payment}` to let the handler run unpaid,
+      which emits `[:x402, :plug, :pass_through]` with
+      `reason: :hook_skipped`.
+    * `c:X402.Hooks.on_verified_payment_canceled/2` runs when a payment the
+      facilitator verified is not settled: the handler answered with a
+      status of 400 or above (`reason: :handler_failed`, with
+      `:response_status`), or settlement failed before a transaction was
+      broadcast (`reason: :settlement_failed`, with `:error`). A handler
+      that raises does not reach the gate's before-send callback; when an
+      error handler renders a 500 for it the callback runs with
+      `:handler_failed`.
+
+    ## Extension adapters
+
+    The `:extensions` option takes `X402.Extension` adapters —
+    `[module | {module, opts}]` — that advertise, validate, and observe one
+    protocol extension each:
+
+        plug X402.Plug.PaymentGate,
+          routes: [...],
+          extensions: [
+            {X402.Extensions.PaymentIdentifier.Adapter, required: true},
+            {X402.Extensions.BuilderCode.Adapter, app_code: "my_app"}
+          ]
+
+    Adapter advertisements are merged over each route's static
+    `extensions` map on every 402, `validate/3` runs after the generic
+    echo check (a failure answers **400** `invalid_payload` with reason
+    `{:extension_invalid, key, reason}`), and `after_verify/4` /
+    `after_settle/4` are notified with the facilitator's results.
+    Sign-In-With-X keeps its dedicated `:siwx` option (see below) and
+    bazaar discovery its `:bazaar` route option; both compose with
+    adapters.
+
+    ### Builder code
+
+    Routes may advertise the
+    [`builder-code` extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/builder_code.md)
+    — statically through `X402.Extensions.BuilderCode.extension/2` or with
+    the adapter above. Whether or not it is advertised, a payload that
+    echoes `extensions["builder-code"]` is checked with
+    `X402.Extensions.BuilderCode.validate_echo/2`: malformed codes and more
+    than ten service codes answer **400** `invalid_payload` (reason
+    `{:invalid_builder_code, detail}`), and an app code that differs from
+    the advertised one is an `:extension_echo_mismatch` (**400**). The
+    codes are then forwarded to the facilitator inside the payload, which
+    encodes them into the settlement calldata.
+
     ## Browser paywall
 
     With `paywall: X402.Paywall.Default` (or any `X402.Paywall`
@@ -113,8 +231,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     signed authorization (JSON key order, whitespace, Base64 variant) cannot
     mint a fresh key:
 
-    * `"exact"` on `eip155:*` — the EIP-3009 authorization's `from` + `nonce`
+    * `"exact"` on `eip155:*` — the EIP-3009 authorization's `from` + `nonce`,
+      or for the Permit2 transfer method (`extra.assetTransferMethod`
+      `"permit2"`) the Permit2 authorization's `from` + `nonce`
     * `"upto"` on `eip155:*` — the Permit2 authorization's `from` + `nonce`
+      (Permit2 nonces are per owner across spenders, so an exact-Permit2
+      and an upto authorization sharing owner and nonce share one key)
     * `"exact"` on `solana:*` — the SHA-256 of the transaction's signed
       message bytes (immune to the mutable fee-payer signature slot)
     * everything else — the SHA-256 hash of the raw `PAYMENT-SIGNATURE`
@@ -199,7 +321,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @behaviour Plug
 
     alias X402.EIP712
+    alias X402.Extension
     alias X402.Extensions.Bazaar
+    alias X402.Extensions.BuilderCode
     alias X402.Extensions.PaymentIdentifier
     alias X402.Extensions.PaymentIdentifier.Cache
     alias X402.Extensions.PaymentIdentifier.ETSCache
@@ -209,6 +333,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     alias X402.Facilitator.Error
     alias X402.Hooks
     alias X402.Hooks.Default
+    alias X402.Hooks.RequestContext
     alias X402.PaymentRequired
     alias X402.PaymentRequirements
     alias X402.PaymentResponse
@@ -270,12 +395,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         """
       ],
       price: [
-        type: {:custom, __MODULE__, :validate_atomic_amount, []},
+        type: {:custom, __MODULE__, :validate_dynamic_amount, []},
         required: true,
         doc: """
-        Payment amount in atomic token units (PaymentRequirements `amount`).
-        For `exact` this is the required amount; for `upto` it is the maximum
-        authorized amount.
+        Payment amount in atomic token units (PaymentRequirements `amount`),
+        or a 1-arity function of the `Plug.Conn` returning one. For `exact`
+        this is the required amount; for `upto` it is the maximum authorized
+        amount.
         """
       ],
       network: [
@@ -289,9 +415,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         doc: "Token contract address or asset identifier."
       ],
       pay_to: [
-        type: :string,
+        type: {:custom, __MODULE__, :validate_dynamic_string, ["pay_to"]},
         required: true,
-        doc: "Recipient wallet address (`payTo` in the PaymentRequirements schema)."
+        doc: """
+        Recipient wallet address (`payTo` in the PaymentRequirements schema),
+        or a 1-arity function of the `Plug.Conn` returning one.
+        """
       ],
       max_timeout_seconds: [
         type: :pos_integer,
@@ -312,16 +441,21 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         doc: "HTTP method for the route (`:any` matches all methods)."
       ],
       path: [
-        type: :string,
+        type: {:custom, __MODULE__, :validate_path, []},
         required: true,
-        doc: "Route path, supporting exact matches and `*` globs (for example `/api/*`)."
+        doc: """
+        Route path: an exact path, a `*` glob (`/api/*`), or a template with
+        `:param` segments (`/api/users/:id`) whose captured values are
+        assigned as `:x402_path_params`.
+        """
       ],
       accepts: [
-        type: {:list, {:map, @accept_option_schema}},
+        type: {:custom, __MODULE__, :validate_dynamic_accepts, []},
         default: [],
         doc: """
-        Payment options advertised in `PAYMENT-REQUIRED.accepts`. When empty,
-        a single option is built from the top-level `:scheme`, `:price`,
+        Payment options advertised in `PAYMENT-REQUIRED.accepts`, or a
+        1-arity function of the `Plug.Conn` returning them. When empty, a
+        single option is built from the top-level `:scheme`, `:price`,
         `:network`, `:asset`, and `:pay_to` fields.
         """
       ],
@@ -335,8 +469,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         """
       ],
       price: [
-        type: {:custom, __MODULE__, :validate_atomic_amount, []},
-        doc: "Single-option amount (required when `:accepts` is empty)."
+        type: {:custom, __MODULE__, :validate_dynamic_amount, []},
+        doc: """
+        Single-option amount (required when `:accepts` is empty), or a
+        1-arity function of the `Plug.Conn` returning one.
+        """
       ],
       network: [
         type: :string,
@@ -347,13 +484,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         doc: "Single-option asset (required when `:accepts` is empty)."
       ],
       pay_to: [
-        type: :string,
-        doc: "Single-option payTo (required when `:accepts` is empty)."
+        type: {:custom, __MODULE__, :validate_dynamic_string, ["pay_to"]},
+        doc: """
+        Single-option payTo (required when `:accepts` is empty), or a
+        1-arity function of the `Plug.Conn` returning one.
+        """
       ],
       description: [
-        type: :string,
+        type: {:custom, __MODULE__, :validate_dynamic_string, ["description"]},
         default: @default_description,
-        doc: "ResourceInfo.description."
+        doc: "ResourceInfo.description, or a 1-arity function of the `Plug.Conn` returning it."
       ],
       mime_type: [
         type: :string,
@@ -400,6 +540,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         type: {:custom, __MODULE__, :validate_extra_map, []},
         default: %{},
         doc: "Protocol extensions advertised in PaymentRequired.extensions."
+      ],
+      bazaar: [
+        type: {:custom, __MODULE__, :validate_bazaar, []},
+        default: nil,
+        doc: """
+        `X402.Extensions.Bazaar.build_extension/1` options advertising the
+        route in the bazaar. For `:param` routes the extension carries the
+        path as `routeTemplate` and the captured values as
+        `info.input.pathParams`; globs cannot be advertised.
+        """
       ]
     ]
 
@@ -579,6 +729,18 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         record the payer so later proofs from that address skip payment —
         see "Sign-In-With-X" above.
         """
+      ],
+      extensions: [
+        type: {:list, {:custom, Extension, :validate_spec, []}},
+        default: [],
+        doc: """
+        `X402.Extension` adapters — `module` or `{module, opts}` — that
+        advertise, validate, and observe protocol extensions on every gated
+        request (for example `X402.Extensions.PaymentIdentifier.Adapter`
+        and `X402.Extensions.BuilderCode.Adapter`). Advertisements are
+        merged over each route's static `:extensions` map — see "Extension
+        adapters" above.
+        """
       ]
     ]
 
@@ -596,16 +758,20 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             local_prechecks: boolean(),
             local_verification: keyword() | nil,
             paywall: module() | nil,
-            siwx: SIWXServer.t() | nil
+            siwx: SIWXServer.t() | nil,
+            extensions: [Extension.spec()]
           }
+
+    @typedoc "A route value that is either static or computed from the request."
+    @type dynamic(value) :: value | (Plug.Conn.t() -> value | {:ok, value} | {:error, term()})
 
     @typedoc false
     @type payment_accept :: %{
             scheme: String.t(),
-            price: String.t(),
+            price: dynamic(String.t()),
             network: String.t(),
             asset: String.t(),
-            pay_to: String.t(),
+            pay_to: dynamic(String.t()),
             max_timeout_seconds: pos_integer(),
             extra: map()
           }
@@ -613,22 +779,27 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @typedoc false
     @type compiled_route :: %{
             method: atom(),
-            matcher: :exact | :glob,
+            matcher: :exact | :glob | :params,
             path: String.t(),
             glob_regex: Regex.t() | nil,
-            accepts: [payment_accept()],
-            description: String.t(),
+            param_names: [String.t()],
+            accepts: dynamic([payment_accept()]),
+            dynamic: boolean(),
+            description: dynamic(String.t()),
             mime_type: String.t(),
             service_name: String.t() | nil,
             tags: [String.t()],
             icon_url: String.t() | nil,
-            extensions: map()
+            extensions: map(),
+            bazaar: keyword() | nil,
+            requirements: [map()]
           }
 
     @typedoc false
     @type settlement_context :: %{
             facilitator: Facilitator.server(),
             hooks: module(),
+            extensions: [Extension.spec()],
             payment_identifier_cache: Cache.adapter() | nil,
             payment_id: String.t(),
             client_payment_id: String.t() | nil,
@@ -636,6 +807,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             payment_payload: map(),
             requirements: map(),
             route: compiled_route(),
+            context: RequestContext.t(),
             request_method: atom(),
             request_path: String.t(),
             siwx_resource: String.t(),
@@ -700,6 +872,99 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     def validate_atomic_amount(_value), do: {:error, "expected a digit-only atomic-unit amount"}
+
+    @doc false
+    @spec validate_dynamic_amount(term()) ::
+            {:ok, dynamic(String.t())} | {:error, String.t()}
+    def validate_dynamic_amount(fun) when is_function(fun, 1), do: {:ok, fun}
+
+    def validate_dynamic_amount(value) do
+      case validate_atomic_amount(value) do
+        {:ok, amount} -> {:ok, amount}
+        {:error, message} -> {:error, message <> " or a 1-arity function returning one"}
+      end
+    end
+
+    @doc false
+    @spec validate_dynamic_string(term(), String.t()) ::
+            {:ok, dynamic(String.t())} | {:error, String.t()}
+    def validate_dynamic_string(fun, _field) when is_function(fun, 1), do: {:ok, fun}
+    def validate_dynamic_string(value, _field) when is_binary(value), do: {:ok, value}
+
+    def validate_dynamic_string(_value, field),
+      do: {:error, "expected #{field} to be a string or a 1-arity function returning one"}
+
+    @doc false
+    @spec validate_dynamic_accepts(term()) ::
+            {:ok, dynamic([map()])} | {:error, String.t()}
+    def validate_dynamic_accepts(fun) when is_function(fun, 1), do: {:ok, fun}
+
+    def validate_dynamic_accepts(value) when is_list(value) do
+      case NimbleOptions.validate([accepts: value],
+             accepts: [type: {:list, {:map, @accept_option_schema}}]
+           ) do
+        {:ok, validated} -> {:ok, Keyword.fetch!(validated, :accepts)}
+        {:error, error} -> {:error, Exception.message(error)}
+      end
+    end
+
+    def validate_dynamic_accepts(_value),
+      do: {:error, "expected a list of payment option maps or a 1-arity function returning one"}
+
+    @doc false
+    @spec validate_path(term()) :: {:ok, String.t()} | {:error, String.t()}
+    def validate_path(path) when is_binary(path) do
+      params = path_param_names(path)
+
+      cond do
+        Enum.any?(params, &(not valid_param_name?(&1))) ->
+          {:error, "expected :param segments to be identifiers, got: #{inspect(path)}"}
+
+        params != Enum.uniq(params) ->
+          {:error, "expected :param names to be unique, got: #{inspect(path)}"}
+
+        params != [] and String.contains?(path, "*") ->
+          {:error, "expected either :param segments or a * glob, got: #{inspect(path)}"}
+
+        true ->
+          {:ok, path}
+      end
+    end
+
+    def validate_path(_path), do: {:error, "expected a string"}
+
+    @doc false
+    @spec validate_bazaar(term()) :: {:ok, keyword() | nil} | {:error, String.t()}
+    def validate_bazaar(nil), do: {:ok, nil}
+
+    def validate_bazaar(opts) when is_list(opts) do
+      if Keyword.keyword?(opts) do
+        # Built once here so misconfiguration surfaces at init rather than
+        # on the first 402; the request-time build adds template and params.
+        _extension = Bazaar.build_extension(opts)
+        {:ok, opts}
+      else
+        {:error, "expected a keyword list of X402.Extensions.Bazaar.build_extension/1 options"}
+      end
+    rescue
+      error in NimbleOptions.ValidationError -> {:error, Exception.message(error)}
+    end
+
+    def validate_bazaar(_opts),
+      do: {:error, "expected a keyword list of X402.Extensions.Bazaar.build_extension/1 options"}
+
+    @spec path_param_names(String.t()) :: [String.t()]
+    defp path_param_names(path) do
+      path
+      |> String.split("/")
+      |> Enum.flat_map(fn
+        ":" <> name -> [name]
+        _segment -> []
+      end)
+    end
+
+    @spec valid_param_name?(String.t()) :: boolean()
+    defp valid_param_name?(name), do: Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\z/, name)
 
     @doc false
     @spec validate_payment_identifier_cache(term()) ::
@@ -771,7 +1036,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
            validated_map = Map.new(validated),
            :ok <- ensure_accepts_source(validated_map),
            :ok <- ensure_route_schemes(validated_map, allowed_schemes),
-           :ok <- ensure_supported_payment_flow(validated_map) do
+           :ok <- ensure_supported_payment_flow(validated_map),
+           :ok <- ensure_bazaar_route(validated_map) do
         {:ok, validated_map}
       end
     end
@@ -824,7 +1090,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         local_prechecks: Keyword.fetch!(validated_opts, :local_prechecks),
         local_verification: Keyword.fetch!(validated_opts, :local_verification),
         paywall: Keyword.fetch!(validated_opts, :paywall),
-        siwx: Keyword.fetch!(validated_opts, :siwx)
+        siwx: Keyword.fetch!(validated_opts, :siwx),
+        extensions: Keyword.fetch!(validated_opts, :extensions)
       }
     end
 
@@ -896,23 +1163,267 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           emit(:pass_through, %{method: request_method, path: request_path})
           conn
 
-        route ->
-          handle_payment_gate(conn, opts, route, request_method, request_path)
+        {route, path_params} ->
+          conn = assign_path_params(conn, route, path_params)
+          prepare_request(conn, opts, route, path_params, request_method, request_path)
       end
     end
 
-    @spec handle_payment_gate(Plug.Conn.t(), options(), compiled_route(), atom(), String.t()) ::
+    @spec assign_path_params(Plug.Conn.t(), compiled_route(), map()) :: Plug.Conn.t()
+    defp assign_path_params(conn, %{matcher: :params}, path_params),
+      do: Plug.Conn.assign(conn, :x402_path_params, path_params)
+
+    defp assign_path_params(conn, _route, _path_params), do: conn
+
+    # Dynamic fields are resolved exactly once per request, before the 402
+    # advertisement and before the client's `accepted` is matched, so both
+    # sides of one request always see the same terms.
+    @spec prepare_request(Plug.Conn.t(), options(), compiled_route(), map(), atom(), String.t()) ::
             Plug.Conn.t()
-    defp handle_payment_gate(conn, opts, route, request_method, request_path) do
+    defp prepare_request(conn, opts, route, path_params, request_method, request_path) do
+      metadata = %{method: request_method, path: request_path, route: route.path}
+
+      case resolve_route(route, conn, opts, path_params) do
+        {:ok, resolved} ->
+          context = request_context(conn, resolved, path_params, request_method, request_path)
+          context = advertise_adapters(context, opts)
+          run_protected_request(conn, opts, context, request_method, request_path, metadata)
+
+        {:error, reason} ->
+          emit(:payment_rejected, Map.put(metadata, :reason, reason))
+          conn |> internal_error_conn() |> send_resp() |> halt()
+      end
+    end
+
+    @spec run_protected_request(
+            Plug.Conn.t(),
+            options(),
+            RequestContext.t(),
+            atom(),
+            String.t(),
+            map()
+          ) :: Plug.Conn.t()
+    defp run_protected_request(conn, opts, context, request_method, request_path, metadata) do
+      case Hooks.run_protected_request(opts.hooks, context, metadata) do
+        {:cont, context} ->
+          route = apply_context(context)
+          handle_payment_gate(conn, opts, route, context, request_method, request_path)
+
+        {:halt, :skip_payment} ->
+          emit(:pass_through, Map.put(metadata, :reason, :hook_skipped))
+          conn
+
+        {:halt, {status, body}} ->
+          emit(:payment_rejected, Map.put(metadata, :reason, {:hook_halted, status}))
+          hook_halt_response(conn, status, body)
+
+        {:error, reason} ->
+          emit(:payment_rejected, Map.put(metadata, :reason, reason))
+          conn |> internal_error_conn() |> send_resp() |> halt()
+      end
+    end
+
+    @spec hook_halt_response(Plug.Conn.t(), pos_integer(), map()) :: Plug.Conn.t()
+    defp hook_halt_response(conn, status, body) do
+      case Jason.encode(body) do
+        {:ok, json} ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> resp(status, json)
+          |> send_resp()
+          |> halt()
+
+        {:error, _reason} ->
+          conn |> internal_error_conn() |> send_resp() |> halt()
+      end
+    end
+
+    @spec request_context(Plug.Conn.t(), compiled_route(), map(), atom(), String.t()) ::
+            RequestContext.t()
+    defp request_context(conn, route, path_params, request_method, request_path) do
+      RequestContext.new(
+        transport: :http,
+        conn: conn,
+        route: route,
+        method: request_method,
+        path: request_path,
+        path_params: path_params,
+        requirements: route.requirements,
+        extensions: route.extensions
+      )
+    end
+
+    @spec advertise_adapters(RequestContext.t(), options()) :: RequestContext.t()
+    defp advertise_adapters(context, %{extensions: []}), do: context
+
+    defp advertise_adapters(context, %{extensions: adapters}) do
+      %{context | extensions: Extension.advertise_all(adapters, context, context.extensions)}
+    end
+
+    # The hook may have replaced the requirements or extensions for this
+    # request; the route carried downstream reflects its final word.
+    @spec apply_context(RequestContext.t()) :: compiled_route()
+    defp apply_context(%RequestContext{route: route} = context) do
+      %{route | requirements: context.requirements, extensions: context.extensions}
+    end
+
+    @spec resolve_route(compiled_route(), Plug.Conn.t(), options(), map()) ::
+            {:ok, compiled_route()} | {:error, {:dynamic_route_error, term()}}
+    defp resolve_route(route, conn, opts, path_params) do
+      with {:ok, accepts} <- resolve_accepts(route, conn, opts),
+           {:ok, description} <- resolve_string(route.description, conn, :description) do
+        resolved = %{
+          route
+          | accepts: accepts,
+            description: description,
+            requirements: Enum.map(accepts, &payment_requirements_from_accept/1)
+        }
+
+        {:ok, put_bazaar_extension(resolved, path_params)}
+      end
+    end
+
+    @spec resolve_accepts(compiled_route(), Plug.Conn.t(), options()) ::
+            {:ok, [payment_accept()]} | {:error, {:dynamic_route_error, term()}}
+    defp resolve_accepts(%{dynamic: false, accepts: accepts}, _conn, _opts), do: {:ok, accepts}
+
+    defp resolve_accepts(%{accepts: accepts}, conn, opts) do
+      with {:ok, entries} <- resolve_accepts_source(accepts, conn, opts) do
+        resolve_accept_entries(entries, conn, [])
+      end
+    end
+
+    @spec resolve_accept_entries([payment_accept()], Plug.Conn.t(), [payment_accept()]) ::
+            {:ok, [payment_accept()]} | {:error, {:dynamic_route_error, term()}}
+    defp resolve_accept_entries([], _conn, resolved), do: {:ok, Enum.reverse(resolved)}
+
+    defp resolve_accept_entries([accept | rest], conn, resolved) do
+      case resolve_accept(accept, conn) do
+        {:ok, entry} -> resolve_accept_entries(rest, conn, [entry | resolved])
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    @spec resolve_accepts_source(dynamic([payment_accept()]), Plug.Conn.t(), options()) ::
+            {:ok, [payment_accept()]} | {:error, {:dynamic_route_error, term()}}
+    defp resolve_accepts_source(accepts, _conn, _opts) when is_list(accepts), do: {:ok, accepts}
+
+    defp resolve_accepts_source(fun, conn, opts) when is_function(fun, 1) do
+      allowed_schemes = @route_schemes ++ Enum.map(opts.schemes, & &1.scheme())
+
+      with {:ok, value} <- dynamic_value(fun, conn, :accepts),
+           {:ok, entries} <- validate_dynamic_accepts(value),
+           :ok <- ensure_dynamic_accepts(entries, allowed_schemes) do
+        {:ok, Enum.map(entries, &compile_accept/1)}
+      else
+        {:error, {:dynamic_route_error, _reason} = reason} -> {:error, reason}
+        {:error, message} -> {:error, {:dynamic_route_error, {:accepts, message}}}
+      end
+    end
+
+    @spec ensure_dynamic_accepts([map()], [String.t()]) :: :ok | {:error, String.t()}
+    defp ensure_dynamic_accepts([], _allowed_schemes), do: {:error, "expected at least one entry"}
+
+    defp ensure_dynamic_accepts(entries, allowed_schemes) do
+      route = %{accepts: Enum.map(entries, &Map.new/1), scheme: "exact"}
+
+      with :ok <- ensure_route_schemes(route, allowed_schemes) do
+        ensure_supported_payment_flow(route)
+      end
+    end
+
+    @spec resolve_accept(payment_accept(), Plug.Conn.t()) ::
+            {:ok, payment_accept()} | {:error, {:dynamic_route_error, term()}}
+    defp resolve_accept(accept, conn) do
+      with {:ok, price} <- resolve_amount(accept.price, conn),
+           {:ok, pay_to} <- resolve_string(accept.pay_to, conn, :pay_to) do
+        {:ok, %{accept | price: price, pay_to: pay_to}}
+      end
+    end
+
+    @spec resolve_amount(dynamic(String.t()), Plug.Conn.t()) ::
+            {:ok, String.t()} | {:error, {:dynamic_route_error, term()}}
+    defp resolve_amount(amount, _conn) when is_binary(amount), do: {:ok, amount}
+
+    defp resolve_amount(fun, conn) do
+      with {:ok, value} <- dynamic_value(fun, conn, :price) do
+        case validate_atomic_amount(value) do
+          {:ok, amount} -> {:ok, amount}
+          {:error, message} -> {:error, {:dynamic_route_error, {:price, message}}}
+        end
+      end
+    end
+
+    @spec resolve_string(dynamic(String.t()), Plug.Conn.t(), atom()) ::
+            {:ok, String.t()} | {:error, {:dynamic_route_error, term()}}
+    defp resolve_string(value, _conn, _field) when is_binary(value), do: {:ok, value}
+
+    defp resolve_string(fun, conn, field) do
+      case dynamic_value(fun, conn, field) do
+        {:ok, value} when is_binary(value) and value != "" -> {:ok, value}
+        {:ok, _value} -> {:error, {:dynamic_route_error, {field, "expected a non-empty string"}}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    @spec dynamic_value((Plug.Conn.t() -> term()), Plug.Conn.t(), atom()) ::
+            {:ok, term()} | {:error, {:dynamic_route_error, term()}}
+    defp dynamic_value(fun, conn, field) do
+      case fun.(conn) do
+        {:ok, value} -> {:ok, value}
+        {:error, reason} -> {:error, {:dynamic_route_error, {field, reason}}}
+        value -> {:ok, value}
+      end
+    end
+
+    # The bazaar spec keys dynamic routes by their template and carries the
+    # concrete values under input.pathParams; exact routes advertise neither.
+    @spec put_bazaar_extension(compiled_route(), map()) :: compiled_route()
+    defp put_bazaar_extension(%{bazaar: nil} = route, _path_params), do: route
+
+    defp put_bazaar_extension(%{bazaar: bazaar_opts} = route, path_params) do
+      bazaar_opts =
+        case route.matcher do
+          :params ->
+            bazaar_opts
+            |> Keyword.put_new(:route_template, route.path)
+            |> Keyword.put_new(:path_params, path_params)
+
+          _matcher ->
+            bazaar_opts
+        end
+
+      extension = Bazaar.build_extension(bazaar_opts)
+      %{route | extensions: Map.put(route.extensions, "bazaar", extension)}
+    end
+
+    @spec handle_payment_gate(
+            Plug.Conn.t(),
+            options(),
+            compiled_route(),
+            RequestContext.t(),
+            atom(),
+            String.t()
+          ) :: Plug.Conn.t()
+    defp handle_payment_gate(conn, opts, route, context, request_method, request_path) do
       case siwx_header(conn, opts.siwx) do
-        :none -> handle_payment(conn, opts, route, request_method, request_path)
-        {:ok, header} -> handle_siwx(conn, opts, route, request_method, request_path, header)
+        :none ->
+          handle_payment(conn, opts, route, context, request_method, request_path)
+
+        {:ok, header} ->
+          handle_siwx(conn, opts, route, context, request_method, request_path, header)
       end
     end
 
-    @spec handle_payment(Plug.Conn.t(), options(), compiled_route(), atom(), String.t()) ::
-            Plug.Conn.t()
-    defp handle_payment(conn, opts, route, request_method, request_path) do
+    @spec handle_payment(
+            Plug.Conn.t(),
+            options(),
+            compiled_route(),
+            RequestContext.t(),
+            atom(),
+            String.t()
+          ) :: Plug.Conn.t()
+    defp handle_payment(conn, opts, route, context, request_method, request_path) do
       case payment_header(conn) do
         :missing ->
           emit(:payment_required, %{method: request_method, path: request_path, route: route.path})
@@ -928,7 +1439,15 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           )
 
         {:ok, header} ->
-          verify_and_prepare_settlement(conn, opts, route, request_method, request_path, header)
+          verify_and_prepare_settlement(
+            conn,
+            opts,
+            route,
+            context,
+            request_method,
+            request_path,
+            header
+          )
 
         {:error, reason} ->
           emit(:payment_rejected, %{
@@ -970,11 +1489,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             Plug.Conn.t(),
             options(),
             compiled_route(),
+            RequestContext.t(),
             atom(),
             String.t(),
             String.t()
           ) :: Plug.Conn.t()
-    defp handle_siwx(conn, opts, route, request_method, request_path, header) do
+    defp handle_siwx(conn, opts, route, context, request_method, request_path, header) do
       metadata = %{method: request_method, path: request_path, route: route.path}
 
       with {:ok, decoded} <- decode_siwx_header(header),
@@ -992,7 +1512,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         {:error, :not_authorized} ->
           case payment_header(conn) do
             {:ok, _header} ->
-              handle_payment(conn, opts, route, request_method, request_path)
+              handle_payment(conn, opts, route, context, request_method, request_path)
 
             _missing_or_invalid ->
               emit(:payment_required, Map.put(metadata, :siwx, :not_authorized))
@@ -1064,15 +1584,24 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             Plug.Conn.t(),
             options(),
             compiled_route(),
+            RequestContext.t(),
             atom(),
             String.t(),
             String.t()
           ) :: Plug.Conn.t()
-    defp verify_and_prepare_settlement(conn, opts, route, request_method, request_path, header) do
+    defp verify_and_prepare_settlement(
+           conn,
+           opts,
+           route,
+           context,
+           request_method,
+           request_path,
+           header
+         ) do
       accepts = route_accepts(route)
 
       with {:ok, payment_payload, requirements} <-
-             decode_and_validate_payment(header, accepts, route.extensions, opts.schemes),
+             decode_and_validate_payment(header, accepts, route.extensions, opts),
            {:ok, client_payment_id} <- client_payment_id(payment_payload, route),
            payment_id = replay_key(header, payment_payload, requirements),
            :ok <- run_local_prechecks(opts, payment_payload, requirements),
@@ -1087,9 +1616,17 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
              ),
            {:ok, verify_response} <-
              claim_and_verify_bound(opts, payment_id, binding, payment_payload, requirements) do
+        Extension.after_verify_all(
+          opts.extensions,
+          payment_payload,
+          requirements,
+          verify_response
+        )
+
         settlement_context = %{
           facilitator: opts.facilitator,
           hooks: opts.hooks,
+          extensions: opts.extensions,
           payment_identifier_cache: opts.payment_identifier_cache,
           payment_id: payment_id,
           client_payment_id: client_payment_id,
@@ -1097,6 +1634,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           payment_payload: payment_payload,
           requirements: requirements,
           route: route,
+          context: %{context | payload: payment_payload, matched_requirements: requirements},
           request_method: request_method,
           request_path: request_path,
           siwx_resource: siwx_resource_key(conn),
@@ -1141,8 +1679,26 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
         false ->
           release_claims(settlement_context)
+
+          notify_payment_canceled(settlement_context, %{
+            reason: :handler_failed,
+            response_status: conn.status
+          })
+
           conn
       end
+    end
+
+    @spec notify_payment_canceled(settlement_context(), map()) :: :ok
+    defp notify_payment_canceled(settlement_context, metadata) do
+      Hooks.run_verified_payment_canceled(
+        settlement_context.hooks,
+        settlement_context.context,
+        Map.merge(
+          %{method: settlement_context.request_method, path: settlement_context.request_path},
+          metadata
+        )
+      )
     end
 
     @spec release_claims(settlement_context()) :: :ok
@@ -1200,6 +1756,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp fail_settlement(conn, settlement_context, reason, response_reason) do
       release_claims(settlement_context)
 
+      # A failure that already carries a transaction hash was broadcast; the
+      # payment is then in flight rather than canceled.
+      unless broadcast_settlement?(response_reason) do
+        notify_payment_canceled(settlement_context, %{reason: :settlement_failed, error: reason})
+      end
+
       reject_settlement(
         conn,
         settlement_context.route,
@@ -1230,6 +1792,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           )
 
           record_siwx_payment(response_conn, settle_response, settlement_context)
+
+          Extension.after_settle_all(
+            settlement_context.extensions,
+            settlement_context.payment_payload,
+            settlement_context.requirements,
+            settle_response
+          )
+
           response_conn
 
         {:error, reason} ->
@@ -1245,15 +1815,19 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     # The payer is taken from the settle response (the facilitator's
-    # authoritative view of who paid), falling back to the signed payload's
-    # `from`. A storage failure is logged and the settled response still
-    # served: the payment went through, the address merely has to pay again
-    # next time.
+    # authoritative view of who paid), falling back to the EVM authorization's
+    # `from` selected by the matched requirements. A storage failure is logged
+    # and the settled response still served: the payment went through, the
+    # address merely has to pay again next time.
     @spec record_siwx_payment(Plug.Conn.t(), map(), settlement_context()) :: :ok
     defp record_siwx_payment(_conn, _settle_response, %{siwx: nil}), do: :ok
 
     defp record_siwx_payment(_conn, settle_response, %{siwx: siwx} = settlement_context) do
-      case settlement_payer(settle_response, settlement_context.payment_payload) do
+      case settlement_payer(
+             settle_response,
+             settlement_context.payment_payload,
+             settlement_context.requirements
+           ) do
         nil ->
           :ok
 
@@ -1273,18 +1847,19 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec settlement_payer(map(), map()) :: String.t() | nil
-    defp settlement_payer(%{body: body}, payment_payload) do
+    @spec settlement_payer(map(), map(), map()) :: String.t() | nil
+    defp settlement_payer(%{body: body}, payment_payload, requirements) do
       case Utils.map_value(body, {"payer", :payer}) do
         payer when is_binary(payer) and payer != "" -> payer
-        _absent -> payload_from(payment_payload)
+        _absent -> payload_from(payment_payload, requirements)
       end
     end
 
-    @spec payload_from(map()) :: String.t() | nil
-    defp payload_from(payment_payload) do
-      with %{} = payload <- Utils.map_value(payment_payload, {"payload", :payload}),
-           %{} = authorization <- Utils.map_value(payload, {"authorization", :authorization}),
+    @spec payload_from(map(), map()) :: String.t() | nil
+    defp payload_from(payment_payload, requirements) do
+      with {:ok, method} <- evm_transfer_method(requirements),
+           %{} = payload <- Utils.map_value(payment_payload, {"payload", :payload}),
+           %{} = authorization <- evm_authorization(payload, method),
            from when is_binary(from) and from != "" <-
              Utils.map_value(authorization, {"from", :from}) do
         from
@@ -1292,6 +1867,33 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         _other -> nil
       end
     end
+
+    @spec evm_transfer_method(map()) :: {:ok, Scheme.ExactEVM.transfer_method()} | :error
+    defp evm_transfer_method(requirements) do
+      scheme = Utils.map_value(requirements, {"scheme", :scheme})
+      network = Utils.map_value(requirements, {"network", :network})
+
+      case {scheme, network} do
+        {"exact", "eip155:" <> _reference} ->
+          case Scheme.ExactEVM.transfer_method(requirements) do
+            {:ok, method} -> {:ok, method}
+            {:error, _reason} -> :error
+          end
+
+        {"upto", "eip155:" <> _reference} ->
+          {:ok, :permit2}
+
+        _other ->
+          :error
+      end
+    end
+
+    @spec evm_authorization(map(), Scheme.ExactEVM.transfer_method()) :: term()
+    defp evm_authorization(payload, :eip3009),
+      do: Utils.map_value(payload, {"authorization", :authorization})
+
+    defp evm_authorization(payload, :permit2),
+      do: Utils.map_value(payload, {"permit2Authorization", :permit2Authorization})
 
     @spec reject_settlement(
             Plug.Conn.t(),
@@ -1444,6 +2046,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           {:error, reason, nil}
       end
     end
+
+    @spec broadcast_settlement?(term()) :: boolean()
+    defp broadcast_settlement?(settle_body) when is_map(settle_body) do
+      transaction = Utils.map_value(settle_body, {"transaction", :transaction})
+      is_binary(transaction) and transaction != ""
+    end
+
+    defp broadcast_settlement?(_settle_body), do: false
 
     @spec retryable_settlement_pending?(term()) :: boolean()
     defp retryable_settlement_pending?(settle_body) when is_map(settle_body) do
@@ -1648,11 +2258,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       :ok
     end
 
+    defp ensure_accepts_source(%{accepts: accepts}) when is_function(accepts, 1), do: :ok
+
     defp ensure_accepts_source(route) do
       missing =
         Enum.reject([:price, :network, :asset, :pay_to], fn key ->
           value = Map.get(route, key)
-          is_binary(value) and value != ""
+          (is_binary(value) and value != "") or is_function(value, 1)
         end)
 
       case missing do
@@ -1673,7 +2285,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    # A function-valued :accepts is validated per request, once resolved.
     @spec ensure_route_schemes(map(), [String.t()]) :: :ok | {:error, String.t()}
+    defp ensure_route_schemes(%{accepts: accepts}, _allowed_schemes)
+         when is_function(accepts, 1),
+         do: :ok
+
     defp ensure_route_schemes(route, allowed_schemes) do
       route_schemes =
         case Map.get(route, :accepts, []) do
@@ -1696,6 +2313,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     @spec ensure_supported_payment_flow(map()) :: :ok | {:error, String.t()}
+    defp ensure_supported_payment_flow(%{accepts: accepts}) when is_function(accepts, 1), do: :ok
+
     defp ensure_supported_payment_flow(%{accepts: accepts})
          when is_list(accepts) and accepts != [] do
       Enum.reduce_while(accepts, :ok, fn accept, :ok ->
@@ -1719,6 +2338,33 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    # Bazaar catalogs key dynamic routes by template; a glob has no template
+    # and an exact route needs none, but the template must satisfy the
+    # metadata rules since it is advertised verbatim.
+    @spec ensure_bazaar_route(map()) :: :ok | {:error, String.t()}
+    defp ensure_bazaar_route(%{bazaar: nil}), do: :ok
+
+    defp ensure_bazaar_route(%{bazaar: bazaar, path: path}) when is_list(bazaar) do
+      normalized_path = normalize_path(path)
+
+      case path_matcher(normalized_path) do
+        :glob ->
+          {:error, "a :bazaar advertisement cannot be combined with a * glob path"}
+
+        :params ->
+          case Bazaar.Metadata.valid_route_template?(normalized_path) do
+            true ->
+              :ok
+
+            false ->
+              {:error, "expected a bazaar-compatible route template, got: #{inspect(path)}"}
+          end
+
+        :exact ->
+          :ok
+      end
+    end
+
     @spec compile_route(map()) :: compiled_route()
     defp compile_route(%{} = route) do
       normalized_path = normalize_path(Map.fetch!(route, :path))
@@ -1726,6 +2372,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
       accepts =
         case Map.get(route, :accepts, []) do
+          fun when is_function(fun, 1) ->
+            fun
+
           list when is_list(list) and list != [] ->
             Enum.map(list, &compile_accept/1)
 
@@ -1744,20 +2393,44 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             ]
         end
 
+      description = Map.get(route, :description, @default_description)
+      dynamic = dynamic_accepts?(accepts) or is_function(description, 1)
+
       %{
         method: Map.fetch!(route, :method),
         matcher: matcher,
         path: normalized_path,
         glob_regex: glob_regex(matcher, normalized_path),
+        param_names: path_param_names(normalized_path),
         accepts: accepts,
-        description: Map.get(route, :description, @default_description),
+        dynamic: dynamic,
+        requirements: static_requirements(accepts),
+        description: description,
         mime_type: Map.get(route, :mime_type, @default_mime_type),
         service_name: Map.get(route, :service_name),
         tags: Map.get(route, :tags, []),
         icon_url: Map.get(route, :icon_url),
-        extensions: stringify_keys(Map.get(route, :extensions, %{}))
+        extensions: stringify_keys(Map.get(route, :extensions, %{})),
+        bazaar: Map.get(route, :bazaar)
       }
     end
+
+    @spec dynamic_accepts?(dynamic([payment_accept()])) :: boolean()
+    defp dynamic_accepts?(fun) when is_function(fun, 1), do: true
+
+    defp dynamic_accepts?(accepts) when is_list(accepts) do
+      Enum.any?(accepts, &(is_function(&1.price, 1) or is_function(&1.pay_to, 1)))
+    end
+
+    @spec static_requirements(dynamic([payment_accept()])) :: [map()]
+    defp static_requirements(accepts) when is_list(accepts) do
+      case dynamic_accepts?(accepts) do
+        true -> []
+        false -> Enum.map(accepts, &payment_requirements_from_accept/1)
+      end
+    end
+
+    defp static_requirements(_fun), do: []
 
     @spec compile_accept(map()) :: payment_accept()
     defp compile_accept(accept) do
@@ -1772,15 +2445,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       }
     end
 
-    @spec path_matcher(String.t()) :: :exact | :glob
+    @spec path_matcher(String.t()) :: :exact | :glob | :params
     defp path_matcher(path) do
-      case String.contains?(path, "*") do
-        true -> :glob
-        false -> :exact
+      cond do
+        String.contains?(path, "*") -> :glob
+        path_param_names(path) != [] -> :params
+        true -> :exact
       end
     end
 
-    @spec glob_regex(:exact | :glob, String.t()) :: Regex.t() | nil
+    @spec glob_regex(:exact | :glob | :params, String.t()) :: Regex.t() | nil
     defp glob_regex(:exact, _path), do: nil
 
     defp glob_regex(:glob, path) do
@@ -1788,10 +2462,29 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       |> Regex.compile!()
     end
 
-    @spec match_route([compiled_route()], atom(), String.t()) :: compiled_route() | nil
+    # Each :param segment captures exactly one non-empty path segment, as
+    # in the reference middlewares' route patterns.
+    defp glob_regex(:params, path) do
+      pattern =
+        path
+        |> String.split("/")
+        |> Enum.map_join("/", fn
+          ":" <> name -> "(?<#{name}>[^/]+)"
+          segment -> Regex.escape(segment)
+        end)
+
+      Regex.compile!("^" <> pattern <> "$")
+    end
+
+    @spec match_route([compiled_route()], atom(), String.t()) :: {compiled_route(), map()} | nil
     defp match_route(routes, request_method, request_path) do
-      Enum.find(routes, fn route ->
-        method_matches?(route.method, request_method) and path_matches?(route, request_path)
+      Enum.find_value(routes, fn route ->
+        with true <- method_matches?(route.method, request_method),
+             {:ok, params} <- match_path(route, request_path) do
+          {route, params}
+        else
+          _no_match -> nil
+        end
       end)
     end
 
@@ -1799,11 +2492,27 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp method_matches?(:any, _request_method), do: true
     defp method_matches?(method, request_method), do: method == request_method
 
-    @spec path_matches?(compiled_route(), String.t()) :: boolean()
-    defp path_matches?(%{matcher: :exact, path: path}, request_path), do: path == request_path
+    @spec match_path(compiled_route(), String.t()) :: {:ok, map()} | :error
+    defp match_path(%{matcher: :exact, path: path}, request_path) do
+      case path == request_path do
+        true -> {:ok, %{}}
+        false -> :error
+      end
+    end
 
-    defp path_matches?(%{matcher: :glob, glob_regex: regex}, request_path),
-      do: Regex.match?(regex, request_path)
+    defp match_path(%{matcher: :glob, glob_regex: regex}, request_path) do
+      case Regex.match?(regex, request_path) do
+        true -> {:ok, %{}}
+        false -> :error
+      end
+    end
+
+    defp match_path(%{matcher: :params, glob_regex: regex}, request_path) do
+      case Regex.named_captures(regex, request_path) do
+        nil -> :error
+        params -> {:ok, params}
+      end
+    end
 
     @spec payment_header(Plug.Conn.t()) ::
             :missing | {:ok, String.t()} | {:error, :invalid_payment_header}
@@ -1815,17 +2524,55 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec decode_and_validate_payment(String.t(), [map()], map(), [module()]) ::
+    @spec decode_and_validate_payment(String.t(), [map()], map(), options()) ::
             {:ok, map(), map()} | {:error, term()}
-    defp decode_and_validate_payment(header, accepts, advertised_extensions, schemes)
+    defp decode_and_validate_payment(header, accepts, advertised_extensions, opts)
          when is_list(accepts) and is_map(advertised_extensions) do
       with {:ok, payload} <- PaymentSignature.decode(header),
            :ok <- ensure_v2_payload(payload),
-           {:ok, payload} <- validate_payment_payload(payload, schemes),
+           {:ok, payload} <- validate_payment_payload(payload, opts.schemes),
            {:ok, matched} <- find_matching_requirements(accepts, payload),
-           :ok <- validate_extensions(payload, advertised_extensions) do
+           :ok <- validate_extensions(payload, advertised_extensions),
+           :ok <- validate_builder_code(payload, advertised_extensions),
+           :ok <- validate_adapter_extensions(payload, advertised_extensions, opts.extensions) do
         {:ok, payload, matched}
       end
+    end
+
+    # The generic echo check above only compares the advertised keys; the
+    # builder-code rules also apply to payloads that volunteer the
+    # extension when the route never advertised it.
+    @spec validate_builder_code(map(), map()) ::
+            :ok | {:error, :extension_echo_mismatch | {:invalid_builder_code, term()}}
+    defp validate_builder_code(payload, advertised_extensions) do
+      key = BuilderCode.extension_key()
+      client_extensions = Utils.map_value(payload, {"extensions", :extensions})
+
+      echoed =
+        case client_extensions do
+          %{} = extensions -> Utils.map_value(extensions, {key, :"builder-code"})
+          _absent -> nil
+        end
+
+      case BuilderCode.validate_echo(echoed, Map.get(advertised_extensions, key)) do
+        :ok -> :ok
+        {:error, :builder_code_mismatch} -> {:error, :extension_echo_mismatch}
+        {:error, reason} -> {:error, {:invalid_builder_code, reason}}
+      end
+    end
+
+    @spec validate_adapter_extensions(map(), map(), [Extension.spec()]) ::
+            :ok | {:error, {:extension_invalid, String.t(), term()}}
+    defp validate_adapter_extensions(_payload, _advertised_extensions, []), do: :ok
+
+    defp validate_adapter_extensions(payload, advertised_extensions, adapters) do
+      client_extensions =
+        case Utils.map_value(payload, {"extensions", :extensions}) do
+          %{} = extensions -> extensions
+          _absent -> %{}
+        end
+
+      Extension.validate_all(adapters, client_extensions, advertised_extensions)
     end
 
     # With no custom schemes the historical validate/1 path is kept as-is;
@@ -1893,50 +2640,57 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       network = Utils.map_value(requirements, {"network", :network})
       scheme_payload = Utils.map_value(payment_payload, {"payload", :payload})
 
-      case derive_replay_key(scheme, network, scheme_payload) do
+      case derive_replay_key(scheme, network, scheme_payload, requirements) do
         {:ok, key} -> key
         :error -> "hdr:" <> Base.encode16(:crypto.hash(:sha256, header), case: :lower)
       end
     end
 
-    # EIP-3009: the authorization's from + nonce are covered by the
-    # signature and uniquely identify the authorization on its network.
-    @spec derive_replay_key(term(), term(), term()) :: {:ok, String.t()} | :error
-    defp derive_replay_key("exact", "eip155:" <> _reference = network, scheme_payload)
+    # EVM exact: an EIP-3009 payload carries `authorization`, whose from +
+    # nonce are covered by the signature and uniquely identify the
+    # authorization on its network; a Permit2 payload (assetTransferMethod
+    # "permit2") carries `permit2Authorization` instead. Select from the
+    # matched requirements, never from attacker-added unsigned payload fields.
+    @spec derive_replay_key(term(), term(), term(), map()) :: {:ok, String.t()} | :error
+    defp derive_replay_key(
+           "exact",
+           "eip155:" <> _reference = network,
+           scheme_payload,
+           requirements
+         )
          when is_map(scheme_payload) do
-      scheme_payload
-      |> Utils.map_value({"authorization", :authorization})
-      |> signer_nonce_key("evm:", network)
-    end
+      case evm_transfer_method(requirements) do
+        {:ok, :eip3009} ->
+          authorization = evm_authorization(scheme_payload, :eip3009)
+          signer_nonce_key(authorization, "evm:", network)
 
-    # Permit2: the permit's owner (from) + nonce are covered by the
-    # PermitWitnessTransferFrom signature. The nonce is a uint256, so
-    # canonicalize it to its 32-byte encoding — equivalent JSON forms
-    # (`1`, `"1"`, `"01"`) must mint the same replay key so a re-encoded
-    # header cannot bypass dedup while sharing the same signature.
-    defp derive_replay_key("upto", "eip155:" <> _reference = network, scheme_payload)
-         when is_map(scheme_payload) do
-      with authorization when is_map(authorization) <-
-             Utils.map_value(scheme_payload, {"permit2Authorization", :permit2Authorization}),
-           from when is_binary(from) and from != "" <-
-             Utils.map_value(authorization, {"from", :from}),
-           {:ok, nonce_word} <-
-             EIP712.encode_uint256(Utils.map_value(authorization, {"nonce", :nonce})) do
-        {:ok,
-         "evm-upto:" <>
-           network <>
-           ":" <>
-           String.downcase(from) <> ":" <> Base.encode16(nonce_word, case: :lower)}
-      else
-        _other -> :error
+        {:ok, :permit2} ->
+          permit2_replay_key(scheme_payload, network)
+
+        :error ->
+          :error
       end
     end
+
+    defp derive_replay_key(
+           "upto",
+           "eip155:" <> _reference = network,
+           scheme_payload,
+           _requirements
+         )
+         when is_map(scheme_payload),
+         do: permit2_replay_key(scheme_payload, network)
 
     # SVM: hash the signed message bytes, not the wire transaction — the
     # fee-payer signature slot is mutable, so a facilitator co-signature
     # (or a stripped slot) would mint a fresh key for the same signed
     # message. Matches the reference SDKs' transactionMessageHash.
-    defp derive_replay_key("exact", "solana:" <> _reference = network, scheme_payload)
+    defp derive_replay_key(
+           "exact",
+           "solana:" <> _reference = network,
+           scheme_payload,
+           _requirements
+         )
          when is_map(scheme_payload) do
       with transaction when is_binary(transaction) <-
              Utils.map_value(scheme_payload, {"transaction", :transaction}),
@@ -1950,7 +2704,32 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    defp derive_replay_key(_scheme, _network, _scheme_payload), do: :error
+    defp derive_replay_key(_scheme, _network, _scheme_payload, _requirements), do: :error
+
+    # Permit2: the permit's owner (from) + nonce are covered by the
+    # PermitWitnessTransferFrom signature. Permit2's nonce bitmap is per
+    # owner and shared by every spender, so exact and upto authorizations
+    # with the same owner + nonce are the same on-chain slot and share one
+    # key. The nonce is a uint256, so canonicalize it to its 32-byte
+    # encoding — equivalent JSON forms (`1`, `"1"`, `"01"`) must mint the
+    # same replay key so a re-encoded header cannot bypass dedup while
+    # sharing the same signature.
+    @spec permit2_replay_key(map(), String.t()) :: {:ok, String.t()} | :error
+    defp permit2_replay_key(scheme_payload, network) do
+      with authorization when is_map(authorization) <- evm_authorization(scheme_payload, :permit2),
+           from when is_binary(from) and from != "" <-
+             Utils.map_value(authorization, {"from", :from}),
+           {:ok, nonce_word} <-
+             EIP712.encode_uint256(Utils.map_value(authorization, {"nonce", :nonce})) do
+        {:ok,
+         "evm-permit2:" <>
+           network <>
+           ":" <>
+           String.downcase(from) <> ":" <> Base.encode16(nonce_word, case: :lower)}
+      else
+        _other -> :error
+      end
+    end
 
     @spec signer_nonce_key(term(), String.t(), String.t()) :: {:ok, String.t()} | :error
     defp signer_nonce_key(authorization, prefix, network) when is_map(authorization) do
@@ -2135,9 +2914,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     @spec route_accepts(compiled_route()) :: [map()]
-    defp route_accepts(%{accepts: accepts}) do
-      Enum.map(accepts, &payment_requirements_from_accept/1)
-    end
+    defp route_accepts(%{requirements: requirements}), do: requirements
 
     @spec payment_requirements_from_accept(payment_accept()) :: map()
     defp payment_requirements_from_accept(accept) do
@@ -2407,10 +3184,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp status_for_reason({:missing_fields, _fields}), do: 400
     defp status_for_reason({:precheck_failed, _reason}), do: 402
     defp status_for_reason({:invalid_upto_payment, _reason}), do: 400
+    defp status_for_reason({:invalid_exact_payment, _reason}), do: 400
     defp status_for_reason({:invalid_scheme_payment, _reason}), do: 400
     defp status_for_reason({:invalid_fields, _fields}), do: 400
     defp status_for_reason(:invalid_payment_requirements), do: 400
     defp status_for_reason(:extension_echo_mismatch), do: 400
+    defp status_for_reason({:invalid_builder_code, _reason}), do: 400
+    defp status_for_reason({:extension_invalid, _key, _reason}), do: 400
     defp status_for_reason({:siwx_header, _reason}), do: 400
     defp status_for_reason({:siwx, _code}), do: 402
     defp status_for_reason({:invalid_payment_identifier, _reason}), do: 400
@@ -2508,10 +3288,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       do: "payment authorization does not satisfy the payment requirements"
 
     defp rejection_error({:invalid_upto_payment, _reason}), do: "invalid_payload"
+    defp rejection_error({:invalid_exact_payment, _reason}), do: "invalid_payload"
     defp rejection_error({:invalid_scheme_payment, _reason}), do: "invalid_payload"
     defp rejection_error({:invalid_fields, _fields}), do: "invalid_payload"
     defp rejection_error(:invalid_payment_requirements), do: "invalid_payload"
     defp rejection_error(:extension_echo_mismatch), do: "invalid_payload"
+    defp rejection_error({:invalid_builder_code, _reason}), do: "invalid_payload"
+    defp rejection_error({:extension_invalid, _key, _reason}), do: "invalid_payload"
     defp rejection_error({:siwx_header, _reason}), do: "invalid_siwx_header"
     defp rejection_error({:siwx, code}), do: Atom.to_string(code)
 

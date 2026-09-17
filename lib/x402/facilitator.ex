@@ -146,6 +146,26 @@ defmodule X402.Facilitator do
           pagination: discovery_pagination() | nil
         }
 
+  @typedoc "Cursor pagination metadata returned by `GET /discovery/search`."
+  @type discovery_search_pagination :: %{
+          limit: non_neg_integer(),
+          cursor: String.t() | nil
+        }
+
+  @typedoc """
+  Validated response of `search_resources/2`.
+
+  Each resource is the raw, string-keyed discovered-resource map from the
+  wire. `:partial_results` is `true` when the facilitator truncated the
+  match list, `nil` when it did not say.
+  """
+  @type discovery_search_response :: %{
+          x402_version: integer() | nil,
+          resources: [map()],
+          partial_results: boolean() | nil,
+          pagination: discovery_search_pagination() | nil
+        }
+
   @type state :: %{
           url: String.t(),
           finch: term(),
@@ -432,6 +452,108 @@ defmodule X402.Facilitator do
     end
   end
 
+  @search_resources_params_schema [
+    query: [
+      type: :string,
+      required: true,
+      doc: "Natural-language search query."
+    ],
+    type: [
+      type: :string,
+      doc: "Filter by resource type (for example `\"http\"` or `\"mcp\"`)."
+    ],
+    pay_to: [
+      type: :string,
+      doc: "Filter by payment recipient address (sent as `payTo`)."
+    ],
+    scheme: [
+      type: :string,
+      doc: "Filter by payment scheme (for example `\"exact\"`)."
+    ],
+    network: [
+      type: :string,
+      doc: "Filter by CAIP-2 payment network (for example `\"eip155:8453\"`)."
+    ],
+    extensions: [
+      type: :string,
+      doc: "Filter by extension key present on each discovered resource."
+    ],
+    limit: [
+      type: :pos_integer,
+      doc: "Advisory maximum number of results; the facilitator may return fewer or ignore it."
+    ],
+    cursor: [
+      type: :string,
+      doc: "Advisory continuation cursor from a previous page's `pagination.cursor`."
+    ]
+  ]
+
+  @doc """
+  Searches discoverable x402 resources in the facilitator's bazaar.
+
+  Performs `GET /discovery/search` in the calling process — the
+  natural-language search endpoint of the
+  [bazaar extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/bazaar.md).
+  Parameters are validated with `NimbleOptions` and encoded as query string
+  parameters; `:query` is required. The response is validated fail-closed:
+  a malformed body returns
+  `{:error, %X402.Facilitator.Error{type: :malformed_facilitator_response}}`.
+
+  Unlike `list_resources/2`, the search endpoint pages with an opaque
+  cursor: pass `pagination.cursor` from one response as `:cursor` to fetch
+  the next page, until it is `nil`. Both `:limit` and `:cursor` are
+  advisory — the facilitator may ignore them.
+
+  Resources are returned as raw, string-keyed maps exactly as sent by the
+  facilitator (`X402.Extensions.Bazaar.search/2` parses them). `X402.Hooks`
+  callbacks do not apply to this read-only operation.
+
+  When called with just a keyword list — `search_resources(query: "weather")`
+  — the parameters apply to the default facilitator process name.
+
+  ## Parameters
+
+  #{NimbleOptions.docs(@search_resources_params_schema)}
+
+  ## Examples
+
+      {:ok, %{resources: resources, pagination: pagination}} =
+        X402.Facilitator.search_resources(MyFacilitator,
+          query: "weather forecast APIs",
+          network: "eip155:8453",
+          limit: 10
+        )
+  """
+  @doc group: :discovery
+  @doc since: "0.8.0"
+  @spec search_resources(server() | keyword(), keyword()) ::
+          {:ok, discovery_search_response()}
+          | {:error, Error.t() | NimbleOptions.ValidationError.t()}
+  def search_resources(server_or_params \\ @default_name, params \\ [])
+
+  def search_resources(params, []) when is_list(params) do
+    search_resources(@default_name, params)
+  end
+
+  def search_resources(server, params) when is_list(params) do
+    case NimbleOptions.validate(params, @search_resources_params_schema) do
+      {:ok, validated_params} ->
+        config = fetch_config(server)
+        query = discovery_query(validated_params)
+
+        get_with_telemetry(
+          config,
+          :search_resources,
+          "/discovery/search",
+          query,
+          &parse_discovery_search/1
+        )
+
+      {:error, %NimbleOptions.ValidationError{} = error} ->
+        {:error, error}
+    end
+  end
+
   @doc false
   @spec validate_auth(nil | module() | {module(), keyword()}) ::
           {:ok, nil | module() | {module(), keyword()}} | {:error, String.t()}
@@ -711,8 +833,51 @@ defmodule X402.Facilitator do
       "upto" ->
         validate_upto_payment(operation, payload, requirements)
 
+      "exact" ->
+        validate_exact_payment(payload, requirements)
+
       _scheme ->
         :ok
+    end
+  end
+
+  # Exact payments using the Permit2 transfer method settle exactly
+  # `permitted.amount`, so a permitted amount that differs from the
+  # requirements' amount can never be a valid payment for these
+  # requirements — reject it locally before the facilitator round-trip.
+  # EIP-3009 payloads (no permit2Authorization) are left to the facilitator.
+  defp validate_exact_payment(payload, requirements) do
+    permitted =
+      Utils.nested_map_value(payload, [
+        {"payload", :payload},
+        {"permit2Authorization", :permit2Authorization},
+        {"permitted", :permitted},
+        {"amount", :amount}
+      ])
+
+    amount = Utils.map_value(requirements, {"amount", :amount})
+
+    case {permitted, amount} do
+      {nil, _amount} -> :ok
+      {_permitted, nil} -> :ok
+      {permitted, amount} -> ensure_exact_amount(permitted, amount)
+    end
+  end
+
+  defp ensure_exact_amount(permitted, amount) do
+    with {:ok, permitted} <- parse_exact_amount(permitted, :invalid_payment_value),
+         {:ok, amount} <- parse_exact_amount(amount, :invalid_amount) do
+      case Utils.compare_decimal(permitted, amount) do
+        :eq -> :ok
+        _comparison -> {:error, {:invalid_exact_payment, :amount_mismatch}}
+      end
+    end
+  end
+
+  defp parse_exact_amount(value, reason) do
+    case Utils.parse_decimal(value) do
+      {:ok, parsed} -> {:ok, parsed}
+      :error -> {:error, {:invalid_exact_payment, reason}}
     end
   end
 
@@ -975,6 +1140,46 @@ defmodule X402.Facilitator do
   defp parse_discovery_version(nil), do: {:ok, nil}
   defp parse_discovery_version(version) when is_integer(version), do: {:ok, version}
   defp parse_discovery_version(_version), do: {:error, {:invalid_field, "x402Version"}}
+
+  defp parse_discovery_search(body) do
+    with {:ok, resources} <- parse_search_resources(Map.get(body, "resources")),
+         {:ok, partial_results} <- parse_partial_results(Map.get(body, "partialResults")),
+         {:ok, pagination} <- parse_search_pagination(Map.get(body, "pagination")),
+         {:ok, x402_version} <- parse_discovery_version(Map.get(body, "x402Version")) do
+      {:ok,
+       %{
+         x402_version: x402_version,
+         resources: resources,
+         partial_results: partial_results,
+         pagination: pagination
+       }}
+    end
+  end
+
+  defp parse_search_resources(nil), do: {:error, {:missing_field, "resources"}}
+
+  defp parse_search_resources(resources) when is_list(resources) do
+    if Enum.all?(resources, &is_map/1) do
+      {:ok, resources}
+    else
+      {:error, {:invalid_field, "resources"}}
+    end
+  end
+
+  defp parse_search_resources(_resources), do: {:error, {:invalid_field, "resources"}}
+
+  defp parse_partial_results(nil), do: {:ok, nil}
+  defp parse_partial_results(value) when is_boolean(value), do: {:ok, value}
+  defp parse_partial_results(_value), do: {:error, {:invalid_field, "partialResults"}}
+
+  defp parse_search_pagination(nil), do: {:ok, nil}
+
+  defp parse_search_pagination(%{"limit" => limit, "cursor" => cursor})
+       when is_integer(limit) and (is_binary(cursor) or is_nil(cursor)) do
+    {:ok, %{limit: limit, cursor: cursor}}
+  end
+
+  defp parse_search_pagination(_pagination), do: {:error, {:invalid_field, "pagination"}}
 
   defp before_callback(:verify), do: :before_verify
   defp before_callback(:settle), do: :before_settle
