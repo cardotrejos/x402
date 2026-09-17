@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Accept Solana signers in `X402.Client.Finch` and `X402.MCP.Client` option
+  validation. Both clients now require `address/1` plus either `sign_eip712/3`
+  or `sign_ed25519/2`, allowing `X402.Signer.SolanaKey` to reach the SVM
+  payment flow. Scheme-specific callback checks remain in the signer dispatcher.
+
 ## [0.6.0] - 2026-08-28
 
 ### Added
