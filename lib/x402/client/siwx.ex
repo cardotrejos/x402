@@ -144,12 +144,13 @@ defmodule X402.Client.SIWX do
   signed, or `{:error, {:siwx, reason}}`.
 
   Before signing, the challenge is checked against the resource it was
-  issued for, as the spec requires: its `info.domain` must equal
+  issued for, as the spec requires: its `info.domain` must equal (ignoring case)
   `siwx_opts[:domain]` when given, otherwise the host (optionally with
   port) of `:resource_url`; and, when `:resource_url` is given, the origin
   (scheme, host, port) of `info.uri` must equal the URL's origin. Failures
   are reported as `:domain_mismatch` / `:uri_mismatch`. With neither a
-  domain nor a resource URL the origin is not checked.
+  trusted domain nor a resource URL, signing fails with `:domain_mismatch`.
+  Never derive the expected domain from the untrusted challenge.
 
   With `chain_id: :auto` the first entry of `supportedChains` whose family
   the signer can sign is used (`eip155:*` needs `c:X402.Signer.sign_message/2`,
@@ -229,10 +230,11 @@ defmodule X402.Client.SIWX do
       case {expected, resource_url} do
         {expected, _url} when is_binary(expected) -> [expected]
         {nil, url} when is_binary(url) -> url_domains(url)
-        {nil, nil} -> [domain]
+        {nil, nil} -> []
       end
 
-    case is_binary(domain) and domain in allowed do
+    case is_binary(domain) and domain != "" and
+           Enum.any?(allowed, &(String.downcase(&1) == String.downcase(domain))) do
       true -> :ok
       false -> {:error, {:siwx, :domain_mismatch}}
     end

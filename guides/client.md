@@ -499,7 +499,10 @@ The option is a keyword list of `X402.Client.SIWX` options:
 A challenge whose `domain` or `uri` is not bound to the resource's origin
 is refused (`{:error, {:siwx, :domain_mismatch}}` /
 `{:siwx, :uri_mismatch}`), as is one listing no chain the signer can sign
-(`{:siwx, :unsupported_chain}`). Every attempt emits
+(`{:siwx, :unsupported_chain}`). Domain matching ignores host case, but
+does not ignore port differences. Direct `authenticate/4` calls also
+require a trusted `domain:` or `resource_url:`; neither may be inferred
+from the untrusted challenge. Every attempt emits
 `[:x402, :client, :siwx]` with `:transport`, `:chain_id`, and `:outcome`
 (`:authenticated` or `:payment_required`) — or `:reason` on error.
 

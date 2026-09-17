@@ -62,8 +62,10 @@ defmodule X402.MCP.Client do
   payment. A result that is not payment-required is returned with
   `siwx_authenticated: true`; another payment-required result continues
   with the payment flow, the paid call carrying a proof for the new
-  challenge. MCP resources have no HTTP origin, so pass `:domain` to pin
-  the challenge to the server you expect.
+  challenge. MCP resources have no trusted HTTP origin, so `:domain` is
+  required to pin the challenge to the server you expect. Without it,
+  an advertised challenge fails with `{:error, {:siwx, :domain_mismatch}}`
+  before the wallet signs or the call is retried.
   """
 
   alias X402.Client
@@ -129,7 +131,7 @@ defmodule X402.MCP.Client do
       default: nil,
       doc: """
       Automatic Sign-In-With-X: a keyword list of `X402.Client.SIWX`
-      options (`chain_id:` required, or `:auto`; `domain:` recommended).
+      options (`chain_id:` required, or `:auto`; `domain:` required).
       `nil`/`false` disables it.
       """
     ],

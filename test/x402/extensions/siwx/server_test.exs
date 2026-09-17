@@ -124,6 +124,41 @@ defmodule X402.Extensions.SIWX.ServerTest do
   end
 
   describe "authenticate/3, record_payment/4, and revoke/3" do
+    test "EVM records, lookups, proof authentication and revocation ignore address case" do
+      storage = start_storage()
+      siwx = Server.new!(@base ++ [storage: {ETSStorage, storage}])
+      checksummed = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAfF2A"
+
+      assert :ok = Server.record_payment(siwx, checksummed, @resource, :paid)
+      assert {:ok, %{payment_proof: :paid}} = ETSStorage.get(storage, @address, @resource)
+      assert {:ok, _record} = Server.authorized(siwx, @address, @resource)
+      assert {:ok, _record} = Server.authorized(siwx, checksummed, @resource)
+      assert {:ok, %{address: @address}} = Server.authenticate(siwx, proof(siwx), @resource)
+
+      assert :ok = Server.revoke(siwx, checksummed, @resource)
+      assert {:error, :not_authorized} = Server.authorized(siwx, @address, @resource)
+
+      assert :ok = Server.record_payment(siwx, @address, @resource, :paid)
+      assert {:ok, _record} = Server.authorized(siwx, checksummed, @resource)
+      assert :ok = Server.revoke(siwx, @address, @resource)
+      assert {:error, :not_authorized} = Server.authorized(siwx, checksummed, @resource)
+    end
+
+    test "Solana addresses remain case-sensitive" do
+      storage = start_storage()
+      siwx = Server.new!(@base ++ [storage: {ETSStorage, storage}])
+      address = "9xQeWvG816bUx9EPfQmQTYnC16hHhV6bQf8kX6y4YB9"
+      other = String.downcase(address)
+
+      assert :ok = Server.record_payment(siwx, address, @resource, :paid)
+      assert {:ok, _record} = Server.authorized(siwx, address, @resource)
+      assert {:error, :not_authorized} = Server.authorized(siwx, other, @resource)
+      assert :ok = Server.revoke(siwx, other, @resource)
+      assert {:ok, _record} = Server.authorized(siwx, address, @resource)
+      assert :ok = Server.revoke(siwx, address, @resource)
+      assert {:error, :not_authorized} = Server.authorized(siwx, address, @resource)
+    end
+
     test "authorizes only addresses with a payment record for the resource" do
       storage = start_storage()
       cache = start_cache()
