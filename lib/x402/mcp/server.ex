@@ -65,8 +65,37 @@ defmodule X402.MCP.Server do
   the same request proceeds normally. The pre-0.7.0 `"paymentIdentifier"`
   format is still accepted but deprecated (removed in 1.0.0) and emits
   `[:x402, :payment_identifier, :legacy]`.
+
+  ## Builder code
+
+  A payment echoing the
+  [`builder-code` extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/builder_code.md)
+  — whether or not `extensions` advertises it with
+  `X402.Extensions.BuilderCode.extension/2` — is checked with
+  `X402.Extensions.BuilderCode.validate_echo/2`: malformed codes or more
+  than ten service codes yield `invalid_payload`, and an app code that
+  differs from the advertised one is an extension echo mismatch. The codes
+  travel to the facilitator inside the payload.
+
+  ## Lifecycle hooks
+
+  The `:hooks` module may define the optional resource-server callbacks of
+  `X402.Hooks`. `c:X402.Hooks.on_protected_request/2` runs on every call
+  with an `X402.Hooks.RequestContext` (`transport: :mcp`, the request, the
+  tool name, and the advertised requirements and extensions) before the
+  payment is inspected: it may continue with replaced requirements or
+  extensions, halt with `{:halt, {status, body}}` (answered as an
+  `isError` result carrying `body` in `structuredContent`), or halt with
+  `{:halt, :skip_payment}` to run the handler unpaid (emitting
+  `[:x402, :mcp, :pass_through]` with `reason: :hook_skipped`).
+  `c:X402.Hooks.on_verified_payment_canceled/2` runs when a verified
+  payment is not settled: the handler returned an error result
+  (`reason: :handler_failed`), the handler raised or threw
+  (`reason: :handler_raised`, with `:error`), or settlement failed
+  (`reason: :settlement_failed`, with `:error`).
   """
 
+  alias X402.Extensions.BuilderCode
   alias X402.Extensions.PaymentIdentifier
   alias X402.Extensions.PaymentIdentifier.Cache
   alias X402.Extensions.PaymentIdentifier.ETSCache
@@ -74,6 +103,7 @@ defmodule X402.MCP.Server do
   alias X402.Facilitator.Error
   alias X402.Hooks
   alias X402.Hooks.Default
+  alias X402.Hooks.RequestContext
   alias X402.MCP
   alias X402.PaymentRequirements
   alias X402.PaymentSignature
@@ -313,14 +343,62 @@ defmodule X402.MCP.Server do
       when is_map(request) and is_map(config) and is_function(handler, 1) do
     if is_nil(config.payment_identifier_cache), do: warn_no_idempotency_cache_once()
 
+    context =
+      RequestContext.new(
+        transport: :mcp,
+        request: request,
+        route: config,
+        tool: config.tool,
+        requirements: config.accepts,
+        extensions: config.extensions
+      )
+
+    case Hooks.run_protected_request(config.hooks, context, %{tool: config.tool}) do
+      {:cont, context} ->
+        config = %{config | accepts: context.requirements, extensions: context.extensions}
+        gate_call(request, config, context, handler)
+
+      {:halt, :skip_payment} ->
+        emit(:pass_through, %{tool: config.tool, reason: :hook_skipped})
+        handler.(request)
+
+      {:halt, {status, body}} ->
+        emit(:payment_rejected, %{tool: config.tool, reason: {:hook_halted, status}})
+        hook_halt_result(body)
+
+      {:error, reason} ->
+        emit(:payment_rejected, %{tool: config.tool, reason: reason})
+        internal_error_result()
+    end
+  end
+
+  @spec gate_call(map(), options(), RequestContext.t(), handler()) :: map()
+  defp gate_call(request, config, context, handler) do
     case MCP.fetch_payment(request) do
       :error ->
         emit(:payment_required, %{tool: config.tool})
         payment_required_result(config, "Payment required to access this tool")
 
       {:ok, payment_payload} ->
-        verify_and_execute(request, config, handler, payment_payload)
+        verify_and_execute(request, config, context, handler, payment_payload)
     end
+  end
+
+  # MCP has no status line; the halt body becomes the error result's text
+  # (its "error" field when present) and travels whole as structuredContent.
+  @spec hook_halt_result(map()) :: map()
+  defp hook_halt_result(body) do
+    text =
+      case Utils.map_value(body, {"error", :error}) do
+        message when is_binary(message) -> message
+        _other -> "request rejected"
+      end
+
+    %{
+      "isError" => true,
+      "content" => [%{"type" => "text", "text" => text}],
+      "structuredContent" => body
+    }
   end
 
   @doc since: "0.6.0"
@@ -350,15 +428,16 @@ defmodule X402.MCP.Server do
 
   # -- Verification -----------------------------------------------------------
 
-  @spec verify_and_execute(map(), options(), handler(), map()) :: map()
-  defp verify_and_execute(request, config, handler, payment_payload) do
+  @spec verify_and_execute(map(), options(), RequestContext.t(), handler(), map()) :: map()
+  defp verify_and_execute(request, config, context, handler, payment_payload) do
     with {:ok, requirements} <- validate_payment(payment_payload, config),
          {:ok, client_payment_id} <- client_payment_id(payment_payload, config),
          {:ok, payment_id} <- payment_id(payment_payload),
          {:ok, binding} <- bind_payment_id(config, client_payment_id, requirements),
          claims = %{payment_id: payment_id, binding: binding},
          :ok <- verify_and_claim(config, payment_payload, requirements, claims) do
-      execute_and_settle(request, config, handler, payment_payload, requirements, claims)
+      context = %{context | payload: payment_payload, matched_requirements: requirements}
+      execute_and_settle(request, config, context, handler, payment_payload, requirements, claims)
     else
       {:error, reason} ->
         emit(:payment_rejected, %{tool: config.tool, reason: reason})
@@ -418,8 +497,29 @@ defmodule X402.MCP.Server do
     with :ok <- ensure_v2_payload(payment_payload),
          {:ok, payment_payload} <- PaymentSignature.validate(payment_payload),
          {:ok, matched} <- find_matching_requirements(config.accepts, payment_payload),
-         :ok <- validate_extensions(payment_payload, config.extensions) do
+         :ok <- validate_extensions(payment_payload, config.extensions),
+         :ok <- validate_builder_code(payment_payload, config.extensions) do
       {:ok, matched}
+    end
+  end
+
+  # The generic echo check only compares advertised keys; the builder-code
+  # rules also apply when the client volunteers the extension unprompted.
+  @spec validate_builder_code(map(), map()) ::
+          :ok | {:error, :extension_echo_mismatch | {:invalid_builder_code, term()}}
+  defp validate_builder_code(payload, advertised_extensions) do
+    key = BuilderCode.extension_key()
+
+    echoed =
+      case Utils.map_value(payload, {"extensions", :extensions}) do
+        %{} = extensions -> Utils.map_value(extensions, {key, :"builder-code"})
+        _absent -> nil
+      end
+
+    case BuilderCode.validate_echo(echoed, Map.get(advertised_extensions, key)) do
+      :ok -> :ok
+      {:error, :builder_code_mismatch} -> {:error, :extension_echo_mismatch}
+      {:error, reason} -> {:error, {:invalid_builder_code, reason}}
     end
   end
 
@@ -475,34 +575,58 @@ defmodule X402.MCP.Server do
 
   # -- Execution and settlement -----------------------------------------------
 
-  @spec execute_and_settle(map(), options(), handler(), map(), map(), claims()) :: map()
-  defp execute_and_settle(request, config, handler, payment_payload, requirements, claims) do
-    result = run_handler(config, handler, request, claims)
+  @spec execute_and_settle(
+          map(),
+          options(),
+          RequestContext.t(),
+          handler(),
+          map(),
+          map(),
+          claims()
+        ) :: map()
+  defp execute_and_settle(
+         request,
+         config,
+         context,
+         handler,
+         payment_payload,
+         requirements,
+         claims
+       ) do
+    result = run_handler(config, context, handler, request, claims)
 
     case error_result?(result) do
       true ->
         # The tool itself failed: return its error unchanged, do not settle,
         # and release the claim so the client may retry with the same payment.
         release_claims(config, claims)
+        notify_payment_canceled(config, context, %{reason: :handler_failed})
         result
 
       false ->
-        settle_result(config, payment_payload, requirements, claims, result)
+        settle_result(config, context, payment_payload, requirements, claims, result)
     end
   end
 
-  @spec run_handler(options(), handler(), map(), claims()) :: map()
-  defp run_handler(config, handler, request, claims) do
+  @spec run_handler(options(), RequestContext.t(), handler(), map(), claims()) :: map()
+  defp run_handler(config, context, handler, request, claims) do
     result =
       try do
         handler.(request)
       rescue
         exception ->
           release_claims(config, claims)
+          notify_payment_canceled(config, context, %{reason: :handler_raised, error: exception})
           reraise exception, __STACKTRACE__
       catch
         kind, reason ->
           release_claims(config, claims)
+
+          notify_payment_canceled(config, context, %{
+            reason: :handler_raised,
+            error: {kind, reason}
+          })
+
           :erlang.raise(kind, reason, __STACKTRACE__)
       end
 
@@ -519,8 +643,8 @@ defmodule X402.MCP.Server do
     end
   end
 
-  @spec settle_result(options(), map(), map(), claims(), map()) :: map()
-  defp settle_result(config, payment_payload, requirements, claims, result) do
+  @spec settle_result(options(), RequestContext.t(), map(), map(), claims(), map()) :: map()
+  defp settle_result(config, context, payment_payload, requirements, claims, result) do
     with {:ok, settle_response} <- facilitator_settle(config, payment_payload, requirements),
          :ok <- ensure_settle_success(settle_response) do
       emit(:payment_verified, %{tool: config.tool})
@@ -529,8 +653,18 @@ defmodule X402.MCP.Server do
       {:error, reason} ->
         release_claims(config, claims)
         emit(:payment_rejected, %{tool: config.tool, reason: reason})
+        notify_payment_canceled(config, context, %{reason: :settlement_failed, error: reason})
         settlement_failed_result(config, reason)
     end
+  end
+
+  @spec notify_payment_canceled(options(), RequestContext.t(), map()) :: :ok
+  defp notify_payment_canceled(config, context, metadata) do
+    Hooks.run_verified_payment_canceled(
+      config.hooks,
+      context,
+      Map.put(metadata, :tool, config.tool)
+    )
   end
 
   # Per the spec, settlement failure after execution follows the payment
@@ -566,6 +700,7 @@ defmodule X402.MCP.Server do
   defp rejection_message(:invalid_payload), do: "invalid_payload"
   defp rejection_message(:no_matching_requirements), do: "No matching payment requirements"
   defp rejection_message(:extension_echo_mismatch), do: "invalid_payload"
+  defp rejection_message({:invalid_builder_code, _reason}), do: "invalid_payload"
   defp rejection_message(:invalid_payment_identifier), do: "invalid_payload"
   defp rejection_message(:payment_identifier_required), do: "payment_identifier_required"
   defp rejection_message(:payment_identifier_conflict), do: "payment_identifier_conflict"
@@ -863,7 +998,8 @@ defmodule X402.MCP.Server do
     end)
   end
 
-  @spec emit(:payment_required | :payment_verified | :payment_rejected, map()) :: :ok
+  @spec emit(:pass_through | :payment_required | :payment_verified | :payment_rejected, map()) ::
+          :ok
   defp emit(event, metadata) do
     :telemetry.execute([:x402, :mcp, event], %{count: 1}, metadata)
   end

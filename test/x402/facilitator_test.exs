@@ -1502,6 +1502,206 @@ defmodule X402.FacilitatorTest do
     end
   end
 
+  describe "search_resources/2" do
+    test "searches with encoded query parameters and parses the page", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      resource = %{
+        "resource" => "https://api.example.com/weather",
+        "type" => "http",
+        "x402Version" => 2,
+        "accepts" => [%{"scheme" => "exact", "network" => "eip155:8453"}],
+        "lastUpdated" => 1_703_123_456
+      }
+
+      Bypass.expect(bypass, "GET", "/discovery/search", fn conn ->
+        conn = Plug.Conn.fetch_query_params(conn)
+
+        assert conn.query_params == %{
+                 "query" => "weather forecast APIs",
+                 "type" => "http",
+                 "payTo" => "0x1111111111111111111111111111111111111111",
+                 "scheme" => "exact",
+                 "network" => "eip155:8453",
+                 "extensions" => "bazaar",
+                 "limit" => "10",
+                 "cursor" => "abc"
+               }
+
+        Plug.Conn.resp(
+          conn,
+          200,
+          Jason.encode!(%{
+            "x402Version" => 2,
+            "resources" => [resource],
+            "partialResults" => true,
+            "pagination" => %{"limit" => 10, "cursor" => "def"}
+          })
+        )
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok,
+              %{
+                x402_version: 2,
+                resources: [returned],
+                partial_results: true,
+                pagination: %{limit: 10, cursor: "def"}
+              }} =
+               Facilitator.search_resources(facilitator,
+                 query: "weather forecast APIs",
+                 type: "http",
+                 pay_to: "0x1111111111111111111111111111111111111111",
+                 scheme: "exact",
+                 network: "eip155:8453",
+                 extensions: "bazaar",
+                 limit: 10,
+                 cursor: "abc"
+               )
+
+      assert returned == resource
+    end
+
+    test "treats a null cursor as the last page and missing fields as nil", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "GET", "/discovery/search", fn conn ->
+        conn = Plug.Conn.fetch_query_params(conn)
+        assert conn.query_params == %{"query" => "weather"}
+
+        Plug.Conn.resp(
+          conn,
+          200,
+          Jason.encode!(%{"resources" => [], "pagination" => %{"limit" => 20, "cursor" => nil}})
+        )
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok,
+              %{
+                x402_version: nil,
+                resources: [],
+                partial_results: nil,
+                pagination: %{limit: 20, cursor: nil}
+              }} = Facilitator.search_resources(facilitator, query: "weather")
+    end
+
+    test "uses the default registered name when called with parameters only", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "GET", "/discovery/search", fn conn ->
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"resources" => []}))
+      end)
+
+      start_supervised!({Facilitator, finch: finch, url: facilitator_url})
+
+      assert {:ok, %{resources: [], pagination: nil}} =
+               Facilitator.search_resources(query: "weather")
+    end
+
+    test "rejects invalid parameters before any HTTP request", %{
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Facilitator.search_resources(facilitator, [])
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Facilitator.search_resources(facilitator, query: "weather", limit: 0)
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Facilitator.search_resources(facilitator, query: :weather)
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Facilitator.search_resources(facilitator, query: "weather", offset: 1)
+    end
+
+    test "fails closed on malformed responses", %{finch: finch} do
+      malformed_bodies = [
+        %{},
+        %{"resources" => %{}},
+        %{"resources" => ["not-a-map"]},
+        %{"resources" => [], "partialResults" => "yes"},
+        %{"resources" => [], "pagination" => %{"limit" => "10", "cursor" => nil}},
+        %{"resources" => [], "pagination" => %{"limit" => 10, "cursor" => 1}},
+        %{"resources" => [], "pagination" => %{"limit" => 10}},
+        %{"resources" => [], "x402Version" => "2"}
+      ]
+
+      for body <- malformed_bodies do
+        bypass = Bypass.open()
+
+        Bypass.expect(bypass, "GET", "/discovery/search", fn conn ->
+          Plug.Conn.resp(conn, 200, Jason.encode!(body))
+        end)
+
+        facilitator =
+          start_supervised!(
+            {Facilitator,
+             name: unique_name("facilitator"),
+             finch: finch,
+             url: "http://localhost:#{bypass.port}"}
+          )
+
+        assert {:error, %Error{type: :malformed_facilitator_response, status: 200}} =
+                 Facilitator.search_resources(facilitator, query: "weather")
+      end
+    end
+
+    test "surfaces HTTP failures with the search operation in telemetry", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      handler_id = "search-resources-#{System.unique_integer([:positive, :monotonic])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :facilitator, :search_resources, :stop],
+          fn _event, _measurements, metadata, _config -> send(parent, {:search, metadata}) end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Bypass.expect(bypass, "GET", "/discovery/search", fn conn ->
+        Plug.Conn.resp(conn, 503, "unavailable")
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"), finch: finch, url: facilitator_url, max_retries: 0}
+        )
+
+      assert {:error, %Error{type: :http_error, status: 503}} =
+               Facilitator.search_resources(facilitator, query: "weather")
+
+      assert_receive {:search, %{status: 503, success: false, error_type: :http_error}}
+    end
+  end
+
   describe "hook edge cases" do
     test "an invalid before_verify return halts without an HTTP request", %{
       finch: finch,
