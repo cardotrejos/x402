@@ -231,8 +231,12 @@ defmodule X402.MixProject do
           X402.Extensions.OfferReceipt,
           X402.Extensions.OfferReceipt.JWS,
           X402.Extensions.SIWX,
+          X402.Extensions.SIWX.Challenge,
+          X402.Extensions.SIWX.Message,
+          X402.Extensions.SIWX.Server,
           X402.Extensions.SIWX.Verifier,
           X402.Extensions.SIWX.Verifier.Default,
+          X402.Extensions.SIWX.Verifier.Ed25519,
           X402.Extensions.SIWX.Storage,
           X402.Extensions.SIWX.ETSStorage
         ]

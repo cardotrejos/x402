@@ -82,6 +82,20 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
     assert {:error, :invalid_cache_value} = ETSCache.put(cache, "pid:abc", {:bound, :atom})
   end
 
+  test "stores sign-in-with-x nonce states" do
+    cache = start_cache(ttl_ms: 1_000)
+
+    assert :ok = ETSCache.put_new(cache, "siwx:issued:abc", {:siwx_nonce, :issued})
+    assert {:hit, {:siwx_nonce, :issued}} = ETSCache.get(cache, "siwx:issued:abc")
+    assert :ok = ETSCache.put_new(cache, "siwx:used:abc", {:siwx_nonce, :used})
+
+    assert {:error, :already_exists} =
+             ETSCache.put_new(cache, "siwx:used:abc", {:siwx_nonce, :used})
+
+    assert {:error, :invalid_cache_value} =
+             ETSCache.put(cache, "siwx:used:abc", {:siwx_nonce, :pending})
+  end
+
   test "rejects invalid value and invalid payment identifiers" do
     cache = start_cache(ttl_ms: 1_000)
 

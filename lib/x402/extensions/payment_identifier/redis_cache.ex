@@ -91,6 +91,8 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCache do
   @verified_encoding "verified"
   @rejected_prefix "rejected:"
   @bound_prefix "bound:"
+  @siwx_nonce_issued "siwx_nonce:issued"
+  @siwx_nonce_used "siwx_nonce:used"
 
   @new_opts_schema [
     conn: [
@@ -287,12 +289,16 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCache do
   defp encode_value({:bound, fingerprint}) when is_binary(fingerprint),
     do: {:ok, @bound_prefix <> fingerprint}
 
+  defp encode_value({:siwx_nonce, :issued}), do: {:ok, @siwx_nonce_issued}
+  defp encode_value({:siwx_nonce, :used}), do: {:ok, @siwx_nonce_used}
   defp encode_value(_invalid), do: {:error, :invalid_cache_value}
 
   @spec decode_value(String.t()) ::
           {:hit, Cache.value()} | {:error, {:invalid_cache_entry, String.t()}}
   defp decode_value(@verified_encoding), do: {:hit, :verified}
   defp decode_value(@bound_prefix <> fingerprint), do: {:hit, {:bound, fingerprint}}
+  defp decode_value(@siwx_nonce_issued), do: {:hit, {:siwx_nonce, :issued}}
+  defp decode_value(@siwx_nonce_used), do: {:hit, {:siwx_nonce, :used}}
 
   defp decode_value(@rejected_prefix <> encoded = raw) do
     with {:ok, binary} <- Base.decode64(encoded),

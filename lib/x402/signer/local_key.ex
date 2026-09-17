@@ -19,6 +19,8 @@ defmodule X402.Signer.LocalKey do
 
   alias X402.EIP3009
 
+  @eth_sign_prefix "\x19Ethereum Signed Message:\n"
+
   @enforce_keys [:private_key, :address]
   defstruct [:private_key, :address]
 
@@ -82,6 +84,29 @@ defmodule X402.Signer.LocalKey do
 
   def sign_eip712(%__MODULE__{}, _digest, _typed_data), do: {:error, :invalid_digest}
 
+  @doc since: "0.7.0"
+  @doc """
+  Signs `message` with EIP-191 `personal_sign` using the local key.
+
+  Hashes `"\\x19Ethereum Signed Message:\\n" <> byte_size(message) <> message`
+  with keccak256 and returns the `0x`-prefixed hex `r || s || v` signature
+  (`v` is `27` or `28`), the format `X402.Extensions.SIWX.Verifier.Default`
+  verifies. Requires the optional `ex_secp256k1` and `ex_keccak`
+  dependencies.
+  """
+  @impl X402.Signer
+  @spec sign_message(t(), binary()) :: {:ok, String.t()} | {:error, term()}
+  def sign_message(%__MODULE__{private_key: private_key}, message) when is_binary(message) do
+    with {:ok, secp256k1_module} <- secp256k1_module(),
+         {:ok, keccak_module} <- keccak_module(),
+         digest = keccak_module.hash_256(@eth_sign_prefix <> "#{byte_size(message)}" <> message),
+         {:ok, {signature, recovery_id}} <- secp256k1_module.sign_compact(digest, private_key) do
+      {:ok, "0x" <> Base.encode16(signature <> <<recovery_id + 27>>, case: :lower)}
+    end
+  end
+
+  def sign_message(%__MODULE__{}, _message), do: {:error, :invalid_message}
+
   @spec normalize_key(binary()) :: {:ok, binary()} | {:error, :invalid_private_key}
   defp normalize_key(key) when byte_size(key) == 32, do: {:ok, key}
   defp normalize_key("0x" <> hex), do: decode_key_hex(hex)
@@ -105,6 +130,16 @@ defmodule X402.Signer.LocalKey do
     case Code.ensure_loaded?(secp256k1_module) and
            function_exported?(secp256k1_module, :sign_compact, 2) do
       true -> {:ok, secp256k1_module}
+      false -> {:error, :missing_dependency}
+    end
+  end
+
+  @spec keccak_module() :: {:ok, module()} | {:error, :missing_dependency}
+  defp keccak_module do
+    keccak_module = Module.concat(["ExKeccak"])
+
+    case Code.ensure_loaded?(keccak_module) and function_exported?(keccak_module, :hash_256, 1) do
+      true -> {:ok, keccak_module}
       false -> {:error, :missing_dependency}
     end
   end

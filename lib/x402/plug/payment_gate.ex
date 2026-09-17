@@ -55,6 +55,48 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     `PAYMENT-REQUIRED` header is identical on both forms and all other
     responses are unchanged. See the "Browser Paywall" guide.
 
+    ## Sign-In-With-X
+
+    With `:siwx` configured (a keyword list of
+    `X402.Extensions.SIWX.Server.new/1` options), the gate implements the
+    [sign-in-with-x extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/sign-in-with-x.md)
+    so a wallet that already paid can skip payment:
+
+        plug X402.Plug.PaymentGate,
+          routes: [...],
+          siwx: [
+            domain: "api.example.com",
+            uri: "https://api.example.com",
+            supported_chains: [%{chain_id: "eip155:8453"}],
+            nonce_cache: MyApp.SIWXNonces,
+            storage: {X402.Extensions.SIWX.ETSStorage, MyApp.SIWXStorage}
+          ]
+
+    * Every 402 response advertises a fresh challenge under
+      `extensions["sign-in-with-x"]` (new nonce and timestamps each time).
+      Because it changes per response it is exempt from the extension echo
+      check.
+    * A request carrying a `SIGN-IN-WITH-X` header is verified by
+      `X402.Extensions.SIWX.Server.authenticate/3` against the resource URL
+      the gate advertises. When the address has a payment record for that
+      URL the handler runs without payment, `:x402_siwx_address` and
+      `:x402_siwx_chain_id` are assigned, and
+      `[:x402, :plug, :siwx_authenticated]` is emitted. When it has none,
+      the request proceeds through the normal payment flow if it also
+      carries `PAYMENT-SIGNATURE`, and otherwise receives **402** with a
+      fresh challenge. A proof that fails verification receives **402** with
+      the spec's `invalid_siwx_*` code as the `error` string (telemetry
+      `reason: {:siwx, code}`); a header that cannot be decoded receives
+      **400** `invalid_siwx_header`.
+    * After a successful settlement the payer (the settle response's
+      `payer`, falling back to the authorization's `from`) is recorded for
+      the resource URL through the configured `:storage`, for `:ttl_ms`.
+
+    The deprecated pre-0.7.0 `{message, signature}` header format is still
+    accepted; each one emits `[:x402, :siwx, :legacy]` and the first logs a
+    warning. Configure a `:nonce_cache` in production: without it a proof
+    can be replayed within its `issuedAt` window.
+
     ## Replay protection
 
     When `:payment_identifier_cache` is configured, the gate claims a
@@ -154,6 +196,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     alias X402.Extensions.PaymentIdentifier
     alias X402.Extensions.PaymentIdentifier.Cache
     alias X402.Extensions.PaymentIdentifier.ETSCache
+    alias X402.Extensions.SIWX
+    alias X402.Extensions.SIWX.Server, as: SIWXServer
     alias X402.Facilitator
     alias X402.Facilitator.Error
     alias X402.Hooks
@@ -514,6 +558,20 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         headers, 400/500 statuses, post-handler settlement failures) is
         byte-identical to running without `:paywall`.
         """
+      ],
+      siwx: [
+        type: {:or, [nil, {:custom, SIWXServer, :validate_options, []}]},
+        default: nil,
+        doc: """
+        Optional Sign-In-With-X configuration, a keyword list of
+        `X402.Extensions.SIWX.Server.new/1` options (`:domain`, `:uri`, and
+        `:supported_chains` are required). When set, every 402 response
+        advertises a fresh challenge under
+        `extensions["sign-in-with-x"]`, requests carrying a `SIGN-IN-WITH-X`
+        header are authenticated against it, and successful settlements
+        record the payer so later proofs from that address skip payment —
+        see "Sign-In-With-X" above.
+        """
       ]
     ]
 
@@ -530,7 +588,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             schemes: [module()],
             local_prechecks: boolean(),
             local_verification: keyword() | nil,
-            paywall: module() | nil
+            paywall: module() | nil,
+            siwx: SIWXServer.t() | nil
           }
 
     @typedoc false
@@ -571,7 +630,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             requirements: map(),
             route: compiled_route(),
             request_method: atom(),
-            request_path: String.t()
+            request_path: String.t(),
+            siwx: SIWXServer.t() | nil
           }
 
     @doc false
@@ -755,7 +815,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         schemes: schemes,
         local_prechecks: Keyword.fetch!(validated_opts, :local_prechecks),
         local_verification: Keyword.fetch!(validated_opts, :local_verification),
-        paywall: Keyword.fetch!(validated_opts, :paywall)
+        paywall: Keyword.fetch!(validated_opts, :paywall),
+        siwx: Keyword.fetch!(validated_opts, :siwx)
       }
     end
 
@@ -835,6 +896,15 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec handle_payment_gate(Plug.Conn.t(), options(), compiled_route(), atom(), String.t()) ::
             Plug.Conn.t()
     defp handle_payment_gate(conn, opts, route, request_method, request_path) do
+      case siwx_header(conn, opts.siwx) do
+        :none -> handle_payment(conn, opts, route, request_method, request_path)
+        {:ok, header} -> handle_siwx(conn, opts, route, request_method, request_path, header)
+      end
+    end
+
+    @spec handle_payment(Plug.Conn.t(), options(), compiled_route(), atom(), String.t()) ::
+            Plug.Conn.t()
+    defp handle_payment(conn, opts, route, request_method, request_path) do
       case payment_header(conn) do
         :missing ->
           emit(:payment_required, %{method: request_method, path: request_path, route: route.path})
@@ -845,7 +915,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             request_path,
             "PAYMENT-SIGNATURE header is required",
             status: 402,
-            paywall: opts.paywall
+            paywall: opts.paywall,
+            siwx: opts.siwx
           )
 
         {:ok, header} ->
@@ -866,8 +937,118 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             rejection_error(reason),
             status: status_for_reason(reason),
             reason: reason,
-            paywall: opts.paywall
+            paywall: opts.paywall,
+            siwx: opts.siwx
           )
+      end
+    end
+
+    @spec siwx_header(Plug.Conn.t(), SIWXServer.t() | nil) :: :none | {:ok, String.t()}
+    defp siwx_header(_conn, nil), do: :none
+
+    defp siwx_header(conn, _siwx) do
+      case get_req_header(conn, "sign-in-with-x") do
+        [header | _rest] when is_binary(header) and header != "" -> {:ok, header}
+        _missing -> :none
+      end
+    end
+
+    # A proof whose address has no payment record falls through to the
+    # payment flow when a PAYMENT-SIGNATURE is also present, so a client can
+    # present its identity and pay in one request (the settlement then
+    # records the payer). Without a payment the response is a 402 carrying a
+    # fresh challenge, exactly like a request with no headers at all.
+    @spec handle_siwx(
+            Plug.Conn.t(),
+            options(),
+            compiled_route(),
+            atom(),
+            String.t(),
+            String.t()
+          ) :: Plug.Conn.t()
+    defp handle_siwx(conn, opts, route, request_method, request_path, header) do
+      metadata = %{method: request_method, path: request_path, route: route.path}
+
+      with {:ok, decoded} <- decode_siwx_header(header),
+           {:ok, session} <-
+             authenticate_siwx(opts.siwx, decoded, resource_url(conn, request_path)) do
+        emit(
+          :siwx_authenticated,
+          Map.merge(metadata, %{address: session.address, chain_id: session.chain_id})
+        )
+
+        conn
+        |> assign(:x402_siwx_address, session.address)
+        |> assign(:x402_siwx_chain_id, session.chain_id)
+      else
+        {:error, :not_authorized} ->
+          case payment_header(conn) do
+            {:ok, _header} ->
+              handle_payment(conn, opts, route, request_method, request_path)
+
+            _missing_or_invalid ->
+              emit(:payment_required, Map.put(metadata, :siwx, :not_authorized))
+
+              payment_error_response(
+                conn,
+                route,
+                request_path,
+                "no payment recorded for the sign-in-with-x address; " <>
+                  "PAYMENT-SIGNATURE header is required",
+                status: 402,
+                paywall: opts.paywall,
+                siwx: opts.siwx
+              )
+          end
+
+        {:error, reason} ->
+          emit(:payment_rejected, Map.put(metadata, :reason, reason))
+
+          payment_error_response(
+            conn,
+            route,
+            request_path,
+            rejection_error(reason),
+            status: status_for_reason(reason),
+            reason: reason,
+            paywall: opts.paywall,
+            siwx: opts.siwx
+          )
+      end
+    end
+
+    @spec decode_siwx_header(String.t()) ::
+            {:ok, SIWX.decoded()} | {:error, {:siwx_header, SIWX.signed_decode_error()}}
+    defp decode_siwx_header(header) do
+      case SIWX.decode_signed(header) do
+        {:ok, {:legacy, _proof} = decoded} ->
+          SIWX.legacy_notice(:gate)
+          {:ok, decoded}
+
+        {:ok, decoded} ->
+          {:ok, decoded}
+
+        {:error, reason} ->
+          {:error, {:siwx_header, reason}}
+      end
+    end
+
+    @spec authenticate_siwx(SIWXServer.t(), SIWX.decoded(), String.t()) ::
+            {:ok, SIWXServer.session()}
+            | {:error, :not_authorized | {:siwx, SIWX.verify_code()} | {:siwx_header, term()}}
+    defp authenticate_siwx(siwx, decoded, resource) do
+      case SIWXServer.authenticate(siwx, decoded, resource) do
+        {:ok, session} -> {:ok, session}
+        {:error, :not_authorized} -> {:error, :not_authorized}
+        {:error, reason} when is_atom(reason) -> {:error, classify_siwx_error(reason)}
+      end
+    end
+
+    @spec classify_siwx_error(atom()) :: {:siwx, SIWX.verify_code()} | {:siwx_header, atom()}
+    defp classify_siwx_error(reason) do
+      case String.starts_with?(Atom.to_string(reason), "invalid_siwx_") do
+        true -> {:siwx, reason}
+        false -> {:siwx_header, reason}
       end
     end
 
@@ -909,7 +1090,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           requirements: requirements,
           route: route,
           request_method: request_method,
-          request_path: request_path
+          request_path: request_path,
+          siwx: opts.siwx
         }
 
         conn
@@ -936,7 +1118,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             rejection_error(reason),
             status: status_for_reason(reason),
             reason: reason,
-            paywall: opts.paywall
+            paywall: opts.paywall,
+            siwx: opts.siwx
           )
       end
     end
@@ -1014,7 +1197,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         settlement_context.request_method,
         settlement_context.request_path,
         reason,
-        response_reason
+        response_reason,
+        settlement_context.siwx
       )
     end
 
@@ -1036,6 +1220,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             |> maybe_put(:extension_responses, extension_responses(settle_response))
           )
 
+          record_siwx_payment(response_conn, settle_response, settlement_context)
           response_conn
 
         {:error, reason} ->
@@ -1050,13 +1235,63 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    # The payer is taken from the settle response (the facilitator's
+    # authoritative view of who paid), falling back to the signed payload's
+    # `from`. A storage failure is logged and the settled response still
+    # served: the payment went through, the address merely has to pay again
+    # next time.
+    @spec record_siwx_payment(Plug.Conn.t(), map(), settlement_context()) :: :ok
+    defp record_siwx_payment(_conn, _settle_response, %{siwx: nil}), do: :ok
+
+    defp record_siwx_payment(conn, settle_response, %{siwx: siwx} = settlement_context) do
+      case settlement_payer(settle_response, settlement_context.payment_payload) do
+        nil ->
+          :ok
+
+        payer ->
+          resource = resource_url(conn, settlement_context.request_path)
+
+          case SIWXServer.record_payment(siwx, payer, resource, settle_response.body) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              Logger.warning(
+                "[X402.Plug.PaymentGate] could not record sign-in-with-x payer " <>
+                  "#{payer} for #{resource}: #{inspect(reason)}"
+              )
+          end
+      end
+    end
+
+    @spec settlement_payer(map(), map()) :: String.t() | nil
+    defp settlement_payer(%{body: body}, payment_payload) do
+      case Utils.map_value(body, {"payer", :payer}) do
+        payer when is_binary(payer) and payer != "" -> payer
+        _absent -> payload_from(payment_payload)
+      end
+    end
+
+    @spec payload_from(map()) :: String.t() | nil
+    defp payload_from(payment_payload) do
+      with %{} = payload <- Utils.map_value(payment_payload, {"payload", :payload}),
+           %{} = authorization <- Utils.map_value(payload, {"authorization", :authorization}),
+           from when is_binary(from) and from != "" <-
+             Utils.map_value(authorization, {"from", :from}) do
+        from
+      else
+        _other -> nil
+      end
+    end
+
     @spec reject_settlement(
             Plug.Conn.t(),
             compiled_route(),
             atom(),
             String.t(),
             term(),
-            term()
+            term(),
+            SIWXServer.t() | nil
           ) :: Plug.Conn.t()
     defp reject_settlement(
            conn,
@@ -1064,7 +1299,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
            request_method,
            request_path,
            reason,
-           response_reason
+           response_reason,
+           siwx
          ) do
       emit(:payment_rejected, %{
         method: request_method,
@@ -1079,7 +1315,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         request_path,
         rejection_error(reason),
         status: status_for_reason(reason),
-        reason: response_reason
+        reason: response_reason,
+        siwx: siwx
       )
     end
 
@@ -1617,9 +1854,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp requirements_match?(requirement, accepted),
       do: PaymentRequirements.match?(requirement, accepted)
 
+    # The sign-in-with-x advertisement is a per-response challenge (fresh
+    # nonce and timestamps every 402), so a client can never echo the value
+    # the current response would carry; it is exempt from the echo check.
     @spec validate_extensions(map(), map()) :: :ok | {:error, :extension_echo_mismatch}
     defp validate_extensions(payload, advertised_extensions) do
       client_extensions = Utils.map_value(payload, {"extensions", :extensions})
+      advertised_extensions = Map.delete(advertised_extensions, SIWX.extension_key())
 
       case PaymentRequirements.extensions_match?(advertised_extensions, client_extensions) do
         true -> :ok
@@ -1963,7 +2204,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       status = Keyword.get(opts, :status, 402)
       reason = Keyword.get(opts, :reason)
       paywall = Keyword.get(opts, :paywall)
-      required_payload = payment_required_payload(conn, route, request_path, error_message)
+      siwx = if status == 402, do: Keyword.get(opts, :siwx)
+
+      required_payload =
+        payment_required_payload(conn, route, request_path, error_message, siwx)
 
       with {:ok, encoded_required} <- PaymentRequired.encode(required_payload),
            {:ok, response_conn} <- maybe_put_payment_response_header(conn, reason) do
@@ -2054,16 +2298,42 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec payment_required_payload(Plug.Conn.t(), compiled_route(), String.t(), String.t()) ::
-            map()
-    defp payment_required_payload(conn, route, request_path, error_message) do
+    @spec payment_required_payload(
+            Plug.Conn.t(),
+            compiled_route(),
+            String.t(),
+            String.t(),
+            SIWXServer.t() | nil
+          ) :: map()
+    defp payment_required_payload(conn, route, request_path, error_message, siwx) do
       %{
         "x402Version" => @x402_version,
         "error" => error_message,
         "resource" => resource_info(conn, route, request_path),
         "accepts" => route_accepts(route),
-        "extensions" => route.extensions
+        "extensions" => advertised_extensions(route, siwx)
       }
+    end
+
+    # A challenge whose nonce could not be recorded would never verify, so
+    # the advertisement is dropped for that response rather than misleading
+    # the client into signing it.
+    @spec advertised_extensions(compiled_route(), SIWXServer.t() | nil) :: map()
+    defp advertised_extensions(route, nil), do: route.extensions
+
+    defp advertised_extensions(route, siwx) do
+      case SIWXServer.challenge(siwx) do
+        {:ok, challenge} ->
+          Map.put(route.extensions, SIWX.extension_key(), challenge)
+
+        {:error, reason} ->
+          Logger.warning(
+            "[X402.Plug.PaymentGate] could not record the sign-in-with-x challenge " <>
+              "nonce (#{inspect(reason)}); omitting the challenge from this response"
+          )
+
+          route.extensions
+      end
     end
 
     @spec put_payment_response_header(Plug.Conn.t(), map()) ::
@@ -2129,6 +2399,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp status_for_reason({:invalid_fields, _fields}), do: 400
     defp status_for_reason(:invalid_payment_requirements), do: 400
     defp status_for_reason(:extension_echo_mismatch), do: 400
+    defp status_for_reason({:siwx_header, _reason}), do: 400
+    defp status_for_reason({:siwx, _code}), do: 402
     defp status_for_reason({:invalid_payment_identifier, _reason}), do: 400
     defp status_for_reason(:no_matching_requirements), do: 402
     defp status_for_reason(:already_exists), do: 402
@@ -2228,6 +2500,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error({:invalid_fields, _fields}), do: "invalid_payload"
     defp rejection_error(:invalid_payment_requirements), do: "invalid_payload"
     defp rejection_error(:extension_echo_mismatch), do: "invalid_payload"
+    defp rejection_error({:siwx_header, _reason}), do: "invalid_siwx_header"
+    defp rejection_error({:siwx, code}), do: Atom.to_string(code)
 
     defp rejection_error({:invalid_payment_identifier, _reason}),
       do: "invalid payment identifier extension"
@@ -2254,8 +2528,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp rejection_error(_reason), do: "payment processing failed"
 
-    @spec emit(:pass_through | :payment_required | :payment_verified | :payment_rejected, map()) ::
-            :ok
+    @spec emit(
+            :pass_through
+            | :payment_required
+            | :payment_verified
+            | :payment_rejected
+            | :siwx_authenticated,
+            map()
+          ) :: :ok
     defp emit(event, metadata) do
       :telemetry.execute([:x402, :plug, event], %{count: 1}, metadata)
     end
