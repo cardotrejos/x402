@@ -86,9 +86,32 @@ dropping values.
 gate takes. Each payment proof is atomically claimed before settlement, so
 the same signed payment cannot be settled twice. The claim key is a
 deterministic hash of the signed scheme payload — never the
-client-controlled `paymentId` extension — so neither re-encoding the
-payment envelope nor varying `paymentId` can mint a fresh claim for the
-same signed authorization.
+client-controlled payment identifier — so neither re-encoding the
+payment envelope nor varying the id can mint a fresh claim for the same
+signed authorization.
+
+### Payment identifiers
+
+The server supports the
+[payment-identifier extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/payment_identifier.md)
+in its spec format. Advertise it with
+`extensions: %{"payment-identifier" => X402.Extensions.PaymentIdentifier.extension(required: true)}`;
+clients echo it with their id under
+`extensions["payment-identifier"]["info"]["id"]` (the
+[client guide](client.html) shows the enricher). The id must be 16–128
+characters of `[A-Za-z0-9_-]`, otherwise the payment-required result's
+`error` is `invalid_payload`; with `required: true` a payment without an
+id yields `payment_identifier_required`. When `payment_identifier_cache:`
+is configured, the id is bound to a fingerprint of the matched
+requirements and the **tool name**
+(`X402.Extensions.PaymentIdentifier.fingerprint/2`) under a `"pid:"` key:
+reusing it for a different tool or different requirements yields
+`payment_identifier_conflict`, while the same request proceeds normally.
+A binding is released whenever the tool result is not settled (handler
+error, verification or settlement failure), so the client can retry with
+the same id. The pre-0.7.0 `"paymentIdentifier"` format is still accepted
+but deprecated (removed in 1.0.0) and emits
+`[:x402, :payment_identifier, :legacy]`.
 
 To advertise the price outside a rejection (for example in a `tools/list`
 response), use `X402.MCP.Server.payment_required_result/2`.
