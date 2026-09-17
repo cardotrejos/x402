@@ -107,6 +107,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @behaviour Plug
 
     alias X402.EIP712
+    alias X402.Extensions.Bazaar
     alias X402.Extensions.PaymentIdentifier
     alias X402.Extensions.PaymentIdentifier.Cache
     alias X402.Extensions.PaymentIdentifier.ETSCache
@@ -264,19 +265,30 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         doc: "ResourceInfo.mimeType."
       ],
       service_name: [
-        type: {:or, [:string, nil]},
+        type: {:custom, __MODULE__, :validate_service_name, []},
         default: nil,
-        doc: "ResourceInfo.serviceName (printable ASCII, max 32 characters recommended)."
+        doc: """
+        ResourceInfo.serviceName: non-empty printable ASCII, at most 32
+        characters (`X402.Extensions.Bazaar.Metadata.valid_service_name?/1`).
+        """
       ],
       tags: [
-        type: {:list, :string},
+        type: {:custom, __MODULE__, :validate_tags, []},
         default: [],
-        doc: "ResourceInfo.tags (max 5 recommended)."
+        doc: """
+        ResourceInfo.tags: at most 5 unique (case-insensitive) entries, each
+        non-empty printable ASCII of at most 32 characters
+        (`X402.Extensions.Bazaar.Metadata.sanitize_tags/1`).
+        """
       ],
       icon_url: [
-        type: {:or, [:string, nil]},
+        type: {:custom, __MODULE__, :validate_icon_url, []},
         default: nil,
-        doc: "ResourceInfo.iconUrl (absolute http(s) URL)."
+        doc: """
+        ResourceInfo.iconUrl: absolute http(s) URL, no userinfo, not an IP
+        literal or loopback host, at most 2048 characters
+        (`X402.Extensions.Bazaar.Metadata.valid_icon_url?/1`).
+        """
       ],
       max_timeout_seconds: [
         type: :pos_integer,
@@ -519,6 +531,49 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec validate_extra_map(term()) :: {:ok, map()} | {:error, String.t()}
     def validate_extra_map(value) when is_map(value), do: {:ok, value}
     def validate_extra_map(_value), do: {:error, "expected a map"}
+
+    # Service metadata is validated up front rather than soft-dropped: an
+    # invalid value here is a configuration mistake, and silently omitting
+    # the field from every 402 would hide it.
+    @doc false
+    @spec validate_service_name(term()) :: {:ok, String.t() | nil} | {:error, String.t()}
+    def validate_service_name(empty) when empty in [nil, ""], do: {:ok, nil}
+
+    def validate_service_name(value) do
+      if Bazaar.Metadata.valid_service_name?(value) do
+        {:ok, value}
+      else
+        {:error, "expected non-empty printable ASCII of at most 32 characters"}
+      end
+    end
+
+    @doc false
+    @spec validate_tags(term()) :: {:ok, [String.t()]} | {:error, String.t()}
+    def validate_tags(value) when is_list(value) do
+      if Bazaar.Metadata.sanitize_tags(value) == value do
+        {:ok, value}
+      else
+        {:error,
+         "expected at most 5 unique (case-insensitive) tags, each non-empty " <>
+           "printable ASCII of at most 32 characters"}
+      end
+    end
+
+    def validate_tags(_value), do: {:error, "expected a list of strings"}
+
+    @doc false
+    @spec validate_icon_url(term()) :: {:ok, String.t() | nil} | {:error, String.t()}
+    def validate_icon_url(empty) when empty in [nil, ""], do: {:ok, nil}
+
+    def validate_icon_url(value) do
+      if Bazaar.Metadata.valid_icon_url?(value) do
+        {:ok, value}
+      else
+        {:error,
+         "expected an absolute http(s) URL of at most 2048 characters without " <>
+           "userinfo, IP-literal or loopback host"}
+      end
+    end
 
     @doc false
     @spec validate_atomic_amount(term()) :: {:ok, String.t()} | {:error, String.t()}

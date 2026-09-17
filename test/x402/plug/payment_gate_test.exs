@@ -3090,6 +3090,28 @@ defmodule X402.Plug.PaymentGateTest do
       refute Map.has_key?(required["resource"], "iconUrl")
     end
 
+    test "rejects service metadata that violates the bazaar validation rules" do
+      for {key, value, fragment} <- [
+            {:service_name, "Wetter für alle", "printable ASCII"},
+            {:service_name, String.duplicate("a", 33), "at most 32"},
+            {:tags, ~w(a b c d e f), "at most 5"},
+            {:tags, ["weather", "Weather"], "unique"},
+            {:tags, ["ok", ""], "non-empty"},
+            {:icon_url, "data:image/png;base64,AAAA", "http(s)"},
+            {:icon_url, "http://localhost/icon.png", "loopback"},
+            {:icon_url, "https://user@api.example.com/icon.png", "userinfo"}
+          ] do
+        route = Map.put(@route, key, value)
+
+        error =
+          assert_raise NimbleOptions.ValidationError, fn ->
+            PaymentGate.init(routes: [route], facilitator: self())
+          end
+
+        assert Exception.message(error) =~ fragment
+      end
+    end
+
     test "stringifies atom keys in advertised extra and extensions" do
       route =
         @route

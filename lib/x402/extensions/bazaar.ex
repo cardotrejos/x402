@@ -26,6 +26,12 @@ defmodule X402.Extensions.Bazaar do
 
       extensions = %{"bazaar" => X402.Extensions.Bazaar.build_extension(method: :get)}
 
+  Dynamic routes add the canonical `routeTemplate` catalog key with the
+  `:route_template` option. Provider-level service metadata (`serviceName`,
+  `tags`, `iconUrl`) lives on the `PaymentRequired.resource` object instead
+  and is validated by `X402.Extensions.Bazaar.Metadata`, which also carries
+  the facilitator-side soft-drop sanitizers.
+
   ## Discovery client
 
   `list_resources/2` queries a facilitator's `GET /discovery/resources`
@@ -50,6 +56,7 @@ defmodule X402.Extensions.Bazaar do
   [bazaar extension spec](https://github.com/x402-foundation/x402/blob/main/specs/extensions/bazaar.md).
   """
 
+  alias X402.Extensions.Bazaar.Metadata
   alias X402.Facilitator
   alias X402.Facilitator.Error
   alias X402.Utils
@@ -78,6 +85,7 @@ defmodule X402.Extensions.Bazaar do
     headers: [type: {:custom, __MODULE__, :validate_map, []}],
     path_params: [type: {:custom, __MODULE__, :validate_map, []}],
     path_params_schema: [type: {:custom, __MODULE__, :validate_map, []}],
+    route_template: [type: {:custom, __MODULE__, :validate_route_template, []}],
     output: [type: {:custom, __MODULE__, :validate_output, []}]
   ]
 
@@ -140,6 +148,10 @@ defmodule X402.Extensions.Bazaar do
     * `:headers` — example custom header values.
     * `:path_params` — concrete path parameter values (dynamic routes).
     * `:path_params_schema` — JSON Schema for path parameters.
+    * `:route_template` — canonical `:param` template for dynamic routes
+      (for example `"/users/:userId"`), published as the extension's
+      top-level `routeTemplate` catalog key. Must satisfy
+      `X402.Extensions.Bazaar.Metadata.valid_route_template?/1`.
 
   ## MCP options
 
@@ -171,6 +183,14 @@ defmodule X402.Extensions.Bazaar do
       iex> ext = X402.Extensions.Bazaar.build_extension(method: :post, input: %{"query" => "example"})
       iex> ext["info"]["input"]["bodyType"]
       "json"
+
+      iex> ext = X402.Extensions.Bazaar.build_extension(
+      ...>   method: :get,
+      ...>   path_params: %{"userId" => "123"},
+      ...>   route_template: "/users/:userId"
+      ...> )
+      iex> {ext["routeTemplate"], ext["info"]["input"]["pathParams"]}
+      {"/users/:userId", %{"userId" => "123"}}
 
       iex> ext = X402.Extensions.Bazaar.build_extension(
       ...>   tool_name: "financial_analysis",
@@ -221,6 +241,18 @@ defmodule X402.Extensions.Bazaar do
 
   def validate_map(value),
     do: {:error, "expected a map with string or atom keys, got: #{inspect(value)}"}
+
+  @doc false
+  @spec validate_route_template(term()) :: {:ok, String.t()} | {:error, String.t()}
+  def validate_route_template(value) do
+    if Metadata.valid_route_template?(value) do
+      {:ok, value}
+    else
+      {:error,
+       "expected a route template such as \"/users/:userId\" (leading slash, " <>
+         "path characters only, no \"..\" or \"://\"), got: #{inspect(value)}"}
+    end
+  end
 
   # --- discovery client ---
 
@@ -549,6 +581,7 @@ defmodule X402.Extensions.Bazaar do
       "info" => put_output(info, Keyword.get(opts, :output)),
       "schema" => build_http_schema(method, opts)
     }
+    |> maybe_put("routeTemplate", Keyword.get(opts, :route_template))
   end
 
   @spec put_http_input(map(), String.t(), keyword()) :: map()
