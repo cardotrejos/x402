@@ -151,11 +151,18 @@ defmodule X402.MixProject do
           X402.PaymentRequirements,
           X402.PaymentRequired,
           X402.PaymentSignature,
-          X402.PaymentResponse
+          X402.PaymentResponse,
+          X402.ExtensionResponses
         ],
         "Payer Client": [
           X402.Client,
           X402.Client.Finch,
+          X402.Client.Budget,
+          X402.Client.Hooks,
+          X402.Client.Hooks.Context,
+          X402.Client.Hooks.Default,
+          X402.Client.Policy,
+          X402.Client.SIWX,
           X402.Signer,
           X402.Signer.LocalKey,
           X402.Signer.SolanaKey,
@@ -223,6 +230,7 @@ defmodule X402.MixProject do
         ],
         Extensions: [
           X402.Extensions.Bazaar,
+          X402.Extensions.Bazaar.Metadata,
           X402.Extensions.BuilderCode,
           X402.Extensions.BuilderCode.Adapter,
           X402.Extensions.EIP2612GasSponsoring,
