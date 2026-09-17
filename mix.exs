@@ -171,12 +171,14 @@ defmodule X402.MixProject do
           X402.Facilitator.HTTP,
           X402.Hooks,
           X402.Hooks.Context,
-          X402.Hooks.Default
+          X402.Hooks.Default,
+          X402.Hooks.RequestContext
         ],
         "Plug Integration": [
           X402.Plug.PaymentGate,
           X402.Paywall,
-          X402.Paywall.Default
+          X402.Paywall.Default,
+          X402.Extension
         ],
         "Payment Schemes": [
           X402.Scheme,
@@ -221,9 +223,12 @@ defmodule X402.MixProject do
         ],
         Extensions: [
           X402.Extensions.Bazaar,
+          X402.Extensions.BuilderCode,
+          X402.Extensions.BuilderCode.Adapter,
           X402.Extensions.EIP2612GasSponsoring,
           X402.Extensions.ERC20ApprovalGasSponsoring,
           X402.Extensions.PaymentIdentifier,
+          X402.Extensions.PaymentIdentifier.Adapter,
           X402.Extensions.PaymentIdentifier.Cache,
           X402.Extensions.PaymentIdentifier.ETSCache,
           X402.Extensions.PaymentIdentifier.RedisCache,
