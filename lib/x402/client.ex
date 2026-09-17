@@ -29,12 +29,16 @@ defmodule X402.Client do
       end
   """
 
+  alias X402.Client.Hooks
+  alias X402.Client.Hooks.Context
   alias X402.EIP3009
   alias X402.PaymentRequirements
   alias X402.Scheme
   alias X402.Signer
   alias X402.Telemetry
   alias X402.Utils
+
+  require Logger
 
   @select_opts_schema [
     network: [
@@ -59,6 +63,17 @@ defmodule X402.Client do
       exceed this value — the budget guard for automated payers.
       """
     ],
+    policies: [
+      type: {:list, {:fun, 2}},
+      default: [],
+      doc: """
+      Selection policies, each a function of the candidate requirements and
+      the `PaymentRequired` map (`nil` for a bare list) returning `true` to
+      accept, `false` to skip the entry, or `{:error, reason}` to abort
+      selection with that error. Every policy must accept an entry for it
+      to be selected — see `X402.Client.Policy` for ready-made ones.
+      """
+    ],
     schemes: [
       type: {:list, {:custom, Scheme, :validate_module, []}},
       default: [],
@@ -72,6 +87,14 @@ defmodule X402.Client do
 
   @build_opts_schema @select_opts_schema ++
                        [
+                         hooks: [
+                           type: {:custom, Hooks, :validate_module, []},
+                           default: Hooks.Default,
+                           doc: """
+                           Module implementing `X402.Client.Hooks`, run around
+                           payment creation.
+                           """
+                         ],
                          valid_after_buffer: [
                            type: :non_neg_integer,
                            default: 60,
@@ -134,10 +157,15 @@ defmodule X402.Client do
           scheme: String.t(),
           asset: String.t(),
           max_amount: String.t() | non_neg_integer(),
+          policies: [X402.Client.Policy.t()],
           schemes: [module()]
         ]
 
-  @type select_error :: :no_acceptable_requirements | :invalid_payment_required
+  @type select_error ::
+          :no_acceptable_requirements
+          | :invalid_payment_required
+          | {:invalid_policy_result, term()}
+          | term()
 
   # Payment flows (spec §6.1) this client knows how to run. Only the default
   # verify → resource → settle ordering is implemented; `upfront` and
@@ -146,6 +174,7 @@ defmodule X402.Client do
 
   @type build_error ::
           select_error()
+          | Hooks.hook_error()
           | {:unsupported_kind, term(), term()}
           | EIP3009.domain_error()
           | EIP3009.encode_error()
@@ -172,6 +201,12 @@ defmodule X402.Client do
   `"authorization"` flow (explicit or omitted) is recognized; `upfront` and
   `escrow` entries settle before the resource executes and are not selected.
 
+  `:policies` run last, on the signable candidates in order: the first entry
+  every policy accepts is selected. A policy returning `{:error, reason}`
+  aborts with `{:error, reason}` (for example a budget policy refusing to
+  continue); any other non-boolean return aborts with
+  `{:error, {:invalid_policy_result, value}}`.
+
   The selected entry is returned exactly as the server sent it, so it can be
   echoed verbatim as the payload's `accepted` value.
 
@@ -197,29 +232,42 @@ defmodule X402.Client do
 
       iex> X402.Client.select_requirements(%{"x402Version" => 2, "accepts" => []})
       {:error, :no_acceptable_requirements}
+
+      iex> requirements = %{
+      ...>   "scheme" => "exact",
+      ...>   "network" => "eip155:84532",
+      ...>   "amount" => "10000",
+      ...>   "asset" => "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      ...>   "payTo" => "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+      ...>   "maxTimeoutSeconds" => 60,
+      ...>   "extra" => %{"name" => "USDC", "version" => "2"}
+      ...> }
+      iex> X402.Client.select_requirements([requirements], policies: [X402.Client.Policy.max_amount("100")])
+      {:error, :no_acceptable_requirements}
   """
   @spec select_requirements(map() | [map()], select_opts()) ::
           {:ok, map()} | {:error, select_error()}
   def select_requirements(payment_required, opts \\ []) do
     opts = NimbleOptions.validate!(opts, @select_opts_schema)
     schemes = Keyword.fetch!(opts, :schemes)
+    policies = Keyword.fetch!(opts, :policies)
 
     with {:ok, accepts} <- fetch_accepts(payment_required) do
       accepts
-      |> Enum.filter(&(is_map(&1) and matches_filters?(&1, opts)))
-      |> Enum.find(&supported?(&1, schemes))
+      |> Enum.filter(&(is_map(&1) and matches_filters?(&1, opts) and supported?(&1, schemes)))
+      |> first_accepted(policies, payment_required_map(payment_required))
       |> case do
-        nil ->
-          Telemetry.emit(:client, :select, :error, %{reason: :no_acceptable_requirements})
-          {:error, :no_acceptable_requirements}
+        {:error, reason} = error ->
+          Telemetry.emit(:client, :select, :error, %{reason: reason})
+          error
 
-        selected ->
+        {:ok, selected} = ok ->
           Telemetry.emit(:client, :select, :ok, %{
             scheme: Utils.map_value(selected, {"scheme", :scheme}),
             network: Utils.map_value(selected, {"network", :network})
           })
 
-          {:ok, selected}
+          ok
       end
     end
   end
@@ -251,6 +299,16 @@ defmodule X402.Client do
   validated build options, so options like `:valid_after_buffer` (EVM) and
   `:svm_blockhash` (SVM) reach `c:X402.Scheme.sign/3`.
 
+  ## Lifecycle hooks
+
+  The `:hooks` module (`X402.Client.Hooks`, default
+  `X402.Client.Hooks.Default`) runs `before_payment/2` once requirements
+  are selected — it may replace them or halt — `after_payment/2` once the
+  payload is built — it may replace the payload — and
+  `on_payment_failure/2` when signing or enrichment fails — it may replace
+  the error or recover with a payload. Selection failures return before
+  any hook runs.
+
   ## Options
 
   #{NimbleOptions.docs(@build_opts_schema)}
@@ -259,14 +317,14 @@ defmodule X402.Client do
           {:ok, map()} | {:error, build_error()}
   def build_payment(payment_required_or_requirements, signer, opts \\ []) do
     opts = NimbleOptions.validate!(opts, @build_opts_schema)
+    hooks = Keyword.fetch!(opts, :hooks)
 
     result =
       with {:ok, requirements, envelope} <-
              resolve_requirements(payment_required_or_requirements, opts),
-           {:ok, scheme_payload} <- sign_for_kind(requirements, signer, opts) do
-        requirements
-        |> assemble_payload(scheme_payload, envelope)
-        |> apply_extensions(envelope.payment_required, Keyword.fetch!(opts, :extensions))
+           context = Context.new(envelope.payment_required, requirements, opts),
+           {:ok, context} <- run_before_hook(hooks, context) do
+        create_payload(hooks, context, envelope, signer, opts)
       end
 
     case result do
@@ -278,6 +336,24 @@ defmodule X402.Client do
         Telemetry.emit(:client, :build, :error, %{reason: reason})
         error
     end
+  end
+
+  @doc false
+  @spec warn_no_spend_limit_once(module()) :: :ok
+  def warn_no_spend_limit_once(driver) do
+    key = {__MODULE__, :no_spend_limit_warned}
+
+    unless :persistent_term.get(key, false) do
+      :persistent_term.put(key, true)
+
+      Logger.warning(
+        "[#{inspect(driver)}] no spend limit is configured: this client will sign any " <>
+          "amount a server asks for. Pass `max_amount:`, `policies:` " <>
+          "(see X402.Client.Policy), or `budget:` (see X402.Client.Budget) to cap payments."
+      )
+    end
+
+    :ok
   end
 
   @doc since: "0.6.0"
@@ -320,6 +396,35 @@ defmodule X402.Client do
   end
 
   defp fetch_accepts(_payment_required), do: {:error, :invalid_payment_required}
+
+  @spec payment_required_map(term()) :: map() | nil
+  defp payment_required_map(payment_required) when is_map(payment_required), do: payment_required
+  defp payment_required_map(_accepts), do: nil
+
+  @spec first_accepted([map()], [X402.Client.Policy.t()], map() | nil) ::
+          {:ok, map()} | {:error, select_error()}
+  defp first_accepted([], _policies, _payment_required), do: {:error, :no_acceptable_requirements}
+
+  defp first_accepted([candidate | rest], policies, payment_required) do
+    case apply_policies(policies, candidate, payment_required) do
+      :accept -> {:ok, candidate}
+      :skip -> first_accepted(rest, policies, payment_required)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec apply_policies([X402.Client.Policy.t()], map(), map() | nil) ::
+          :accept | :skip | {:error, term()}
+  defp apply_policies([], _candidate, _payment_required), do: :accept
+
+  defp apply_policies([policy | policies], candidate, payment_required) do
+    case policy.(candidate, payment_required) do
+      true -> apply_policies(policies, candidate, payment_required)
+      false -> :skip
+      {:error, _reason} = error -> error
+      other -> {:error, {:invalid_policy_result, other}}
+    end
+  end
 
   @spec matches_filters?(map(), keyword()) :: boolean()
   defp matches_filters?(requirements, opts) do
@@ -430,6 +535,104 @@ defmodule X402.Client do
 
   @spec select_opts(keyword()) :: keyword()
   defp select_opts(opts), do: Keyword.take(opts, Keyword.keys(@select_opts_schema))
+
+  @spec create_payload(module(), Context.t(), map(), Signer.t(), keyword()) ::
+          {:ok, map()} | {:error, build_error()}
+  defp create_payload(
+         hooks,
+         %Context{requirements: requirements} = context,
+         envelope,
+         signer,
+         opts
+       ) do
+    result =
+      with {:ok, scheme_payload} <- sign_for_kind(requirements, signer, opts) do
+        requirements
+        |> assemble_payload(scheme_payload, envelope)
+        |> apply_extensions(envelope.payment_required, Keyword.fetch!(opts, :extensions))
+      end
+
+    case result do
+      {:ok, payload} -> run_after_hook(hooks, %{context | payload: payload})
+      {:error, reason} -> run_failure_hook(hooks, %{context | error: reason}, reason)
+    end
+  end
+
+  # -- Lifecycle hooks --------------------------------------------------------
+
+  @spec run_before_hook(module(), Context.t()) ::
+          {:ok, Context.t()} | {:error, Hooks.hook_error()}
+  defp run_before_hook(hooks, context) do
+    case invoke_hook(hooks, :before_payment, context) do
+      {:ok, {:cont, %Context{requirements: requirements} = next}} when is_map(requirements) ->
+        {:ok, next}
+
+      {:ok, {:halt, reason}} ->
+        {:error, {:hook_halted, :before_payment, reason}}
+
+      {:ok, invalid_return} ->
+        {:error, {:hook_invalid_return, :before_payment, invalid_return}}
+
+      {:error, reason} ->
+        {:error, {:hook_callback_failed, :before_payment, reason}}
+    end
+  end
+
+  @spec run_after_hook(module(), Context.t()) :: {:ok, map()} | {:error, Hooks.hook_error()}
+  defp run_after_hook(hooks, context) do
+    case invoke_hook(hooks, :after_payment, context) do
+      {:ok, {:cont, %Context{payload: payload}}} when is_map(payload) ->
+        {:ok, payload}
+
+      {:ok, invalid_return} ->
+        {:error, {:hook_invalid_return, :after_payment, invalid_return}}
+
+      {:error, reason} ->
+        {:error, {:hook_callback_failed, :after_payment, reason}}
+    end
+  end
+
+  @spec run_failure_hook(module(), Context.t(), term()) ::
+          {:ok, map()} | {:error, build_error()}
+  defp run_failure_hook(hooks, context, original_error) do
+    case invoke_hook(hooks, :on_payment_failure, context) do
+      {:ok, {:cont, %Context{error: nil}}} ->
+        {:error, original_error}
+
+      {:ok, {:cont, %Context{error: error}}} ->
+        {:error, error}
+
+      {:ok, {:recover, payload}} when is_map(payload) ->
+        {:ok, payload}
+
+      {:ok, {:recover, invalid_payload}} ->
+        {:error,
+         {:hook_invalid_return, :on_payment_failure, {:invalid_recovery_result, invalid_payload}}}
+
+      {:ok, invalid_return} ->
+        {:error, {:hook_invalid_return, :on_payment_failure, invalid_return}}
+
+      {:error, reason} ->
+        {:error, {:hook_callback_failed, :on_payment_failure, reason}}
+    end
+  end
+
+  @spec invoke_hook(module(), Hooks.callback_name(), Context.t()) ::
+          {:ok, term()} | {:error, term()}
+  defp invoke_hook(hooks, callback, %Context{requirements: requirements} = context) do
+    metadata = %{
+      operation: :build_payment,
+      hook_module: hooks,
+      scheme: Utils.map_value(requirements, {"scheme", :scheme}),
+      network: Utils.map_value(requirements, {"network", :network})
+    }
+
+    {:ok, apply(hooks, callback, [context, metadata])}
+  rescue
+    error -> {:error, {:exception, error}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
 
   @spec sign_for_kind(map(), Signer.t(), keyword()) :: {:ok, map()} | {:error, build_error()}
   defp sign_for_kind(requirements, signer, opts) do

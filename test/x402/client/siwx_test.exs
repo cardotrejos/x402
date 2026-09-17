@@ -1,0 +1,316 @@
+defmodule X402.Client.SIWXTest do
+  use ExUnit.Case, async: true
+
+  doctest X402.Client.SIWX
+
+  alias X402.Client.SIWX, as: ClientSIWX
+  alias X402.Extensions.SIWX
+  alias X402.Signer.LocalKey
+  alias X402.Signer.SolanaKey
+
+  @evm_chain "eip155:8453"
+  @solana_chain "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+  @resource "https://api.example.com/premium"
+
+  defp evm_signer do
+    {:ok, signer} = LocalKey.new("0x" <> String.duplicate("11", 32))
+    signer
+  end
+
+  defp solana_signer do
+    {:ok, signer} = SolanaKey.new(:binary.copy(<<1>>, 32))
+    signer
+  end
+
+  defp challenge(opts \\ []) do
+    SIWX.challenge(
+      Keyword.merge(
+        [
+          domain: "api.example.com",
+          uri: "https://api.example.com",
+          supported_chains: [%{chain_id: @evm_chain}, %{chain_id: @solana_chain}]
+        ],
+        opts
+      )
+    )
+  end
+
+  defp payment_required(challenge) do
+    %{"x402Version" => 2, "accepts" => [], "extensions" => %{"sign-in-with-x" => challenge}}
+  end
+
+  defp verify(header, chain_id) do
+    SIWX.verify(header,
+      domain: "api.example.com",
+      uri: "https://api.example.com",
+      supported_chains: [%{chain_id: chain_id}]
+    )
+  end
+
+  describe "validate_opts/1" do
+    test "validates nested options" do
+      assert {:ok, opts} =
+               ClientSIWX.validate_opts(
+                 chain_id: @evm_chain,
+                 address: "0xabc",
+                 signature_scheme: "eip191",
+                 domain: "api.example.com"
+               )
+
+      assert opts[:chain_id] == @evm_chain
+      assert opts[:signature_scheme] == "eip191"
+
+      assert {:error, message} = ClientSIWX.validate_opts(chain_id: 8453)
+      assert message =~ ":chain_id"
+      assert {:error, _message} = ClientSIWX.validate_opts(chain_id: :auto, unknown: 1)
+      assert {:error, _message} = ClientSIWX.validate_opts("auto")
+    end
+  end
+
+  describe "authenticate/4 with an explicit chain" do
+    test "signs an EVM challenge that verifies on the server side" do
+      signer = evm_signer()
+      challenge = challenge()
+
+      assert {:ok, proof} =
+               ClientSIWX.authenticate(
+                 payment_required(challenge),
+                 signer,
+                 [chain_id: @evm_chain],
+                 resource_url: @resource
+               )
+
+      assert proof.chain_id == @evm_chain
+      assert proof.address == signer.address
+      assert {:ok, identity} = verify(proof.header, @evm_chain)
+      assert identity.address == signer.address
+      assert identity.fields["nonce"] == challenge["info"]["nonce"]
+    end
+
+    test "forwards :address and :signature_scheme to the proof" do
+      other = "0x0000000000000000000000000000000000000001"
+
+      assert {:ok, proof} =
+               ClientSIWX.authenticate(payment_required(challenge()), evm_signer(),
+                 chain_id: @evm_chain,
+                 address: other,
+                 signature_scheme: "eip1271"
+               )
+
+      assert proof.address == other
+      assert {:ok, {:spec, fields}} = SIWX.decode_signed(proof.header)
+      assert fields["signatureScheme"] == "eip1271"
+    end
+
+    test "returns signer and chain errors wrapped as {:siwx, reason}" do
+      payment_required = payment_required(challenge())
+
+      assert ClientSIWX.authenticate(payment_required, solana_signer(), chain_id: @evm_chain) ==
+               {:error, {:siwx, :unsupported_signer}}
+
+      assert ClientSIWX.authenticate(payment_required, evm_signer(), chain_id: "eip155:1") ==
+               {:error, {:siwx, :unsupported_chain}}
+
+      assert ClientSIWX.authenticate(payment_required, evm_signer(), chain_id: "eip155:x") ==
+               {:error, {:siwx, :invalid_chain_id}}
+
+      assert ClientSIWX.authenticate(payment_required, evm_signer(), chain_id: "cosmos:hub") ==
+               {:error, {:siwx, :unsupported_chain}}
+    end
+
+    test "rejects challenges without an info map" do
+      payment_required = payment_required(%{"supportedChains" => []})
+
+      assert ClientSIWX.authenticate(payment_required, evm_signer(), chain_id: @evm_chain) ==
+               {:error, {:siwx, :invalid_challenge}}
+    end
+
+    test "returns :none without a challenge" do
+      assert ClientSIWX.authenticate(%{"accepts" => []}, evm_signer(), chain_id: @evm_chain) ==
+               :none
+
+      assert ClientSIWX.authenticate(%{"extensions" => %{"other" => %{}}}, evm_signer(),
+               chain_id: @evm_chain
+             ) == :none
+    end
+  end
+
+  describe "authenticate/4 with chain_id: :auto" do
+    test "an EVM signer picks the first eip155 chain" do
+      chains = [%{chain_id: @solana_chain}, %{chain_id: "eip155:1"}, %{chain_id: @evm_chain}]
+      payment_required = payment_required(challenge(supported_chains: chains))
+
+      assert {:ok, %{chain_id: "eip155:1"}} =
+               ClientSIWX.authenticate(payment_required, evm_signer(), chain_id: :auto)
+    end
+
+    test "a Solana signer picks the first solana chain" do
+      assert {:ok, %{chain_id: @solana_chain, header: header}} =
+               ClientSIWX.authenticate(payment_required(challenge()), solana_signer(),
+                 chain_id: :auto
+               )
+
+      assert {:ok, %{address: "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9"}} =
+               verify(header, @solana_chain)
+    end
+
+    test "fails when no advertised chain matches the signer" do
+      payment_required = payment_required(challenge(supported_chains: [%{chain_id: @evm_chain}]))
+
+      assert ClientSIWX.authenticate(payment_required, solana_signer(), chain_id: :auto) ==
+               {:error, {:siwx, :unsupported_chain}}
+
+      no_chains = payment_required(%{"info" => challenge()["info"], "supportedChains" => "nope"})
+
+      assert ClientSIWX.authenticate(no_chains, evm_signer(), chain_id: :auto) ==
+               {:error, {:siwx, :unsupported_chain}}
+
+      assert ClientSIWX.authenticate(payment_required, %URI{}, chain_id: :auto) ==
+               {:error, {:siwx, :unsupported_chain}}
+
+      assert ClientSIWX.authenticate(payment_required, %{not: :a_struct}, chain_id: :auto) ==
+               {:error, {:siwx, :unsupported_chain}}
+    end
+
+    test "ignores malformed supportedChains entries" do
+      challenge = %{
+        "info" => challenge()["info"],
+        "supportedChains" => [
+          "nope",
+          %{"type" => "eip191"},
+          %{"chainId" => "cosmos:hub"},
+          [chain_id: @evm_chain]
+        ]
+      }
+
+      assert {:ok, %{chain_id: @evm_chain}} =
+               ClientSIWX.authenticate(payment_required(challenge), evm_signer(), chain_id: :auto)
+    end
+  end
+
+  describe "authenticate/4 origin binding" do
+    test "accepts a domain with the resource's port and rejects other hosts" do
+      port_challenge =
+        challenge(domain: "api.example.com:8443", uri: "https://api.example.com:8443")
+
+      assert {:ok, _proof} =
+               ClientSIWX.authenticate(
+                 payment_required(port_challenge),
+                 evm_signer(),
+                 [chain_id: @evm_chain],
+                 resource_url: "https://api.example.com:8443/premium"
+               )
+
+      assert ClientSIWX.authenticate(
+               payment_required(challenge()),
+               evm_signer(),
+               [chain_id: @evm_chain],
+               resource_url: "https://evil.example.com/premium"
+             ) ==
+               {:error, {:siwx, :domain_mismatch}}
+    end
+
+    test "rejects a uri whose origin differs from the resource URL" do
+      challenge = challenge(uri: "http://api.example.com")
+
+      assert ClientSIWX.authenticate(
+               payment_required(challenge),
+               evm_signer(),
+               [chain_id: @evm_chain],
+               resource_url: @resource
+             ) ==
+               {:error, {:siwx, :uri_mismatch}}
+
+      missing_uri = %{challenge() | "info" => Map.delete(challenge()["info"], "uri")}
+
+      assert ClientSIWX.authenticate(
+               payment_required(missing_uri),
+               evm_signer(),
+               [chain_id: @evm_chain],
+               resource_url: @resource
+             ) ==
+               {:error, {:siwx, :uri_mismatch}}
+    end
+
+    test "an explicit :domain wins over the resource URL and a missing domain fails" do
+      assert {:ok, _proof} =
+               ClientSIWX.authenticate(
+                 payment_required(challenge()),
+                 evm_signer(),
+                 [chain_id: @evm_chain, domain: "api.example.com"],
+                 resource_url: "https://api.example.com/premium"
+               )
+
+      assert ClientSIWX.authenticate(payment_required(challenge()), evm_signer(),
+               chain_id: @evm_chain,
+               domain: "other.example.com"
+             ) == {:error, {:siwx, :domain_mismatch}}
+
+      no_domain = %{challenge() | "info" => Map.delete(challenge()["info"], "domain")}
+
+      assert ClientSIWX.authenticate(payment_required(no_domain), evm_signer(),
+               chain_id: @evm_chain
+             ) == {:error, {:siwx, :domain_mismatch}}
+    end
+
+    test "skips the origin check without a domain or resource URL" do
+      assert {:ok, _proof} =
+               ClientSIWX.authenticate(payment_required(challenge()), evm_signer(),
+                 chain_id: @evm_chain
+               )
+    end
+
+    test "a resource URL without a host matches nothing" do
+      assert ClientSIWX.authenticate(
+               payment_required(challenge()),
+               evm_signer(),
+               [chain_id: @evm_chain],
+               resource_url: "premium"
+             ) ==
+               {:error, {:siwx, :domain_mismatch}}
+    end
+
+    test "a resource URL without a default port matches the bare host only" do
+      # The domain matches, but the challenge's https origin cannot equal a
+      # scheme without a known port.
+      assert ClientSIWX.authenticate(
+               payment_required(challenge()),
+               evm_signer(),
+               [chain_id: @evm_chain],
+               resource_url: "custom://api.example.com/premium"
+             ) == {:error, {:siwx, :uri_mismatch}}
+    end
+  end
+
+  describe "fetch_challenge/1" do
+    test "returns :error for anything but a map carrying the extension" do
+      assert ClientSIWX.fetch_challenge("nope") == :error
+
+      assert ClientSIWX.fetch_challenge(%{"extensions" => %{"sign-in-with-x" => "nope"}}) ==
+               :error
+    end
+  end
+
+  describe "telemetry" do
+    test "emits [:x402, :client, :siwx] with the failure reason" do
+      handler_id = "client-siwx-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:x402, :client, :siwx],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      ClientSIWX.authenticate(payment_required(challenge()), evm_signer(), chain_id: "eip155:1")
+
+      assert_received {:telemetry, [:x402, :client, :siwx], %{count: 1},
+                       %{status: :error, reason: :unsupported_chain}}
+    end
+  end
+end
