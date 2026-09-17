@@ -10,6 +10,9 @@ defmodule X402.TelemetryTest do
     test "builds event names with x402 prefix" do
       assert Telemetry.event_name(:payment_required, :encode) ==
                [:x402, :payment_required, :encode]
+
+      assert Telemetry.event_name(:payment_identifier, :legacy) ==
+               [:x402, :payment_identifier, :legacy]
     end
   end
 

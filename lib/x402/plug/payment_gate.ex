@@ -37,6 +37,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     - **402** — payment required, no matching requirements, or payment failed
     - **400** — malformed / invalid payment payload (including wrong `x402Version`)
+    - **409** — a `payment-identifier` id reused for a different request
     - **500** — facilitator transport failures or malformed facilitator responses
 
     See the official
@@ -72,12 +73,48 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       proof are distinct keys here, exactly as before canonical keys existed.
 
     The key is **never** derived from client-controlled unsigned fields — in
-    particular not from the payment identifier extension's `paymentId`: a
-    replayer could vary it to mint a fresh key and bypass deduplication, or
-    squat another payment's id to deny it service. Duplicate proofs are
-    rejected with **402** and the claim is released when the protected
-    handler responds with a status >= 400 or settlement fails, so clients may
-    retry a payment whose resource was never delivered.
+    particular not from the payment identifier extension's id: a replayer
+    could vary it to mint a fresh key and bypass deduplication, or squat
+    another payment's id to deny it service. Duplicate proofs are rejected
+    with **402** and the claim is released when the protected handler
+    responds with a status >= 400 or settlement fails, so clients may retry
+    a payment whose resource was never delivered.
+
+    ### Payment identifier
+
+    Routes may advertise the
+    [`payment-identifier` extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/payment_identifier.md)
+    through `X402.Extensions.PaymentIdentifier.extension/1`:
+
+        extensions: %{"payment-identifier" => X402.Extensions.PaymentIdentifier.extension(required: true)}
+
+    The id the client echoes under `extensions["payment-identifier"]["info"]["id"]`
+    is validated (16–128 characters of `[A-Za-z0-9_-]`, otherwise **400**
+    `invalid_payload`), assigned as `:x402_payment_id`, and attached as
+    `:payment_id` to the `[:x402, :plug, :payment_verified]` telemetry
+    metadata. When the advertisement sets `required: true` and no id is
+    echoed, the request is rejected with **400** `payment_identifier_required`.
+
+    With `:payment_identifier_cache` configured, the id is additionally
+    bound to a request fingerprint
+    (`X402.Extensions.PaymentIdentifier.fingerprint/2` over the matched
+    scheme, network, asset, amount, payTo, HTTP method, and path) under a
+    `"pid:"`-prefixed cache key. Reusing an id for a request with a
+    different fingerprint is rejected with **409**
+    `payment_identifier_conflict`; the same id with the same fingerprint
+    proceeds normally and remains subject to the signature-derived replay
+    key above. A binding this request created is released together with the
+    replay claim (handler status >= 400, settlement failure, verification
+    failure), so the id may be retried. Without a cache the binding is
+    skipped and only the validity and `required` checks apply.
+
+    The pre-0.7.0 `"paymentIdentifier"` format (a Base64 JSON
+    `{"paymentId": ...}` string or a `%{"paymentId" => ...}` map, optionally
+    wrapped in `%{"info" => ...}`) is still accepted, with the same assign,
+    telemetry, and fingerprint binding, but is **deprecated** and removed in
+    1.0.0: each legacy id emits `[:x402, :payment_identifier, :legacy]` and
+    the first one logs a warning. Legacy ids satisfy `required: true` and are
+    not subject to the spec's length and character rules.
 
     The `:claim_order` option controls when the claim is taken relative to
     facilitator verification:
@@ -156,7 +193,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @precheck_time_buffer_seconds Scheme.EVM.time_buffer_seconds()
     @default_description "Payment required"
     @default_mime_type "application/json"
-    @payment_identifier_extension "paymentIdentifier"
+    @payment_id_binding_prefix "pid:"
     @settlement_pending_reason "settlement_pending"
     @local_verification_levels [:structural, :signature, :full]
 
@@ -167,7 +204,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       :invalid_json,
       :payload_too_large,
       :invalid_payload,
-      :invalid_x402_version
+      :invalid_x402_version,
+      :invalid_payment_identifier,
+      :payment_identifier_required
     ]
 
     @accept_option_schema [
@@ -386,9 +425,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         callbacks (for example `{MyApp.RedisPaymentCache, MyApp.Redis}`).
         When set, the plug performs an atomic claim (via the adapter's
         `put_new/3`) on the payment proof hash before settling, preventing
-        concurrent requests from double-settling the same payment. The default
-        ETS adapter is per-node — see the "Replay protection" section above
-        for the clustering hazard.
+        concurrent requests from double-settling the same payment, and binds
+        each echoed `payment-identifier` id to its request fingerprint (see
+        "Payment identifier" above). The default ETS adapter is per-node —
+        see the "Replay protection" section above for the clustering hazard.
         """
       ],
       claim_order: [
@@ -526,6 +566,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             payment_identifier_cache: Cache.adapter() | nil,
             payment_id: String.t(),
             client_payment_id: String.t() | nil,
+            payment_id_binding: String.t() | nil,
             payment_payload: map(),
             requirements: map(),
             route: compiled_route(),
@@ -843,17 +884,27 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
       with {:ok, payment_payload, requirements} <-
              decode_and_validate_payment(header, accepts, route.extensions, opts.schemes),
-           {:ok, client_payment_id} <- extract_client_payment_id(payment_payload),
+           {:ok, client_payment_id} <- client_payment_id(payment_payload, route),
            payment_id = replay_key(header, payment_payload, requirements),
            :ok <- run_local_prechecks(opts, payment_payload, requirements),
+           {:ok, binding} <-
+             bind_payment_id(
+               opts.payment_identifier_cache,
+               client_payment_id,
+               PaymentIdentifier.fingerprint(requirements, %{
+                 method: request_method,
+                 path: request_path
+               })
+             ),
            {:ok, verify_response} <-
-             claim_and_verify(opts, payment_id, payment_payload, requirements) do
+             claim_and_verify_bound(opts, payment_id, binding, payment_payload, requirements) do
         settlement_context = %{
           facilitator: opts.facilitator,
           hooks: opts.hooks,
           payment_identifier_cache: opts.payment_identifier_cache,
           payment_id: payment_id,
           client_payment_id: client_payment_id,
+          payment_id_binding: binding,
           payment_payload: payment_payload,
           requirements: requirements,
           route: route,
@@ -897,13 +948,24 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           settle_successful_resource(conn, settlement_context)
 
         false ->
-          release_claim(
-            settlement_context.payment_identifier_cache,
-            settlement_context.payment_id
-          )
-
+          release_claims(settlement_context)
           conn
       end
+    end
+
+    @spec release_claims(settlement_context()) :: :ok
+    defp release_claims(settlement_context) do
+      release_claim(
+        settlement_context.payment_identifier_cache,
+        settlement_context.payment_id
+      )
+
+      release_binding(
+        settlement_context.payment_identifier_cache,
+        settlement_context.payment_id_binding
+      )
+
+      :ok
     end
 
     @spec successful_resource_response?(Plug.Conn.t()) :: boolean()
@@ -944,10 +1006,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec fail_settlement(Plug.Conn.t(), settlement_context(), term(), term()) :: Plug.Conn.t()
     defp fail_settlement(conn, settlement_context, reason, response_reason) do
-      release_claim(
-        settlement_context.payment_identifier_cache,
-        settlement_context.payment_id
-      )
+      release_claims(settlement_context)
 
       reject_settlement(
         conn,
@@ -1150,6 +1209,30 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp retryable_settlement_pending?(_settle_body), do: false
 
+    # A binding this request created is released on every failure below —
+    # including a facilitator exit, which under :after_verify propagates
+    # before any replay claim exists — so a failed attempt never strands the
+    # client's id until the cache TTL expires.
+    @spec claim_and_verify_bound(options(), String.t(), String.t() | nil, map(), map()) ::
+            {:ok, map()} | {:error, term()}
+    defp claim_and_verify_bound(opts, payment_id, nil, payload, requirements),
+      do: claim_and_verify(opts, payment_id, payload, requirements)
+
+    defp claim_and_verify_bound(opts, payment_id, binding, payload, requirements) do
+      case claim_and_verify(opts, payment_id, payload, requirements) do
+        {:ok, verify_response} ->
+          {:ok, verify_response}
+
+        {:error, reason} ->
+          release_binding(opts.payment_identifier_cache, binding)
+          {:error, reason}
+      end
+    catch
+      :exit, reason ->
+        release_binding(opts.payment_identifier_cache, binding)
+        exit(reason)
+    end
+
     # Orders the replay claim relative to facilitator verification.
     #
     # :after_verify — verify first, then claim. Verification failures never
@@ -1258,6 +1341,41 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec release_claim(Cache.adapter() | nil, String.t()) :: Cache.write_result()
     defp release_claim(nil, _payment_id), do: :ok
     defp release_claim(adapter, payment_id), do: Cache.delete(adapter, payment_id)
+
+    # Binds the client's payment id to the request fingerprint. Returns the
+    # binding key when this request created the binding (and therefore owns
+    # its release), nil when no id / no cache / an identical binding already
+    # exists, and :payment_identifier_conflict when the id was first used for
+    # a different request.
+    @spec bind_payment_id(Cache.adapter() | nil, String.t() | nil, String.t()) ::
+            {:ok, String.t() | nil} | {:error, term()}
+    defp bind_payment_id(nil, _client_payment_id, _fingerprint), do: {:ok, nil}
+    defp bind_payment_id(_adapter, nil, _fingerprint), do: {:ok, nil}
+
+    defp bind_payment_id(adapter, client_payment_id, fingerprint) do
+      key = @payment_id_binding_prefix <> client_payment_id
+
+      case Cache.put_new(adapter, key, {:bound, fingerprint}) do
+        :ok -> {:ok, key}
+        {:error, :already_exists} -> compare_binding(adapter, key, fingerprint)
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    @spec compare_binding(Cache.adapter(), String.t(), String.t()) ::
+            {:ok, nil} | {:error, term()}
+    defp compare_binding(adapter, key, fingerprint) do
+      case Cache.get(adapter, key) do
+        {:hit, {:bound, ^fingerprint}} -> {:ok, nil}
+        {:hit, _other} -> {:error, :payment_identifier_conflict}
+        :miss -> {:ok, nil}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    @spec release_binding(Cache.adapter() | nil, String.t() | nil) :: Cache.write_result()
+    defp release_binding(_adapter, nil), do: :ok
+    defp release_binding(adapter, key), do: Cache.delete(adapter, key)
 
     @spec facilitator_verify(Facilitator.server(), map(), map(), module()) ::
             Facilitator.response()
@@ -1601,51 +1719,40 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp signer_nonce_key(_authorization, _prefix, _network), do: :error
 
-    # The echoed paymentId is surfaced for correlation only — never used as
-    # the replay key (see replay_key/3): it is client-controlled and not
-    # covered by any signature.
-    @spec extract_client_payment_id(map()) ::
-            {:ok, String.t() | nil} | {:error, {:invalid_payment_identifier, term()}}
-    defp extract_client_payment_id(payment_payload) do
-      with extensions when is_map(extensions) <-
-             Utils.map_value(payment_payload, {"extensions", :extensions}),
-           {:ok, value} <- Map.fetch(extensions, @payment_identifier_extension) do
-        decode_client_payment_id(value)
-      else
-        _absent -> {:ok, nil}
+    # The echoed id is surfaced for correlation and bound to the request
+    # fingerprint — never used as the replay key (see replay_key/3): it is
+    # client-controlled and not covered by any signature.
+    @spec client_payment_id(map(), compiled_route()) ::
+            {:ok, String.t() | nil}
+            | {:error,
+               :invalid_payment_identifier
+               | :payment_identifier_required
+               | {:invalid_payment_identifier, term()}}
+    defp client_payment_id(payment_payload, route) do
+      payment_payload
+      |> Utils.map_value({"extensions", :extensions})
+      |> PaymentIdentifier.extract_id()
+      |> case do
+        {:ok, {:spec, payment_id}} ->
+          {:ok, payment_id}
+
+        {:ok, {:legacy, payment_id}} ->
+          PaymentIdentifier.legacy_notice(:gate)
+          {:ok, payment_id}
+
+        {:ok, nil} ->
+          case PaymentIdentifier.required?(route.extensions) do
+            true -> {:error, :payment_identifier_required}
+            false -> {:ok, nil}
+          end
+
+        {:error, :invalid_payment_id} ->
+          {:error, :invalid_payment_identifier}
+
+        {:error, {:legacy, reason}} ->
+          {:error, {:invalid_payment_identifier, reason}}
       end
     end
-
-    # The extension value may arrive in the generic `%{"info" => ...,
-    # "schema" => ...}` envelope form — the same envelope
-    # `X402.PaymentRequirements.extensions_match?/2` unwraps when validating
-    # the client's echo — so an echo that passes extension validation must
-    # not then be rejected as malformed. Mirror that unwrapping here before
-    # decoding; malformed content inside a present envelope is still a hard
-    # 400.
-    @spec decode_client_payment_id(term()) ::
-            {:ok, String.t()} | {:error, {:invalid_payment_identifier, term()}}
-    defp decode_client_payment_id(%{"info" => info}), do: decode_bare_payment_id(info)
-    defp decode_client_payment_id(value), do: decode_bare_payment_id(value)
-
-    @spec decode_bare_payment_id(term()) ::
-            {:ok, String.t()} | {:error, {:invalid_payment_identifier, term()}}
-    defp decode_bare_payment_id(value) when is_binary(value) do
-      case PaymentIdentifier.decode(value) do
-        {:ok, payment_id} -> {:ok, payment_id}
-        {:error, reason} -> {:error, {:invalid_payment_identifier, reason}}
-      end
-    end
-
-    defp decode_bare_payment_id(value) when is_map(value) do
-      case PaymentIdentifier.fetch_payment_id(value) do
-        {:ok, payment_id} -> {:ok, payment_id}
-        {:error, reason} -> {:error, {:invalid_payment_identifier, reason}}
-      end
-    end
-
-    defp decode_bare_payment_id(_value),
-      do: {:error, {:invalid_payment_identifier, :invalid_payment_id}}
 
     # The facilitator's EXTENSION-RESPONSES sidechannel is for the resource
     # server only: it is exposed to the handler through assigns and never
@@ -2011,8 +2118,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp payment_response_from_reason(_reason), do: nil
 
-    @spec status_for_reason(term()) :: 400 | 402 | 500
+    @spec status_for_reason(term()) :: 400 | 402 | 409 | 500
     defp status_for_reason(reason) when reason in @invalid_request_reasons, do: 400
+    defp status_for_reason(:payment_identifier_conflict), do: 409
     defp status_for_reason({:unsupported_x402_version, _version}), do: 400
     defp status_for_reason({:missing_fields, _fields}), do: 400
     defp status_for_reason({:precheck_failed, _reason}), do: 402
@@ -2123,6 +2231,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp rejection_error({:invalid_payment_identifier, _reason}),
       do: "invalid payment identifier extension"
+
+    defp rejection_error(:invalid_payment_identifier), do: "invalid_payload"
+    defp rejection_error(:payment_identifier_required), do: "payment_identifier_required"
+    defp rejection_error(:payment_identifier_conflict), do: "payment_identifier_conflict"
 
     defp rejection_error({:verification_failed, _reason}), do: "facilitator rejected payment"
     defp rejection_error({:settlement_failed, _reason}), do: "facilitator rejected payment"

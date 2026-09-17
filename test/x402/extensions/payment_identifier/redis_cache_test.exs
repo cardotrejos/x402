@@ -170,6 +170,21 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCacheTest do
                RedisCache.get(cache, "payment-1")
     end
 
+    test "round-trips payment id fingerprint bindings as bound:<fingerprint>" do
+      RedisCommandMock
+      |> expect(:command, fn @conn, ["SET", @default_key, "bound:abc123", "NX", "PX", _ttl] ->
+        {:ok, "OK"}
+      end)
+      |> expect(:command, fn @conn, ["GET", @default_key] -> {:ok, "bound:abc123"} end)
+
+      cache = mock_cache()
+      assert :ok = RedisCache.put_new(cache, "payment-1", {:bound, "abc123"})
+      assert {:hit, {:bound, "abc123"}} = RedisCache.get(cache, "payment-1")
+
+      assert {:error, :invalid_cache_value} =
+               RedisCache.put_new(cache, "payment-1", {:bound, :not_a_binary})
+    end
+
     test "fails closed on entries it cannot decode" do
       # Unknown encoding prefix.
       expect(RedisCommandMock, :command, fn @conn, _command -> {:ok, "tampered"} end)

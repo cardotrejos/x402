@@ -457,6 +457,33 @@ defmodule X402.ClientTest do
 
       assert payload["extensions"] == %{}
     end
+
+    test "produces a spec-format payment-identifier echo end to end" do
+      alias X402.Extensions.PaymentIdentifier
+
+      advertised = %{"payment-identifier" => PaymentIdentifier.extension(required: true)}
+      payment_required = Map.put(@payment_required, "extensions", advertised)
+
+      assert {:ok, payload} =
+               Client.build_payment(payment_required, signer(),
+                 extensions: [PaymentIdentifier.enricher()]
+               )
+
+      declaration = payload["extensions"]["payment-identifier"]
+      assert declaration["schema"] == PaymentIdentifier.schema()
+      assert declaration["info"]["required"] == true
+      assert {:ok, {:spec, id}} = PaymentIdentifier.extract_id(payload["extensions"])
+      assert declaration["info"]["id"] == id
+      assert PaymentRequirements.extensions_match?(advertised, payload["extensions"])
+
+      # Not advertised: the payload is untouched.
+      assert {:ok, plain} =
+               Client.build_payment(@payment_required, signer(),
+                 extensions: [PaymentIdentifier.enricher()]
+               )
+
+      assert plain["extensions"] == %{}
+    end
   end
 
   describe "encode_payment/1" do

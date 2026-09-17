@@ -73,6 +73,15 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
     assert {:hit, {:rejected, :verification_failed}} = ETSCache.get(cache, "payment-1")
   end
 
+  test "stores payment id fingerprint bindings" do
+    cache = start_cache(ttl_ms: 1_000)
+
+    assert :ok = ETSCache.put_new(cache, "pid:abc", {:bound, "fingerprint"})
+    assert {:hit, {:bound, "fingerprint"}} = ETSCache.get(cache, "pid:abc")
+    assert {:error, :already_exists} = ETSCache.put_new(cache, "pid:abc", {:bound, "other"})
+    assert {:error, :invalid_cache_value} = ETSCache.put(cache, "pid:abc", {:bound, :atom})
+  end
+
   test "rejects invalid value and invalid payment identifiers" do
     cache = start_cache(ttl_ms: 1_000)
 

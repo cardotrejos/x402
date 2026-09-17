@@ -49,8 +49,25 @@ defmodule X402.MCP.Server do
   settlement, rejecting concurrent or repeated submissions of the same signed
   payment. The claim is released when the handler fails or settlement fails,
   so the client may retry with the same payment.
+
+  ## Payment identifier
+
+  Advertise the
+  [`payment-identifier` extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/payment_identifier.md)
+  with `extensions: %{"payment-identifier" => X402.Extensions.PaymentIdentifier.extension(required: true)}`.
+  The id echoed under `extensions["payment-identifier"]["info"]["id"]` must
+  be 16–128 characters of `[A-Za-z0-9_-]` (otherwise the payment-required
+  result carries `invalid_payload`); with `required: true` a missing id
+  yields `payment_identifier_required`. When a cache is configured, the id
+  is bound to a fingerprint of the matched requirements and the tool name
+  (`X402.Extensions.PaymentIdentifier.fingerprint/2`) under a `"pid:"` key:
+  reusing it for a different request yields `payment_identifier_conflict`,
+  the same request proceeds normally. The pre-0.7.0 `"paymentIdentifier"`
+  format is still accepted but deprecated (removed in 1.0.0) and emits
+  `[:x402, :payment_identifier, :legacy]`.
   """
 
+  alias X402.Extensions.PaymentIdentifier
   alias X402.Extensions.PaymentIdentifier.Cache
   alias X402.Extensions.PaymentIdentifier.ETSCache
   alias X402.Facilitator
@@ -69,6 +86,7 @@ defmodule X402.MCP.Server do
   @supported_payment_flow "authorization"
   @default_max_timeout_seconds 60
   @default_mime_type "application/json"
+  @payment_id_binding_prefix "pid:"
 
   @accept_option_schema [
     scheme: [
@@ -191,6 +209,9 @@ defmodule X402.MCP.Server do
 
   @typedoc "An MCP tool-call handler: request params in, tool result map out."
   @type handler :: (map() -> map())
+
+  @typedoc false
+  @type claims :: %{payment_id: String.t(), binding: String.t() | nil}
 
   # Reasons caused by facilitator infrastructure failures rather than by the
   # client's payment; these produce an opaque internal error result instead of
@@ -332,15 +353,63 @@ defmodule X402.MCP.Server do
   @spec verify_and_execute(map(), options(), handler(), map()) :: map()
   defp verify_and_execute(request, config, handler, payment_payload) do
     with {:ok, requirements} <- validate_payment(payment_payload, config),
+         {:ok, client_payment_id} <- client_payment_id(payment_payload, config),
          {:ok, payment_id} <- payment_id(payment_payload),
-         {:ok, verify_response} <- facilitator_verify(config, payment_payload, requirements),
-         :ok <- ensure_verify_success(verify_response),
-         :ok <- claim_or_fail(config.payment_identifier_cache, payment_id) do
-      execute_and_settle(request, config, handler, payment_payload, requirements, payment_id)
+         {:ok, binding} <- bind_payment_id(config, client_payment_id, requirements),
+         claims = %{payment_id: payment_id, binding: binding},
+         :ok <- verify_and_claim(config, payment_payload, requirements, claims) do
+      execute_and_settle(request, config, handler, payment_payload, requirements, claims)
     else
       {:error, reason} ->
         emit(:payment_rejected, %{tool: config.tool, reason: reason})
         rejection_result(config, reason)
+    end
+  end
+
+  # A binding this call created is released when verification or the replay
+  # claim fails, so a rejected attempt never strands the client's id.
+  @spec verify_and_claim(options(), map(), map(), claims()) :: :ok | {:error, term()}
+  defp verify_and_claim(config, payment_payload, requirements, claims) do
+    with {:ok, verify_response} <- facilitator_verify(config, payment_payload, requirements),
+         :ok <- ensure_verify_success(verify_response),
+         :ok <- claim_or_fail(config.payment_identifier_cache, claims.payment_id) do
+      :ok
+    else
+      {:error, reason} ->
+        release_binding(config.payment_identifier_cache, claims.binding)
+        {:error, reason}
+    end
+  end
+
+  @spec client_payment_id(map(), options()) ::
+          {:ok, String.t() | nil}
+          | {:error,
+             :invalid_payment_identifier
+             | :payment_identifier_required
+             | {:invalid_payment_identifier, term()}}
+  defp client_payment_id(payment_payload, config) do
+    payment_payload
+    |> Utils.map_value({"extensions", :extensions})
+    |> PaymentIdentifier.extract_id()
+    |> case do
+      {:ok, {:spec, payment_id}} ->
+        {:ok, payment_id}
+
+      {:ok, {:legacy, payment_id}} ->
+        PaymentIdentifier.legacy_notice(:mcp)
+        {:ok, payment_id}
+
+      {:ok, nil} ->
+        case PaymentIdentifier.required?(config.extensions) do
+          true -> {:error, :payment_identifier_required}
+          false -> {:ok, nil}
+        end
+
+      {:error, :invalid_payment_id} ->
+        {:error, :invalid_payment_identifier}
+
+      {:error, {:legacy, reason}} ->
+        {:error, {:invalid_payment_identifier, reason}}
     end
   end
 
@@ -406,34 +475,34 @@ defmodule X402.MCP.Server do
 
   # -- Execution and settlement -----------------------------------------------
 
-  @spec execute_and_settle(map(), options(), handler(), map(), map(), String.t()) :: map()
-  defp execute_and_settle(request, config, handler, payment_payload, requirements, payment_id) do
-    result = run_handler(config, handler, request, payment_id)
+  @spec execute_and_settle(map(), options(), handler(), map(), map(), claims()) :: map()
+  defp execute_and_settle(request, config, handler, payment_payload, requirements, claims) do
+    result = run_handler(config, handler, request, claims)
 
     case error_result?(result) do
       true ->
         # The tool itself failed: return its error unchanged, do not settle,
         # and release the claim so the client may retry with the same payment.
-        release_claim(config.payment_identifier_cache, payment_id)
+        release_claims(config, claims)
         result
 
       false ->
-        settle_result(config, payment_payload, requirements, payment_id, result)
+        settle_result(config, payment_payload, requirements, claims, result)
     end
   end
 
-  @spec run_handler(options(), handler(), map(), String.t()) :: map()
-  defp run_handler(config, handler, request, payment_id) do
+  @spec run_handler(options(), handler(), map(), claims()) :: map()
+  defp run_handler(config, handler, request, claims) do
     result =
       try do
         handler.(request)
       rescue
         exception ->
-          release_claim(config.payment_identifier_cache, payment_id)
+          release_claims(config, claims)
           reraise exception, __STACKTRACE__
       catch
         kind, reason ->
-          release_claim(config.payment_identifier_cache, payment_id)
+          release_claims(config, claims)
           :erlang.raise(kind, reason, __STACKTRACE__)
       end
 
@@ -442,7 +511,7 @@ defmodule X402.MCP.Server do
         result_map
 
       other ->
-        release_claim(config.payment_identifier_cache, payment_id)
+        release_claims(config, claims)
 
         raise ArgumentError,
               "expected the wrapped MCP tool handler to return a tool result map, " <>
@@ -450,15 +519,15 @@ defmodule X402.MCP.Server do
     end
   end
 
-  @spec settle_result(options(), map(), map(), String.t(), map()) :: map()
-  defp settle_result(config, payment_payload, requirements, payment_id, result) do
+  @spec settle_result(options(), map(), map(), claims(), map()) :: map()
+  defp settle_result(config, payment_payload, requirements, claims, result) do
     with {:ok, settle_response} <- facilitator_settle(config, payment_payload, requirements),
          :ok <- ensure_settle_success(settle_response) do
       emit(:payment_verified, %{tool: config.tool})
       MCP.put_payment_response(result, settle_response.body)
     else
       {:error, reason} ->
-        release_claim(config.payment_identifier_cache, payment_id)
+        release_claims(config, claims)
         emit(:payment_rejected, %{tool: config.tool, reason: reason})
         settlement_failed_result(config, reason)
     end
@@ -497,6 +566,13 @@ defmodule X402.MCP.Server do
   defp rejection_message(:invalid_payload), do: "invalid_payload"
   defp rejection_message(:no_matching_requirements), do: "No matching payment requirements"
   defp rejection_message(:extension_echo_mismatch), do: "invalid_payload"
+  defp rejection_message(:invalid_payment_identifier), do: "invalid_payload"
+  defp rejection_message(:payment_identifier_required), do: "payment_identifier_required"
+  defp rejection_message(:payment_identifier_conflict), do: "payment_identifier_conflict"
+
+  defp rejection_message({:invalid_payment_identifier, _reason}),
+    do: "invalid payment identifier extension"
+
   defp rejection_message(:already_exists), do: "payment already processed"
   defp rejection_message({:missing_fields, _fields}), do: "invalid_payload"
   defp rejection_message({:invalid_fields, _fields}), do: "invalid_payload"
@@ -618,9 +694,55 @@ defmodule X402.MCP.Server do
     end
   end
 
+  @spec release_claims(options(), claims()) :: :ok
+  defp release_claims(config, claims) do
+    release_claim(config.payment_identifier_cache, claims.payment_id)
+    release_binding(config.payment_identifier_cache, claims.binding)
+    :ok
+  end
+
   @spec release_claim(Cache.adapter() | nil, String.t()) :: Cache.write_result()
   defp release_claim(nil, _payment_id), do: :ok
   defp release_claim(adapter, payment_id), do: Cache.delete(adapter, payment_id)
+
+  # Binds the client's payment id to the fingerprint of the matched
+  # requirements plus the tool name. Returns the binding key when this call
+  # created it (and owns its release); nil when there is no id, no cache, or
+  # an identical binding already exists. Adapter failures other than a
+  # duplicate are infrastructure trouble and fail closed.
+  @spec bind_payment_id(options(), String.t() | nil, map()) ::
+          {:ok, String.t() | nil}
+          | {:error, :payment_identifier_conflict | {:claim_failed, term()}}
+  defp bind_payment_id(%{payment_identifier_cache: nil}, _client_payment_id, _requirements),
+    do: {:ok, nil}
+
+  defp bind_payment_id(_config, nil, _requirements), do: {:ok, nil}
+
+  defp bind_payment_id(config, client_payment_id, requirements) do
+    key = @payment_id_binding_prefix <> client_payment_id
+    fingerprint = PaymentIdentifier.fingerprint(requirements, %{tool: config.tool})
+
+    case Cache.put_new(config.payment_identifier_cache, key, {:bound, fingerprint}) do
+      :ok -> {:ok, key}
+      {:error, :already_exists} -> compare_binding(config, key, fingerprint)
+      {:error, reason} -> {:error, {:claim_failed, reason}}
+    end
+  end
+
+  @spec compare_binding(options(), String.t(), String.t()) ::
+          {:ok, nil} | {:error, :payment_identifier_conflict | {:claim_failed, term()}}
+  defp compare_binding(config, key, fingerprint) do
+    case Cache.get(config.payment_identifier_cache, key) do
+      {:hit, {:bound, ^fingerprint}} -> {:ok, nil}
+      {:hit, _other} -> {:error, :payment_identifier_conflict}
+      :miss -> {:ok, nil}
+      {:error, reason} -> {:error, {:claim_failed, reason}}
+    end
+  end
+
+  @spec release_binding(Cache.adapter() | nil, String.t() | nil) :: Cache.write_result()
+  defp release_binding(_adapter, nil), do: :ok
+  defp release_binding(adapter, key), do: Cache.delete(adapter, key)
 
   @doc false
   @spec validate_payment_identifier_cache(term()) ::
