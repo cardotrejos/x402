@@ -416,6 +416,54 @@ defmodule X402.Plug.PaymentGateRateLimitTest do
       refute_receive {:hit, _key, _limit, _window_ms}
       refute Map.has_key?(conn.assigns, :x402_rate_limit)
     end
+
+    for kind <- [:error, :throw, :exit] do
+      @tag callback_kind: kind
+      test "a key callback #{kind} releases both replay claims and identifier bindings", %{
+        callback_kind: kind
+      } do
+        facilitator = start_mock_facilitator()
+        cache = start_supervised!({ETSCache, name: unique_table()})
+        identifier = "abcdefghijklmnopqrstuvwxyz012345"
+
+        key_fun = fn _context ->
+          assert {:hit, {:bound, _fingerprint}} = ETSCache.get(cache, "pid:" <> identifier)
+          :erlang.raise(kind, %RuntimeError{message: "key failed"}, [])
+        end
+
+        opts = [
+          routes: [@route],
+          facilitator: facilitator,
+          payment_identifier_cache: cache,
+          rate_limit: [limit: 3, window_ms: 60_000, key: key_fun]
+        ]
+
+        paid =
+          paid_conn(fn payload ->
+            put_in(payload, ["extensions", "payment-identifier"], %{
+              "info" => %{"id" => identifier}
+            })
+          end)
+
+        case kind do
+          :error ->
+            assert_raise RuntimeError, "key failed", fn -> run_request(paid, opts) end
+
+          :throw ->
+            assert %RuntimeError{message: "key failed"} = catch_throw(run_request(paid, opts))
+
+          :exit ->
+            assert %RuntimeError{message: "key failed"} = catch_exit(run_request(paid, opts))
+        end
+
+        assert ETSCache.get(cache, "pid:" <> identifier) == :miss
+        refute_received {:settle_called, _payload, _requirements}
+
+        retry_opts = Keyword.put(opts, :rate_limit, limit: 3, window_ms: 60_000)
+        assert run_request(paid, retry_opts).status == 200
+        assert_received {:settle_called, _payload, _requirements}
+      end
+    end
   end
 
   describe "stores" do

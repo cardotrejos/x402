@@ -706,6 +706,9 @@ defmodule X402.Facilitator do
       candidates,
       operation,
       fn endpoint ->
+        # An inner retry must not hide an earlier ambiguous settlement
+        # behind a later connection failure and permit another provider.
+        endpoint = if operation == :settle, do: %{endpoint | max_retries: 0}, else: endpoint
         result = request.(endpoint)
 
         if match?({:ok, _result}, result) and Map.has_key?(config.breaker, endpoint.url) do

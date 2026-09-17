@@ -109,16 +109,24 @@ defmodule X402.RateLimiterTest do
     end
   end
 
-  describe "payer/2" do
-    @payload %{"payload" => %{"authorization" => %{"from" => "0x1"}}}
+  describe "payer/3" do
+    @requirements %{"scheme" => "exact", "network" => "eip155:8453"}
+    @payload %{
+      "accepted" => @requirements,
+      "payload" => %{"authorization" => %{"from" => "0x1"}}
+    }
 
     test "accepts atom keys" do
-      assert RateLimiter.payer(%{payload: %{authorization: %{from: "0x1"}}}) == "0x1"
+      assert RateLimiter.payer(%{
+               accepted: %{scheme: "exact", network: "eip155:8453"},
+               payload: %{authorization: %{from: "0x1"}}
+             }) == "0x1"
+
       assert RateLimiter.payer(@payload, %{body: %{payer: "0x2"}}) == "0x2"
     end
 
     test "ignores blank addresses" do
-      assert RateLimiter.payer(%{"payload" => %{"authorization" => %{"from" => ""}}}) == nil
+      assert RateLimiter.payer(put_in(@payload, ["payload", "authorization", "from"], "")) == nil
     end
 
     test "ignores payloads without a scheme payload" do
@@ -131,6 +139,31 @@ defmodule X402.RateLimiterTest do
       assert RateLimiter.payer(@payload, %{"isValid" => true, "payer" => 42}) == "0x1"
       assert RateLimiter.payer(@payload, %{status: 200, body: "not json"}) == "0x1"
       assert RateLimiter.payer(@payload, nil) == "0x1"
+    end
+
+    test "ignores unrelated authorization fields for non-EVM and unknown schemes" do
+      for requirements <- [
+            %{"scheme" => "exact", "network" => "solana:mainnet"},
+            %{"scheme" => "upto", "network" => "solana:mainnet"},
+            %{"scheme" => "custom", "network" => "eip155:8453"},
+            %{}
+          ] do
+        assert RateLimiter.payer(@payload, nil, requirements) == nil
+      end
+
+      assert RateLimiter.payer(Map.delete(@payload, "accepted")) == nil
+    end
+
+    test "uses only the verified transfer method's signer" do
+      payload = put_in(@payload, ["payload", "permit2Authorization"], %{"from" => "0x2"})
+      permit2 = Map.put(@requirements, "extra", %{"assetTransferMethod" => "permit2"})
+      unsupported = put_in(permit2, ["extra", "assetTransferMethod"], "erc7710")
+
+      assert RateLimiter.payer(payload, nil, @requirements) == "0x1"
+      assert RateLimiter.payer(payload, nil, permit2) == "0x2"
+      assert RateLimiter.payer(payload, nil, Map.put(@requirements, "scheme", "upto")) == "0x2"
+      assert RateLimiter.payer(payload, nil, unsupported) == nil
+      assert RateLimiter.payer(@payload, nil, permit2) == nil
     end
   end
 

@@ -303,6 +303,47 @@ defmodule X402.FacilitatorFailoverTest do
   end
 
   describe "settle/3" do
+    test "preserves the first ambiguous result even when HTTP retries are configured", ctx do
+      Bypass.expect_once(ctx.primary, "POST", "/settle", fn conn ->
+        Plug.Conn.resp(conn, 502, "possibly broadcast")
+      end)
+
+      stub_never_called(ctx.fallback, "POST", "/settle")
+
+      facilitator =
+        start_facilitator(ctx,
+          max_retries: 2,
+          fallbacks: [[url: ctx.fallback_url]],
+          failover: [max_attempts: 1]
+        )
+
+      capture_log(fn ->
+        assert {:error, %Error{type: :http_error, status: 502, attempt: 1}} =
+                 Facilitator.settle(facilitator, @payload, @requirements)
+      end)
+
+      refute_receive {:fallback_called, _path}
+    end
+
+    test "also disables the fallback endpoint's own settlement retries", ctx do
+      Bypass.down(ctx.primary)
+
+      Bypass.expect_once(ctx.fallback, "POST", "/settle", fn conn ->
+        Plug.Conn.resp(conn, 502, "possibly broadcast")
+      end)
+
+      facilitator =
+        start_facilitator(ctx,
+          max_retries: 2,
+          fallbacks: [[url: ctx.fallback_url, max_retries: 3]]
+        )
+
+      capture_log(fn ->
+        assert {:error, %Error{type: :http_error, status: 502, attempt: 1}} =
+                 Facilitator.settle(facilitator, @payload, @requirements)
+      end)
+    end
+
     test "does not fail over on a 5xx", ctx do
       Bypass.expect_once(ctx.primary, "POST", "/settle", fn conn ->
         Plug.Conn.resp(conn, 502, "gateway")

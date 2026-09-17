@@ -554,8 +554,11 @@ Failed endpoints enter a cooldown. Authentication is configured per endpoint;
 the primary's credentials are not inherited by a fallback.
 
 Settlement is stricter: failover only occurs for errors proving the request
-was not delivered, such as connection refusal or DNS failure. Timeouts and
-HTTP 5xx are ambiguous and never trigger settlement failover. Reconcile with
+was not delivered, such as connection refusal or DNS failure. TLS alerts,
+timeouts, and HTTP 5xx are ambiguous and never trigger settlement failover.
+With fallbacks configured, settlement makes only one HTTP attempt per
+endpoint, regardless of `max_retries`, so later errors cannot hide an
+earlier ambiguous attempt. Reconcile with
 the original facilitator rather than sending the same authorization to
 another provider. With no fallbacks configured, existing single-endpoint
 retry behavior is unchanged.

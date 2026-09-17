@@ -39,10 +39,14 @@ defmodule X402.RateLimiter.ETSTest do
   end
 
   test "keys may be arbitrary terms including match-spec-looking atoms", %{table: table} do
-    assert {:allow, 0} = ETS.hit(table, :"$1", 1, 10_000)
-    assert {:allow, 0} = ETS.hit(table, :_, 1, 10_000)
-    assert {:deny, _retry} = ETS.hit(table, :"$1", 1, 10_000)
-    assert {:deny, _retry} = ETS.hit(table, :_, 1, 10_000)
+    keys = [:"$1", :_, :"$x402_hits", :"$x402_owner", {:_, :"$2"}, %{:"$1" => :_}, 1, 1.0]
+
+    for key <- keys, do: assert({:allow, 0} = ETS.hit(table, key, 1, 20))
+    for key <- keys, do: assert({:deny, _retry} = ETS.hit(table, key, 1, 20))
+    Process.sleep(30)
+
+    for key <- keys, do: assert({:allow, 0} = ETS.hit(table, key, 1, 60_000))
+    for key <- keys, do: assert({:deny, _retry} = ETS.hit(table, key, 1, 60_000))
   end
 
   test "nil selects the default table" do
@@ -90,6 +94,28 @@ defmodule X402.RateLimiter.ETSTest do
     assert {:allow, 0} = ETS.hit(table, :old, 1, 60_000)
   end
 
+  test "concurrent sweeping and expiring hits never lose the counter", %{table: table} do
+    ETS.hit(table, :shared, 10, 1)
+
+    tasks =
+      for index <- 1..20 do
+        Task.async(fn ->
+          for _iteration <- 1..500 do
+            if rem(index, 5) == 0 do
+              ETS.sweep(table)
+            else
+              result = ETS.hit(table, :shared, 10, 1)
+
+              assert match?({:allow, remaining} when remaining in 0..9, result) or
+                       match?({:deny, retry} when retry > 0, result)
+            end
+          end
+        end)
+      end
+
+    Enum.each(tasks, &Task.await/1)
+  end
+
   test "reset/1 clears every counter", %{table: table} do
     assert {:allow, 0} = ETS.hit(table, :a, 1, 60_000)
     assert {:allow, 0} = ETS.hit(table, :b, 1, 60_000)
@@ -106,7 +132,7 @@ defmodule X402.RateLimiter.ETSTest do
 
     for index <- 1..1_100, do: ETS.hit(table, {:churn, index}, 1, 60_000)
 
-    assert :ets.lookup(table, :stale) == []
+    assert :ets.lookup(table, :erlang.term_to_binary(:stale, [:deterministic])) == []
   end
 
   test "the table survives the creating process exiting", %{table: table} do
@@ -128,6 +154,6 @@ defmodule X402.RateLimiter.ETSTest do
 
     assert Enum.all?(results, &match?({:allow, _remaining}, &1))
     assert :ets.whereis(table) != :undefined
-    assert [{:race, 20, _start, _end}] = :ets.lookup(table, :race)
+    assert {:allow, 79} = ETS.hit(table, :race, 100, 60_000)
   end
 end

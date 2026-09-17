@@ -17,13 +17,16 @@ defmodule X402.Facilitator.Failover do
     is an answer, not an outage).
   * `settle` fails over **only** when the request provably never reached
     the endpoint: connection refused, DNS resolution failure, unreachable
-    host or network, or a TLS handshake failure. It never fails over on a
-    timeout, a closed connection, or a 5xx — the facilitator may have
+    host or network. It never fails over on a TLS alert, a timeout, a
+    closed connection, or a 5xx — the facilitator may have
     broadcast the settlement before the failure, and retrying elsewhere
     could settle the same authorization twice (or, for nonce-consuming
     schemes, surface a confusing "already used" error while the money has
     moved). Callers that need at-least-once settlement should retry the
     same endpoint and reconcile through the pending-settlement flow.
+    With fallbacks configured, settlement disables per-endpoint HTTP
+    retries so an ambiguous attempt cannot be hidden by a later failure.
+    Without fallbacks, existing single-endpoint retry behavior is unchanged.
 
   Every failover emits `[:x402, :facilitator, :failover]` with metadata
   `:operation`, `:from` and `:to` (endpoint URLs), `:reason` (the
@@ -93,14 +96,6 @@ defmodule X402.Facilitator.Failover do
 
   @typedoc "Facilitator operation names."
   @type operation :: :verify | :settle | :supported | :list_resources | :search_resources
-
-  @doc false
-  @spec endpoint_schema() :: keyword()
-  def endpoint_schema, do: @endpoint_schema
-
-  @doc false
-  @spec policy_schema() :: keyword()
-  def policy_schema, do: @policy_schema
 
   @doc false
   @spec validate_fallbacks(term()) :: {:ok, [keyword()]} | {:error, String.t()}
@@ -247,8 +242,9 @@ defmodule X402.Facilitator.Failover do
   @doc """
   Whether a transport error reason proves the request never reached the server.
 
-  Accepts the bare POSIX/DNS reason, a `{:tls_alert, _}` handshake failure,
-  or a transport error struct (`Mint.TransportError`) wrapping one.
+  Accepts a connection-establishment POSIX/DNS reason, invalid transport
+  options, or a transport error struct (`Mint.TransportError`) wrapping
+  one. TLS alerts do not identify when they occurred and are ambiguous.
 
   ## Examples
 
@@ -257,7 +253,7 @@ defmodule X402.Facilitator.Failover do
       iex> X402.Facilitator.Failover.undelivered?(%{reason: :nxdomain})
       true
       iex> X402.Facilitator.Failover.undelivered?(%{reason: {:tls_alert, {:handshake_failure, ~c"bad"}}})
-      true
+      false
       iex> X402.Facilitator.Failover.undelivered?(:timeout)
       false
       iex> X402.Facilitator.Failover.undelivered?(%{reason: :closed})
@@ -267,7 +263,6 @@ defmodule X402.Facilitator.Failover do
   """
   @spec undelivered?(term()) :: boolean()
   def undelivered?(reason) when reason in @undelivered_reasons, do: true
-  def undelivered?({:tls_alert, _alert}), do: true
   def undelivered?({:options, _options}), do: true
   def undelivered?(%{reason: reason}), do: undelivered?(reason)
   def undelivered?(_reason), do: false

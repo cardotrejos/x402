@@ -195,7 +195,12 @@ defmodule X402.Facilitator.FailoverTest do
             %Error{type: :timeout, reason: :timeout},
             %Error{type: :http_error, status: 500},
             %Error{type: :transport_error, reason: %{reason: :closed}},
-            %Error{type: :transport_error, reason: :econnreset}
+            %Error{type: :transport_error, reason: :econnreset},
+            %Error{type: :transport_error, reason: {:tls_alert, {:unknown_ca, ~c"bad"}}},
+            %Error{
+              type: :transport_error,
+              reason: %{reason: {:tls_alert, {:internal_error, ~c"bad"}}}
+            }
           ] do
         request = fn
           %{url: "https://a"} ->
@@ -219,7 +224,6 @@ defmodule X402.Facilitator.FailoverTest do
             :ehostunreach,
             :enetunreach,
             :ehostdown,
-            {:tls_alert, {:unknown_ca, ~c"bad"}},
             {:options, {:cacertfile, []}},
             %{reason: :econnrefused},
             %{__struct__: Mint.TransportError, reason: :nxdomain}

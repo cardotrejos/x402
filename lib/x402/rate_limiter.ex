@@ -15,8 +15,8 @@ defmodule X402.RateLimiter do
       default: :payer,
       doc: """
       What is being limited: `:payer` (the verified payer address, falling
-      back to the remote IP when neither the facilitator nor the payload
-      names one), `:ip` (the remote IP), or a 1-arity function of the
+      back to the remote IP when neither the facilitator nor the verified
+      scheme names one), `:ip` (the remote IP), or a 1-arity function of the
       request context (`%{conn: conn, payer: payer, payment_payload:
       payload, requirements: requirements}`) returning any term — `nil`
       exempts the request.
@@ -81,6 +81,7 @@ defmodule X402.RateLimiter do
 
   require Logger
 
+  alias X402.Scheme.ExactEVM
   alias X402.Utils
 
   @typedoc "Store reference passed as the first argument of `c:hit/4`."
@@ -184,7 +185,7 @@ defmodule X402.RateLimiter do
   Resolves the rate-limit key for a request, or `:skip` when it is exempt.
 
   `:payer` uses the payer address (lower-cased when it is a `0x` address)
-  and falls back to `{:ip, remote_ip}` when the payload carries none;
+  and falls back to `{:ip, remote_ip}` when no verified payer is available;
   `:ip` uses the remote IP; a function receives the whole context.
 
   ## Examples
@@ -239,21 +240,24 @@ defmodule X402.RateLimiter do
 
   Prefers the `payer` the facilitator reported in its verify response
   (`verify_response` is the response map or its body), and otherwise reads
-  the EIP-3009 `authorization.from` or the Permit2
-  `permit2Authorization.from` of the scheme payload — a signer the
-  facilitator has just authenticated. Returns `nil` when neither is
-  present (for example a Solana transaction verified by a facilitator that
-  omits `payer`).
+  the signer field authenticated by the verified scheme: EIP-3009
+  `authorization.from` for exact EVM, or `permit2Authorization.from` for
+  exact EVM with Permit2 and upto EVM. Other schemes require a reported
+  payer; unrelated authorization fields are ignored.
 
   The payload's `from` is attacker-controlled until verification succeeds;
-  call this with a verified payment only.
+  call this with a verified payment only. Pass the requirements used for
+  verification as the third argument, or omit it to use the payload's
+  verified `accepted` requirements.
 
   ## Examples
 
-      iex> X402.RateLimiter.payer(%{"payload" => %{"authorization" => %{"from" => "0xabc"}}})
+      iex> requirements = %{"scheme" => "exact", "network" => "eip155:8453"}
+      iex> X402.RateLimiter.payer(%{"accepted" => requirements, "payload" => %{"authorization" => %{"from" => "0xabc"}}})
       "0xabc"
 
-      iex> X402.RateLimiter.payer(%{"payload" => %{"permit2Authorization" => %{"from" => "0xdef"}}})
+      iex> requirements = %{"scheme" => "upto", "network" => "eip155:8453"}
+      iex> X402.RateLimiter.payer(%{"payload" => %{"permit2Authorization" => %{"from" => "0xdef"}}}, nil, requirements)
       "0xdef"
 
       iex> payload = %{"payload" => %{"authorization" => %{"from" => "0xabc"}}}
@@ -263,23 +267,45 @@ defmodule X402.RateLimiter do
       iex> X402.RateLimiter.payer(%{"payload" => %{"transaction" => "AQID"}}, %{"isValid" => true})
       nil
   """
-  @spec payer(map(), map() | nil) :: String.t() | nil
-  def payer(payment_payload, verify_response \\ nil) when is_map(payment_payload) do
-    [
-      verified_payer(verify_response),
-      Utils.nested_map_value(payment_payload, [
-        {"payload", :payload},
-        {"authorization", :authorization},
-        {"from", :from}
-      ]),
-      Utils.nested_map_value(payment_payload, [
-        {"payload", :payload},
-        {"permit2Authorization", :permit2Authorization},
-        {"from", :from}
-      ])
-    ]
-    |> Utils.first_present()
-    |> case do
+  @spec payer(map(), map() | nil, map() | nil) :: String.t() | nil
+  def payer(payment_payload, verify_response \\ nil, requirements \\ nil)
+      when is_map(payment_payload) do
+    requirements = requirements || Utils.map_value(payment_payload, {"accepted", :accepted})
+    verified_payer(verify_response) || scheme_payer(payment_payload, requirements)
+  end
+
+  defp scheme_payer(payment_payload, requirements) when is_map(requirements) do
+    scheme = Utils.map_value(requirements, {"scheme", :scheme})
+    network = Utils.map_value(requirements, {"network", :network})
+
+    case {scheme, network} do
+      {"exact", "eip155:" <> _chain} ->
+        case ExactEVM.transfer_method(requirements) do
+          {:ok, :eip3009} ->
+            authorization_payer(payment_payload, {"authorization", :authorization})
+
+          {:ok, :permit2} ->
+            permit2_payer(payment_payload)
+
+          {:error, _reason} ->
+            nil
+        end
+
+      {"upto", "eip155:" <> _chain} ->
+        permit2_payer(payment_payload)
+
+      _other ->
+        nil
+    end
+  end
+
+  defp scheme_payer(_payment_payload, _requirements), do: nil
+
+  defp permit2_payer(payment_payload),
+    do: authorization_payer(payment_payload, {"permit2Authorization", :permit2Authorization})
+
+  defp authorization_payer(payment_payload, field) do
+    case Utils.nested_map_value(payment_payload, [{"payload", :payload}, field, {"from", :from}]) do
       from when is_binary(from) and from != "" -> from
       _other -> nil
     end

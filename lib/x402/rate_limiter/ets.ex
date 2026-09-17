@@ -41,7 +41,7 @@ defmodule X402.RateLimiter.ETS do
 
   ## Examples
 
-      iex> table = :"rate_limiter_doctest_#{System.unique_integer([:positive])}"
+      iex> table = String.to_atom("rate_limiter_doctest_#{System.unique_integer([:positive])}")
       iex> X402.RateLimiter.ETS.hit(table, {:payer, "0xabc"}, 2, 60_000)
       {:allow, 1}
       iex> X402.RateLimiter.ETS.hit(table, {:payer, "0xabc"}, 2, 60_000)
@@ -57,7 +57,10 @@ defmodule X402.RateLimiter.ETS do
       when is_integer(limit) and limit > 0 and is_integer(window_ms) and window_ms > 0 do
     table = ensure_table(table)
     maybe_sweep(table)
-    do_hit(table, key, limit, window_ms, now_ms(), 0)
+    # Binary keys bind directly in match heads without interpreting arbitrary
+    # user terms as match-spec variables or colliding with the sweep counter.
+    key = :erlang.term_to_binary(key, [:deterministic])
+    do_hit(table, key, limit, window_ms, 0)
   end
 
   @doc since: "0.9.0"
@@ -89,61 +92,36 @@ defmodule X402.RateLimiter.ETS do
     :ok
   end
 
-  # Two hits racing on the same closed window must not both open a new one
-  # (the second would reset the count), so replacement is a compare-and-swap
-  # on the exact row that was read; the loser re-reads and retries.
-  defp do_hit(_table, _key, _limit, _window_ms, _now, @max_cas_attempts),
+  defp do_hit(_table, _key, _limit, _window_ms, @max_cas_attempts),
     do: {:error, :contention}
 
-  defp do_hit(table, key, limit, window_ms, now, attempts) do
-    case :ets.lookup(table, key) do
-      [{^key, _count, _window_start, window_end}] when now < window_end ->
-        count = :ets.update_counter(table, key, {2, 1})
-        result(table, key, count, limit, window_end, now)
+  defp do_hit(table, key, limit, window_ms, attempts) do
+    now = now_ms()
 
-      [{^key, count, window_start, window_end}] ->
-        replaced =
-          :ets.select_replace(table, [
-            {
-              {:"$1", :"$2", :"$3", :"$4"},
-              [
-                {:"=:=", :"$1", {:const, key}},
-                {:"=:=", :"$2", count},
-                {:"=:=", :"$3", window_start},
-                {:"=:=", :"$4", window_end}
-              ],
-              [{{:"$1", 1, now, now + window_ms}}]
-            }
-          ])
+    # Increment and read the window atomically; the default row also handles
+    # a concurrent sweep without a lookup/update race that could fail open.
+    [count, window_end] =
+      :ets.update_counter(table, key, [{2, 1}, {4, 0}], {key, 0, now, now + window_ms})
 
-        case replaced do
-          1 -> {:allow, limit - 1}
-          0 -> do_hit(table, key, limit, window_ms, now, attempts + 1)
-        end
+    if now < window_end do
+      result(count, limit, window_end - now)
+    else
+      # Only one hit replaces the expired window. Counts in that expired
+      # window no longer matter; a losing hit retries against the new one.
+      replaced =
+        :ets.select_replace(table, [
+          {{key, :_, :_, window_end}, [], [{:const, {key, 1, now, now + window_ms}}]}
+        ])
 
-      [] ->
-        case :ets.insert_new(table, {key, 1, now, now + window_ms}) do
-          true -> {:allow, limit - 1}
-          false -> do_hit(table, key, limit, window_ms, now, attempts + 1)
-        end
+      case replaced do
+        1 -> {:allow, limit - 1}
+        0 -> do_hit(table, key, limit, window_ms, attempts + 1)
+      end
     end
   end
 
-  defp result(_table, _key, count, limit, _window_end, _now) when count <= limit,
-    do: {:allow, limit - count}
-
-  # The window may have rolled over between the lookup and the increment,
-  # in which case the increment landed in the new window and the fresh
-  # row's end is the one to report.
-  defp result(table, key, _count, _limit, window_end, now) do
-    current_end =
-      case :ets.lookup(table, key) do
-        [{^key, _count, _start, current_end}] -> current_end
-        [] -> window_end
-      end
-
-    {:deny, max(current_end - now, 1)}
-  end
+  defp result(count, limit, _retry_after_ms) when count <= limit, do: {:allow, limit - count}
+  defp result(_count, _limit, retry_after_ms), do: {:deny, retry_after_ms}
 
   defp maybe_sweep(table) do
     case :ets.update_counter(table, @hits_key, {2, 1, @sweep_every, 0}, {@hits_key, 0}) do

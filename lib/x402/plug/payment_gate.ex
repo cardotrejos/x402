@@ -1761,7 +1761,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp enforce_rate_limit(conn, %{rate_limit: nil}, _route, _verified), do: {:ok, conn}
 
     defp enforce_rate_limit(conn, %{rate_limit: config} = opts, route, verified) do
-      payer = RateLimiter.payer(verified.payment_payload, verified.verify_response)
+      payer =
+        RateLimiter.payer(
+          verified.payment_payload,
+          verified.verify_response,
+          verified.requirements
+        )
 
       context = %{
         conn: conn,
@@ -1786,8 +1791,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
                })}
 
             {:deny, retry_after_ms} ->
-              release_claim(opts.payment_identifier_cache, verified.payment_id)
-              release_binding(opts.payment_identifier_cache, verified.payment_id_binding)
+              release_claims(
+                opts.payment_identifier_cache,
+                verified.payment_id,
+                verified.payment_id_binding
+              )
 
               emit(:rate_limited, %{
                 method: verified.method,
@@ -1803,6 +1811,15 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
               {:error, {:rate_limited, retry_after_ms}}
           end
       end
+    catch
+      kind, reason ->
+        release_claims(
+          opts.payment_identifier_cache,
+          verified.payment_id,
+          verified.payment_id_binding
+        )
+
+        :erlang.raise(kind, reason, __STACKTRACE__)
     end
 
     @spec settle_after_resource(Plug.Conn.t(), settlement_context()) :: Plug.Conn.t()
@@ -1837,15 +1854,17 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec release_claims(settlement_context()) :: :ok
     defp release_claims(settlement_context) do
-      release_claim(
+      release_claims(
         settlement_context.payment_identifier_cache,
-        settlement_context.payment_id
-      )
-
-      release_binding(
-        settlement_context.payment_identifier_cache,
+        settlement_context.payment_id,
         settlement_context.payment_id_binding
       )
+    end
+
+    @spec release_claims(Cache.adapter() | nil, String.t(), String.t() | nil) :: :ok
+    defp release_claims(cache, payment_id, binding) do
+      release_claim(cache, payment_id)
+      release_binding(cache, binding)
 
       :ok
     end
