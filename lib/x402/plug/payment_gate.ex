@@ -971,7 +971,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
       with {:ok, decoded} <- decode_siwx_header(header),
            {:ok, session} <-
-             authenticate_siwx(opts.siwx, decoded, resource_url(conn, request_path)) do
+             authenticate_siwx(opts.siwx, decoded, siwx_resource_key(conn, request_path)) do
         emit(
           :siwx_authenticated,
           Map.merge(metadata, %{address: session.address, chain_id: session.chain_id})
@@ -1249,7 +1249,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           :ok
 
         payer ->
-          resource = resource_url(conn, settlement_context.request_path)
+          resource = siwx_resource_key(conn, settlement_context.request_path)
 
           case SIWXServer.record_payment(siwx, payer, resource, settle_response.body) do
             :ok ->
@@ -2178,6 +2178,16 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec resource_url(Plug.Conn.t(), String.t()) :: String.t()
     defp resource_url(conn, _request_path), do: Plug.Conn.request_url(conn)
+
+    # Stable storage key for SIWX records and lookups. `Plug.Conn.request_url/1`
+    # varies with the query string and raw path encoding, so the same paid
+    # route would miss on a later proof that changed either. The canonical
+    # `request_path` (already decoded and used for route matching) drops
+    # both, keeping the key aligned with the route the gate actually served.
+    @spec siwx_resource_key(Plug.Conn.t(), String.t()) :: String.t()
+    defp siwx_resource_key(%Plug.Conn{scheme: scheme, host: host}, request_path) do
+      "#{scheme}://#{host}#{request_path}"
+    end
 
     @spec payment_error_response(
             Plug.Conn.t(),

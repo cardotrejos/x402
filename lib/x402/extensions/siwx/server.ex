@@ -370,7 +370,7 @@ defmodule X402.Extensions.SIWX.Server do
           {:ok, Storage.access_record()} | {:error, :not_authorized}
   def authorized(%{storage: storage}, address, resource)
       when is_binary(address) and is_binary(resource) do
-    case storage_get(storage, address, resource) do
+    case storage_get(storage, normalize_address(address), resource) do
       {:ok, record} -> {:ok, record}
       {:error, :not_found} -> {:error, :not_authorized}
     end
@@ -387,7 +387,7 @@ defmodule X402.Extensions.SIWX.Server do
   @spec record_payment(t(), String.t(), String.t(), term()) :: :ok | {:error, term()}
   def record_payment(%{storage: storage, ttl_ms: ttl_ms}, address, resource, payment_proof)
       when is_binary(address) and is_binary(resource) do
-    storage_put(storage, address, resource, payment_proof, ttl_ms)
+    storage_put(storage, normalize_address(address), resource, payment_proof, ttl_ms)
   end
 
   @doc since: "0.7.0"
@@ -397,8 +397,17 @@ defmodule X402.Extensions.SIWX.Server do
   @spec revoke(t(), String.t(), String.t()) :: :ok
   def revoke(%{storage: storage}, address, resource)
       when is_binary(address) and is_binary(resource) do
-    storage_delete(storage, address, resource)
+    storage_delete(storage, normalize_address(address), resource)
   end
+
+  # EVM addresses are case-insensitive (EIP-55 checksums are display-only),
+  # so the same wallet can present as either lowercase or checksummed
+  # depending on the source (facilitator settle response, browser wallet,
+  # LocalKey). Storage keys must fold those variants together; Solana
+  # base58 addresses are case-sensitive and pass through untouched.
+  @spec normalize_address(String.t()) :: String.t()
+  defp normalize_address("0x" <> _rest = address), do: String.downcase(address)
+  defp normalize_address(address), do: address
 
   @spec storage_get(storage(), String.t(), String.t()) ::
           {:ok, Storage.access_record()} | {:error, :not_found}
