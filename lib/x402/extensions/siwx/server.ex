@@ -49,6 +49,9 @@ defmodule X402.Extensions.SIWX.Server do
   process) is used unless `:storage` is set. Pass `{module, server}` to
   address a specific storage process; the module must then expose the
   server-taking `get/3`, `put/5`, and `delete/3` like `ETSStorage` does.
+  EVM addresses are lowercased for storage and lookup; case-sensitive
+  addresses such as Solana public keys are left unchanged. Verified
+  identities retain the address spelling from the proof.
   """
 
   alias X402.Extensions.PaymentIdentifier.Cache
@@ -59,6 +62,7 @@ defmodule X402.Extensions.SIWX.Server do
   alias X402.Extensions.SIWX.Storage
   alias X402.Extensions.SIWX.Verification
   alias X402.Extensions.SIWX.Verifier
+  alias X402.Wallet
 
   @default_ttl_ms 24 * 60 * 60 * 1000
 
@@ -370,7 +374,7 @@ defmodule X402.Extensions.SIWX.Server do
           {:ok, Storage.access_record()} | {:error, :not_authorized}
   def authorized(%{storage: storage}, address, resource)
       when is_binary(address) and is_binary(resource) do
-    case storage_get(storage, address, resource) do
+    case storage_get(storage, normalize_address(address), resource) do
       {:ok, record} -> {:ok, record}
       {:error, :not_found} -> {:error, :not_authorized}
     end
@@ -387,7 +391,7 @@ defmodule X402.Extensions.SIWX.Server do
   @spec record_payment(t(), String.t(), String.t(), term()) :: :ok | {:error, term()}
   def record_payment(%{storage: storage, ttl_ms: ttl_ms}, address, resource, payment_proof)
       when is_binary(address) and is_binary(resource) do
-    storage_put(storage, address, resource, payment_proof, ttl_ms)
+    storage_put(storage, normalize_address(address), resource, payment_proof, ttl_ms)
   end
 
   @doc since: "0.7.0"
@@ -397,7 +401,12 @@ defmodule X402.Extensions.SIWX.Server do
   @spec revoke(t(), String.t(), String.t()) :: :ok
   def revoke(%{storage: storage}, address, resource)
       when is_binary(address) and is_binary(resource) do
-    storage_delete(storage, address, resource)
+    storage_delete(storage, normalize_address(address), resource)
+  end
+
+  @spec normalize_address(String.t()) :: String.t()
+  defp normalize_address(address) do
+    if Wallet.valid_evm?(address), do: String.downcase(address), else: address
   end
 
   @spec storage_get(storage(), String.t(), String.t()) ::

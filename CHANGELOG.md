@@ -41,12 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which address paid for which resource after settlement, and
   `authenticate/3` combines verification with that history
   (`{:error, :not_authorized}` when the wallet has not paid). Usable from
-  any framework
+  any framework. EVM addresses are case-insensitive for payment records,
+  lookup and revocation; Solana public keys retain their case
 - **`X402.Plug.PaymentGate` `:siwx` option** (a keyword list of
   `X402.Extensions.SIWX.Server.new/1` options): every 402 advertises a
   fresh challenge (exempt from the extension echo check because it changes
   per response); a request carrying `SIGN-IN-WITH-X` is authenticated
-  against the resource URL the gate advertises — a previously paying
+  against the HTTP method and full resource URL — a previously paying
   address runs the handler without payment, with `:x402_siwx_address` and
   `:x402_siwx_chain_id` assigned and `[:x402, :plug, :siwx_authenticated]`
   emitted; an address with no record falls through to the normal payment

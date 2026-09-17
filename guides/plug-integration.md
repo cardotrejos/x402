@@ -428,9 +428,9 @@ The flow:
    other extensions).
 2. A client signs the challenge (`X402.Extensions.SIWX.sign/3`) and sends
    the proof in a `SIGN-IN-WITH-X` header. The gate verifies it with
-   `X402.Extensions.SIWX.Server.authenticate/3` against the resource URL
-   it advertises.
-3. If the address has a payment record for that URL, the handler runs
+   `X402.Extensions.SIWX.Server.authenticate/3` against the HTTP method
+   and full resource URL.
+3. If the address has a payment record for that request, the handler runs
    without payment; `:x402_siwx_address` and `:x402_siwx_chain_id` are
    assigned and `[:x402, :plug, :siwx_authenticated]` is emitted. If it
    has none, the request continues through the normal payment flow when it
@@ -438,8 +438,20 @@ The flow:
    and otherwise receives 402 with a fresh challenge.
 4. After a successful settlement the payer (the settle response's `payer`,
    falling back to the authorization's `from`) is recorded for the
-   resource URL through `:storage` for `:ttl_ms` — from then on that
+   method and resource URL through `:storage` for `:ttl_ms` — from then on that
    address can sign in instead of paying, until the record expires.
+
+Storage keys use `"METHOD URL"`, for example
+`"GET https://api.example.com/api/resource?item=1"`. Method, origin, port,
+raw path and query remain distinct authorization boundaries, even on an
+`:any` route. Do not strip query parameters or merge hosts: they may select
+different tenants or differently priced resources. Configure trusted proxy
+URL rewriting before the gate. Old URL-only records are not accepted as
+method-scoped grants; manually provisioning a grant must use its intended
+method and full URL.
+
+EVM payer addresses are normalized to lowercase for records, lookups and
+revocation. Solana addresses remain case-sensitive.
 
 Error responses:
 

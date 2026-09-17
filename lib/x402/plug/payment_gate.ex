@@ -77,9 +77,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       Because it changes per response it is exempt from the extension echo
       check.
     * A request carrying a `SIGN-IN-WITH-X` header is verified by
-      `X402.Extensions.SIWX.Server.authenticate/3` against the resource URL
-      the gate advertises. When the address has a payment record for that
-      URL the handler runs without payment, `:x402_siwx_address` and
+      `X402.Extensions.SIWX.Server.authenticate/3` against the HTTP method
+      and full resource URL. When the address has a payment record for that
+      request the handler runs without payment, `:x402_siwx_address` and
       `:x402_siwx_chain_id` are assigned, and
       `[:x402, :plug, :siwx_authenticated]` is emitted. When it has none,
       the request proceeds through the normal payment flow if it also
@@ -90,7 +90,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       **400** `invalid_siwx_header`.
     * After a successful settlement the payer (the settle response's
       `payer`, falling back to the authorization's `from`) is recorded for
-      the resource URL through the configured `:storage`, for `:ttl_ms`.
+      the method and resource URL through the configured `:storage`, for `:ttl_ms`.
+
+    Access keys have the form `"GET https://api.example.com/resource?item=1"`.
+    The full URL, including origin, port, raw path and query, remains part
+    of the key: those fields can identify different paid resources. A GET
+    payment never grants POST access, even when both match an `:any` route.
+    Configure trusted proxy URL rewriting before this gate. Old URL-only
+    records are not accepted as method-scoped grants.
 
     The deprecated pre-0.7.0 `{message, signature}` header format is still
     accepted; each one emits `[:x402, :siwx, :legacy]` and the first logs a
@@ -631,6 +638,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             route: compiled_route(),
             request_method: atom(),
             request_path: String.t(),
+            siwx_resource: String.t(),
             siwx: SIWXServer.t() | nil
           }
 
@@ -971,7 +979,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
       with {:ok, decoded} <- decode_siwx_header(header),
            {:ok, session} <-
-             authenticate_siwx(opts.siwx, decoded, resource_url(conn, request_path)) do
+             authenticate_siwx(opts.siwx, decoded, siwx_resource_key(conn)) do
         emit(
           :siwx_authenticated,
           Map.merge(metadata, %{address: session.address, chain_id: session.chain_id})
@@ -1091,6 +1099,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           route: route,
           request_method: request_method,
           request_path: request_path,
+          siwx_resource: siwx_resource_key(conn),
           siwx: opts.siwx
         }
 
@@ -1243,13 +1252,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec record_siwx_payment(Plug.Conn.t(), map(), settlement_context()) :: :ok
     defp record_siwx_payment(_conn, _settle_response, %{siwx: nil}), do: :ok
 
-    defp record_siwx_payment(conn, settle_response, %{siwx: siwx} = settlement_context) do
+    defp record_siwx_payment(_conn, settle_response, %{siwx: siwx} = settlement_context) do
       case settlement_payer(settle_response, settlement_context.payment_payload) do
         nil ->
           :ok
 
         payer ->
-          resource = resource_url(conn, settlement_context.request_path)
+          resource = settlement_context.siwx_resource
 
           case SIWXServer.record_payment(siwx, payer, resource, settle_response.body) do
             :ok ->
@@ -2178,6 +2187,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec resource_url(Plug.Conn.t(), String.t()) :: String.t()
     defp resource_url(conn, _request_path), do: Plug.Conn.request_url(conn)
+
+    @spec siwx_resource_key(Plug.Conn.t()) :: String.t()
+    defp siwx_resource_key(conn), do: conn.method <> " " <> Plug.Conn.request_url(conn)
 
     @spec payment_error_response(
             Plug.Conn.t(),
