@@ -38,6 +38,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     - **402** — payment required, no matching requirements, or payment failed
     - **400** — malformed / invalid payment payload (including wrong `x402Version`)
     - **409** — a `payment-identifier` id reused for a different request
+    - **429** — the payer exceeded the configured `:rate_limit` (with `Retry-After`)
     - **500** — facilitator transport failures or malformed facilitator responses
 
     See the official
@@ -309,6 +310,51 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     > you deploy more than one node, configure a shared-store adapter instead —
     > see the "Writing a distributed adapter" section in
     > `X402.Extensions.PaymentIdentifier.Cache` for a Redis sketch.
+
+    ## Rate limiting
+
+    With `:rate_limit` configured, each *verified* payment counts one hit
+    against its payer before settlement, bounding how many payments a wallet
+    can spend on the gated routes per window:
+
+        plug X402.Plug.PaymentGate,
+          routes: [...],
+          rate_limit: [limit: 60, window_ms: 60_000]
+
+    | Option       | Default                 | Meaning                                                        |
+    | ------------ | ----------------------- | -------------------------------------------------------------- |
+    | `:limit`     | required                | Hits allowed per window                                        |
+    | `:window_ms` | required                | Window length in milliseconds                                  |
+    | `:key`       | `:payer`                | `:payer`, `:ip`, or a 1-arity function of the request context  |
+    | `:store`     | `X402.RateLimiter.ETS`  | `X402.RateLimiter` module or `{module, ref}`                   |
+    | `:on_error`  | `:allow`                | `:allow` or `:deny` when the store fails                       |
+
+    The limiter runs after verification (local and facilitator) succeeded
+    and before the resource handler and settlement. The payer of an
+    unverified payload is whatever the sender typed, so counting it
+    earlier would let anyone exhaust a victim wallet's allowance with
+    forged proofs; enforcing after verification means only proofs the
+    wallet actually signed count against it. The trade-off is that
+    over-limit requests still cost a verify round-trip — pair the gate
+    with an edge/IP limiter to shed unauthenticated floods. A denied
+    payment is never settled and its replay claim is released, so the
+    same proof can be retried once the window rolls over.
+
+    `:payer` keys on the payer the facilitator reported (`payer` in the
+    verify response) or, failing that, the `authorization.from` /
+    `permit2Authorization.from` of the verified payload (lower-cased for
+    EVM addresses), and falls back to the remote IP when neither names
+    one; a `:key` function receives
+    `%{conn: conn, payer: payer, payment_payload: payload, requirements: requirements}`
+    and may return `nil` to exempt the request. Allowed requests get an
+    `:x402_rate_limit` assign (`%{key: key, remaining: n, limit: limit,
+    window_ms: window_ms}`); denied requests answer **429** with the usual
+    `PAYMENT-REQUIRED` header (error `rate_limited`), a `Retry-After`
+    header in whole seconds (rounded up), and emit
+    `[:x402, :plug, :rate_limited]` with `:payer`, `:key`, `:retry_after_ms`,
+    `:limit`, `:window_ms`, and the route metadata. The default
+    `X402.RateLimiter.ETS` store is per-node; see `X402.RateLimiter` for
+    shared stores.
     """
 
     @behaviour Plug
@@ -332,6 +378,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     alias X402.PaymentResponse
     alias X402.PaymentSignature
     alias X402.Paywall
+    alias X402.RateLimiter
     alias X402.RPC
     alias X402.Scheme
     alias X402.Solana
@@ -734,6 +781,22 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         merged over each route's static `:extensions` map — see "Extension
         adapters" above.
         """
+      ],
+      rate_limit: [
+        type: {:custom, RateLimiter, :validate_options, []},
+        default: nil,
+        doc: """
+        Optional per-wallet rate limit, a keyword list of `X402.RateLimiter`
+        options: `:limit` and `:window_ms` (both required), `:key`
+        (`:payer` — default — `:ip`, or a 1-arity function of the request
+        context), `:store` (an `X402.RateLimiter` module or `{module, ref}`,
+        default `X402.RateLimiter.ETS`), and `:on_error`. The limit is
+        applied to verified payments only — after the facilitator verify
+        round-trip and before settlement — so a forged payer cannot burn a
+        victim's allowance; a denied request answers **429** with a
+        `Retry-After` header and is never settled — see "Rate limiting"
+        above.
+        """
       ]
     ]
 
@@ -752,7 +815,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             local_verification: keyword() | nil,
             paywall: module() | nil,
             siwx: SIWXServer.t() | nil,
-            extensions: [Extension.spec()]
+            extensions: [Extension.spec()],
+            rate_limit: RateLimiter.config() | nil
           }
 
     @typedoc "A route value that is either static or computed from the request."
@@ -1083,7 +1147,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         local_verification: Keyword.fetch!(validated_opts, :local_verification),
         paywall: Keyword.fetch!(validated_opts, :paywall),
         siwx: Keyword.fetch!(validated_opts, :siwx),
-        extensions: Keyword.fetch!(validated_opts, :extensions)
+        extensions: Keyword.fetch!(validated_opts, :extensions),
+        rate_limit: Keyword.fetch!(validated_opts, :rate_limit)
       }
     end
 
@@ -1607,7 +1672,17 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
                })
              ),
            {:ok, verify_response} <-
-             claim_and_verify_bound(opts, payment_id, binding, payment_payload, requirements) do
+             claim_and_verify_bound(opts, payment_id, binding, payment_payload, requirements),
+           {:ok, conn} <-
+             enforce_rate_limit(conn, opts, route, %{
+               method: request_method,
+               path: request_path,
+               payment_id: payment_id,
+               payment_id_binding: binding,
+               payment_payload: payment_payload,
+               requirements: requirements,
+               verify_response: verify_response
+             }) do
         Extension.after_verify_all(
           opts.extensions,
           payment_payload,
@@ -1641,6 +1716,20 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           settle_after_resource(response_conn, settlement_context)
         end)
       else
+        # A rate-limited request already emitted [:x402, :plug, :rate_limited];
+        # it is not a payment rejection.
+        {:error, {:rate_limited, _retry_after_ms} = reason} ->
+          payment_error_response(
+            conn,
+            route,
+            request_path,
+            rejection_error(reason),
+            status: status_for_reason(reason),
+            reason: reason,
+            paywall: opts.paywall,
+            siwx: opts.siwx
+          )
+
         {:error, reason} ->
           emit(:payment_rejected, %{
             method: request_method,
@@ -1659,6 +1748,60 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             paywall: opts.paywall,
             siwx: opts.siwx
           )
+      end
+    end
+
+    # Runs only after verification succeeded: the payer of an unverified
+    # payload is attacker-controlled, so counting it earlier would let a
+    # forged proof exhaust a victim wallet's allowance. A denied payment is
+    # never settled, so its replay claim and payment-id binding are released
+    # for the payer to retry after the window.
+    @spec enforce_rate_limit(Plug.Conn.t(), options(), compiled_route(), map()) ::
+            {:ok, Plug.Conn.t()} | {:error, {:rate_limited, pos_integer()}}
+    defp enforce_rate_limit(conn, %{rate_limit: nil}, _route, _verified), do: {:ok, conn}
+
+    defp enforce_rate_limit(conn, %{rate_limit: config} = opts, route, verified) do
+      payer = RateLimiter.payer(verified.payment_payload, verified.verify_response)
+
+      context = %{
+        conn: conn,
+        payer: payer,
+        payment_payload: verified.payment_payload,
+        requirements: verified.requirements
+      }
+
+      case RateLimiter.resolve_key(config, context) do
+        :skip ->
+          {:ok, conn}
+
+        key ->
+          case RateLimiter.check(config, key) do
+            {:allow, remaining} ->
+              {:ok,
+               assign(conn, :x402_rate_limit, %{
+                 key: key,
+                 remaining: remaining,
+                 limit: config.limit,
+                 window_ms: config.window_ms
+               })}
+
+            {:deny, retry_after_ms} ->
+              release_claim(opts.payment_identifier_cache, verified.payment_id)
+              release_binding(opts.payment_identifier_cache, verified.payment_id_binding)
+
+              emit(:rate_limited, %{
+                method: verified.method,
+                path: verified.path,
+                route: route.path,
+                payer: payer,
+                key: key,
+                retry_after_ms: retry_after_ms,
+                limit: config.limit,
+                window_ms: config.window_ms
+              })
+
+              {:error, {:rate_limited, retry_after_ms}}
+          end
       end
     end
 
@@ -2937,6 +3080,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
            {:ok, response_conn} <- maybe_put_payment_response_header(conn, reason) do
         response_conn
         |> put_resp_header("payment-required", encoded_required)
+        |> maybe_put_retry_after(reason)
         |> delete_resp_header("content-length")
         |> put_payment_error_body(status, required_payload, request_path, paywall)
       else
@@ -3078,6 +3222,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    @spec maybe_put_retry_after(Plug.Conn.t(), term()) :: Plug.Conn.t()
+    defp maybe_put_retry_after(conn, {:rate_limited, retry_after_ms}) do
+      seconds = RateLimiter.retry_after_seconds(retry_after_ms)
+      put_resp_header(conn, "retry-after", Integer.to_string(seconds))
+    end
+
+    defp maybe_put_retry_after(conn, _reason), do: conn
+
     @spec internal_error_conn(Plug.Conn.t()) :: Plug.Conn.t()
     defp internal_error_conn(conn) do
       conn
@@ -3112,9 +3264,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp payment_response_from_reason(_reason), do: nil
 
-    @spec status_for_reason(term()) :: 400 | 402 | 409 | 500
+    @spec status_for_reason(term()) :: 400 | 402 | 409 | 429 | 500
     defp status_for_reason(reason) when reason in @invalid_request_reasons, do: 400
     defp status_for_reason(:payment_identifier_conflict), do: 409
+    defp status_for_reason({:rate_limited, _retry_after_ms}), do: 429
     defp status_for_reason({:unsupported_x402_version, _version}), do: 400
     defp status_for_reason({:missing_fields, _fields}), do: 400
     defp status_for_reason({:precheck_failed, _reason}), do: 402
@@ -3239,6 +3392,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error(:invalid_payment_identifier), do: "invalid_payload"
     defp rejection_error(:payment_identifier_required), do: "payment_identifier_required"
     defp rejection_error(:payment_identifier_conflict), do: "payment_identifier_conflict"
+    defp rejection_error({:rate_limited, _retry_after_ms}), do: "rate_limited"
 
     defp rejection_error({:verification_failed, _reason}), do: "facilitator rejected payment"
     defp rejection_error({:settlement_failed, _reason}), do: "facilitator rejected payment"
@@ -3263,7 +3417,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             | :payment_required
             | :payment_verified
             | :payment_rejected
-            | :siwx_authenticated,
+            | :siwx_authenticated
+            | :rate_limited,
             map()
           ) :: :ok
     defp emit(event, metadata) do
