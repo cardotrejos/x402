@@ -425,6 +425,54 @@ A `before_*` `{:halt, reason}` becomes a rejected wire response (not an
 exception), and `on_*_failure` may `{:recover, result}` with a
 replacement response.
 
+## Extension responses sidechannel
+
+x402 v2 (§7.2.1) lets a facilitator report per-extension processing
+outcomes separately from the `VerifyResponse` / `SettleResponse` body, so
+a resource server can act on them without ever relaying them to the buyer.
+On HTTP that sidechannel is the `EXTENSION-RESPONSES` header: Base64 JSON
+keyed by extension name, for example `{"bazaar": {"status": "success"}}`.
+`X402.ExtensionResponses` encodes and decodes it.
+
+**Serving it.** An engine's `verify/3` or `settle/3` may return a
+three-element tuple, and `X402.Plug.Facilitator` emits the header (the
+JSON body is unchanged):
+
+```elixir
+def settle(%__MODULE__{} = engine, payload, requirements) do
+  with {:ok, response} <- do_settle(engine, payload, requirements) do
+    {:ok, response, %{"bazaar" => %{"status" => "success"}}}
+  end
+end
+```
+
+The two-element `{:ok, response}` form still works and sends no header —
+the bundled EVM and SVM engines use it. A map the plug cannot encode is
+logged and dropped rather than turning a valid verdict into a 500; `nil`
+or `%{}` sends nothing.
+
+**Consuming it.** `X402.Facilitator.verify/2` and `settle/2` results carry
+the decoded sidechannel as `:extension_responses` next to `:status`,
+`:body`, and the response `:headers`:
+
+```elixir
+{:ok, %{status: 200, body: %{"success" => true}, extension_responses: responses}} =
+  X402.Facilitator.settle(MyApp.Facilitator, payload, requirements)
+
+responses
+#=> %{"bazaar" => %{"status" => "success"}} — or nil when none was sent
+```
+
+Hooks on the *client* side of the facilitator (`X402.Hooks` modules passed
+to `X402.Facilitator`) see the same map in `context.result` of
+`after_verify/2` and `after_settle/2`. A malformed header never fails the
+operation: it decodes to `nil` and emits
+`[:x402, :extension_responses, :decode]` with `status: :error`.
+`X402.Plug.PaymentGate` assigns the verify-time outcomes as
+`:x402_extension_responses` and attaches the settle-time ones to its
+`[:x402, :plug, :payment_verified]` telemetry — see the
+[Plug/Phoenix Integration](plug-integration.html) guide.
+
 ## Production notes
 
 * **Authentication** — the scaffold's `:auth_token` is a minimal bearer

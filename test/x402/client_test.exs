@@ -94,6 +94,24 @@ defmodule X402.ClientTest do
       assert Client.select_requirements([@evm_requirements]) == {:ok, @evm_requirements}
     end
 
+    test "skips entries whose paymentFlow is not recognized" do
+      upfront = put_in(@evm_requirements, ["extra", "paymentFlow"], "upfront")
+      escrow = put_in(@evm_requirements, ["extra", "paymentFlow"], "escrow")
+      bogus = put_in(@evm_requirements, ["extra", "paymentFlow"], 42)
+      payment_required = %{"accepts" => [upfront, escrow, bogus, @evm_requirements]}
+
+      assert Client.select_requirements(payment_required) == {:ok, @evm_requirements}
+
+      assert Client.select_requirements([upfront, escrow]) ==
+               {:error, :no_acceptable_requirements}
+    end
+
+    test "accepts an explicit authorization paymentFlow" do
+      explicit = put_in(@evm_requirements, ["extra", "paymentFlow"], "authorization")
+
+      assert Client.select_requirements([explicit]) == {:ok, explicit}
+    end
+
     test "filters by exact and wildcard network" do
       base = Map.put(@evm_requirements, "network", "eip155:8453")
       testnet = @evm_requirements
@@ -438,6 +456,33 @@ defmodule X402.ClientTest do
                )
 
       assert payload["extensions"] == %{}
+    end
+
+    test "produces a spec-format payment-identifier echo end to end" do
+      alias X402.Extensions.PaymentIdentifier
+
+      advertised = %{"payment-identifier" => PaymentIdentifier.extension(required: true)}
+      payment_required = Map.put(@payment_required, "extensions", advertised)
+
+      assert {:ok, payload} =
+               Client.build_payment(payment_required, signer(),
+                 extensions: [PaymentIdentifier.enricher()]
+               )
+
+      declaration = payload["extensions"]["payment-identifier"]
+      assert declaration["schema"] == PaymentIdentifier.schema()
+      assert declaration["info"]["required"] == true
+      assert {:ok, {:spec, id}} = PaymentIdentifier.extract_id(payload["extensions"])
+      assert declaration["info"]["id"] == id
+      assert PaymentRequirements.extensions_match?(advertised, payload["extensions"])
+
+      # Not advertised: the payload is untouched.
+      assert {:ok, plain} =
+               Client.build_payment(@payment_required, signer(),
+                 extensions: [PaymentIdentifier.enricher()]
+               )
+
+      assert plain["extensions"] == %{}
     end
   end
 

@@ -2719,6 +2719,90 @@ defmodule X402.Plug.PaymentGateTest do
   # Payment identifier extension surfacing
   # ---------------------------------------------------------------------------
 
+  describe "extension responses sidechannel" do
+    test "assigns verify-time outcomes and tags settle telemetry without forwarding them" do
+      {:ok, verify_header} =
+        X402.ExtensionResponses.encode(%{"bazaar" => %{"status" => "processing"}})
+
+      {:ok, settle_header} =
+        X402.ExtensionResponses.encode(%{"bazaar" => %{"status" => "success"}})
+
+      {:ok, %{body: settle_body}} = @default_settle
+      bypass = Bypass.open()
+
+      Bypass.stub(bypass, "POST", "/verify", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("extension-responses", verify_header)
+        |> Plug.Conn.resp(200, Jason.encode!(%{"isValid" => true, "payer" => "0xpayer"}))
+      end)
+
+      Bypass.stub(bypass, "POST", "/settle", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("extension-responses", settle_header)
+        |> Plug.Conn.resp(200, Jason.encode!(settle_body))
+      end)
+
+      facilitator = start_facilitator(url: "http://localhost:#{bypass.port}")
+      handler_id = "extension-responses-#{System.unique_integer([:positive, :monotonic])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :plug, :payment_verified],
+          fn _event, _measurements, metadata, _config ->
+            send(parent, {:verified_metadata, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_extension_responses] == %{"bazaar" => %{"status" => "processing"}}
+
+      assert_receive {:verified_metadata,
+                      %{extension_responses: %{"bazaar" => %{"status" => "success"}}}}
+
+      assert decode_payment_response!(conn) == settle_body
+      assert get_resp_header(conn, "extension-responses") == []
+    end
+
+    test "leaves the assign unset when the facilitator sends no sidechannel" do
+      facilitator = start_mock_facilitator()
+      handler_id = "extension-responses-#{System.unique_integer([:positive, :monotonic])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :plug, :payment_verified],
+          fn _event, _measurements, metadata, _config ->
+            send(parent, {:verified_metadata, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      refute Map.has_key?(conn.assigns, :x402_extension_responses)
+
+      assert_receive {:verified_metadata, metadata}
+      refute Map.has_key?(metadata, :extension_responses)
+    end
+  end
+
   describe "payment identifier extension" do
     test "assigns x402_payment_id and tags telemetry for a well-formed extension" do
       facilitator = start_mock_facilitator()
@@ -2737,7 +2821,7 @@ defmodule X402.Plug.PaymentGateTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      {:ok, encoded} = PaymentIdentifier.encode("pay-123")
+      encoded = Base.encode64(Jason.encode!(%{"paymentId" => "pay-123"}))
 
       header =
         valid_payment_payload()
@@ -2804,7 +2888,7 @@ defmodule X402.Plug.PaymentGateTest do
 
     test "accepts the info-wrapped Base64 string form of the extension" do
       facilitator = start_mock_facilitator()
-      {:ok, encoded} = PaymentIdentifier.encode("pay-env-2")
+      encoded = Base.encode64(Jason.encode!(%{"paymentId" => "pay-env-2"}))
 
       header =
         valid_payment_payload()
@@ -2883,6 +2967,532 @@ defmodule X402.Plug.PaymentGateTest do
 
       assert conn.status == 200
       refute Map.has_key?(conn.assigns, :x402_payment_id)
+    end
+
+    test "legacy ids emit the deprecation telemetry event" do
+      facilitator = start_mock_facilitator()
+      handler_id = "legacy-id-#{System.unique_integer([:positive, :monotonic])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :payment_identifier, :legacy],
+          fn _event, measurements, metadata, _config ->
+            send(parent, {:legacy_event, measurements, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      header =
+        valid_payment_payload()
+        |> Map.put("extensions", %{"paymentIdentifier" => %{"paymentId" => "pay-legacy"}})
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_payment_id] == "pay-legacy"
+      assert_receive {:legacy_event, %{count: 1}, %{source: :gate}}
+    end
+
+    test "legacy ids are bound to the request fingerprint when a cache is configured" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      route = Map.put(@route, :path, "/api/*")
+
+      first =
+        conn(:get, "/api/one")
+        |> put_req_header("payment-signature", spec_id_header("pay-legacy", legacy: true))
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert first.status == 200
+
+      second =
+        conn(:get, "/api/two")
+        |> put_req_header(
+          "payment-signature",
+          spec_id_header("pay-legacy", legacy: true, nonce: "0x02")
+        )
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert second.status == 409
+      assert decode_payment_required!(second)["error"] == "payment_identifier_conflict"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # payment-identifier extension (spec format)
+  # ---------------------------------------------------------------------------
+
+  describe "payment-identifier extension" do
+    @spec_id "abcdefghijklmnopqrstuvwxyz012345"
+    @advertised %{"payment-identifier" => PaymentIdentifier.extension(required: false)}
+    @advertised_required %{"payment-identifier" => PaymentIdentifier.extension(required: true)}
+
+    test "assigns x402_payment_id and tags telemetry for a spec-format id" do
+      facilitator = start_mock_facilitator()
+      handler_id = "spec-id-#{System.unique_integer([:positive, :monotonic])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach_many(
+          handler_id,
+          [[:x402, :plug, :payment_verified], [:x402, :payment_identifier, :legacy]],
+          fn event, _measurements, metadata, _config ->
+            send(parent, {:event, event, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      route = Map.put(@route, :extensions, @advertised)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> run_request(routes: [route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_payment_id] == @spec_id
+      assert_receive {:event, [:x402, :plug, :payment_verified], %{payment_id: @spec_id}}
+      refute_received {:event, [:x402, :payment_identifier, :legacy], _metadata}
+
+      # The client echo (with the added info.id) is forwarded to the facilitator.
+      assert_receive {:verify_called, payload, _requirements}
+      assert payload["extensions"]["payment-identifier"]["info"]["id"] == @spec_id
+    end
+
+    test "accepts a spec-format id on a route that does not advertise the extension" do
+      facilitator = start_mock_facilitator()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_payment_id] == @spec_id
+    end
+
+    test "advertises the extension in PAYMENT-REQUIRED" do
+      route = Map.put(@route, :extensions, @advertised_required)
+
+      required =
+        conn(:get, "/api/resource")
+        |> run_request(routes: [route], facilitator: self())
+        |> decode_payment_required!()
+
+      assert required["extensions"] == @advertised_required
+    end
+
+    test "rejects a missing id with 400 when the route requires one" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :extensions, @advertised_required)
+
+      # No extensions at all, and the advertisement echoed without an id.
+      for extensions <- [%{}, @advertised_required] do
+        conn =
+          conn(:get, "/api/resource")
+          |> put_req_header(
+            "payment-signature",
+            valid_payment_payload() |> Map.put("extensions", extensions) |> encode_header()
+          )
+          |> run_request(routes: [route], facilitator: facilitator)
+
+        assert conn.status == 400
+        assert decode_payment_required!(conn)["error"] == "payment_identifier_required"
+      end
+
+      refute_received {:verify_called, _, _}
+    end
+
+    test "a legacy id satisfies a required advertisement" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :extensions, @advertised_required)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header("pay-legacy", legacy: true))
+        |> run_request(routes: [route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_payment_id] == "pay-legacy"
+    end
+
+    test "a missing id is fine when the advertisement is optional" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :extensions, @advertised)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header(
+          "payment-signature",
+          valid_payment_payload() |> Map.put("extensions", @advertised) |> encode_header()
+        )
+        |> run_request(routes: [route], facilitator: facilitator)
+
+      assert conn.status == 200
+      refute Map.has_key?(conn.assigns, :x402_payment_id)
+    end
+
+    test "rejects malformed spec ids with 400 invalid_payload before any facilitator call" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :extensions, @advertised)
+
+      for invalid <- [
+            String.duplicate("a", 15),
+            String.duplicate("a", 129),
+            "has spaces in the id",
+            "abcdefghijklmnop!",
+            "",
+            42
+          ] do
+        conn =
+          conn(:get, "/api/resource")
+          |> put_req_header("payment-signature", spec_id_header(invalid))
+          |> run_request(routes: [route], facilitator: facilitator)
+
+        assert conn.status == 400
+        assert decode_payment_required!(conn)["error"] == "invalid_payload"
+      end
+
+      refute_received {:verify_called, _, _}
+    end
+
+    test "rejects a reused id with a different request fingerprint with 409" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      route = @route |> Map.put(:path, "/api/*") |> Map.put(:extensions, @advertised)
+
+      first =
+        conn(:get, "/api/one")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert first.status == 200
+      assert_receive {:verify_called, _, _}
+      assert_receive {:settle_called, _, _}
+
+      # A different path — with a different signed nonce so the replay key
+      # cannot be what rejects it — is a different request.
+      second =
+        conn(:get, "/api/two")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id, nonce: "0x02"))
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert second.status == 409
+      assert decode_payment_required!(second)["error"] == "payment_identifier_conflict"
+      assert get_resp_header(second, "payment-required") != []
+      refute_received {:verify_called, _, _}
+      refute_received {:settle_called, _, _}
+    end
+
+    test "the same id with the same fingerprint proceeds normally" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      route = Map.put(@route, :extensions, @advertised)
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert first.status == 200
+
+      second =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id, nonce: "0x02"))
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert second.status == 200
+      assert second.assigns[:x402_payment_id] == @spec_id
+      assert_receive {:settle_called, _, _}
+      assert_receive {:settle_called, _, _}
+    end
+
+    test "the same id with the same fingerprint and the same proof is still a replay" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      route = Map.put(@route, :extensions, @advertised)
+      header = spec_id_header(@spec_id)
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert first.status == 200
+
+      second =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert second.status == 402
+      assert decode_payment_required!(second)["error"] == "payment already processed"
+    end
+
+    test "releases the binding when the protected handler fails" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      route = @route |> Map.put(:path, "/api/*") |> Map.put(:extensions, @advertised)
+
+      failed =
+        conn(:get, "/api/one")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> gate_request(
+          routes: [route],
+          facilitator: facilitator,
+          payment_identifier_cache: cache
+        )
+        |> Plug.Conn.send_resp(500, "handler failed")
+
+      assert failed.status == 500
+
+      # The id may now be reused for a different request.
+      retry =
+        conn(:get, "/api/two")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id, nonce: "0x02"))
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert retry.status == 200
+      assert retry.assigns[:x402_payment_id] == @spec_id
+    end
+
+    test "releases the binding when settlement fails" do
+      facilitator =
+        start_mock_facilitator(
+          settle:
+            {:ok,
+             %{
+               status: 200,
+               body: %{
+                 "success" => false,
+                 "errorReason" => "insufficient_funds",
+                 "transaction" => "",
+                 "network" => @network
+               }
+             }}
+        )
+
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+      route = @route |> Map.put(:path, "/api/*") |> Map.put(:extensions, @advertised)
+
+      failed =
+        conn(:get, "/api/one")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      assert failed.status == 402
+
+      retry =
+        conn(:get, "/api/two")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id, nonce: "0x02"))
+        |> run_request(routes: [route], facilitator: facilitator, payment_identifier_cache: cache)
+
+      refute retry.status == 409
+    end
+
+    test "binds the id through the cache adapter and releases it when verification fails" do
+      facilitator =
+        start_mock_facilitator(
+          verify:
+            {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "declined"}}}
+        )
+
+      parent = self()
+      binding_key = "pid:" <> @spec_id
+
+      expect(CacheMock, :put_new, fn :mock_ref, ^binding_key, {:bound, fingerprint} ->
+        send(parent, {:bound, fingerprint})
+        :ok
+      end)
+
+      expect(CacheMock, :delete, fn :mock_ref, ^binding_key ->
+        send(parent, {:released, binding_key})
+        :ok
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> run_request(
+          routes: [Map.put(@route, :extensions, @advertised)],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+
+      assert conn.status == 402
+      assert_receive {:bound, fingerprint}
+
+      assert fingerprint ==
+               PaymentIdentifier.fingerprint(
+                 %{
+                   "scheme" => "exact",
+                   "network" => @network,
+                   "asset" => @asset,
+                   "amount" => @amount,
+                   "payTo" => @receiver
+                 },
+                 %{method: :get, path: "/api/resource"}
+               )
+
+      assert_receive {:released, ^binding_key}
+    end
+
+    test "does not release a binding another request owns" do
+      facilitator = start_mock_facilitator()
+      binding_key = "pid:" <> @spec_id
+
+      expect(CacheMock, :put_new, fn :mock_ref, ^binding_key, {:bound, _fingerprint} ->
+        {:error, :already_exists}
+      end)
+
+      expect(CacheMock, :get, fn :mock_ref, ^binding_key ->
+        {:hit,
+         {:bound,
+          PaymentIdentifier.fingerprint(
+            %{
+              "scheme" => "exact",
+              "network" => @network,
+              "asset" => @asset,
+              "amount" => @amount,
+              "payTo" => @receiver
+            },
+            %{method: :get, path: "/api/resource"}
+          )}}
+      end)
+
+      # Only the replay claim is taken and released; the "pid:" key is never
+      # deleted because this request did not create it.
+      expect(CacheMock, :put_new, fn :mock_ref, replay_key, :verified ->
+        refute String.starts_with?(replay_key, "pid:")
+        :ok
+      end)
+
+      expect(CacheMock, :delete, fn :mock_ref, replay_key ->
+        refute String.starts_with?(replay_key, "pid:")
+        :ok
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> gate_request(
+          routes: [Map.put(@route, :extensions, @advertised)],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+        |> Plug.Conn.send_resp(500, "handler failed")
+
+      assert conn.status == 500
+    end
+
+    test "a binding that expired between claim and read proceeds" do
+      facilitator = start_mock_facilitator()
+      binding_key = "pid:" <> @spec_id
+
+      expect(CacheMock, :put_new, fn :mock_ref, ^binding_key, {:bound, _fingerprint} ->
+        {:error, :already_exists}
+      end)
+
+      expect(CacheMock, :get, fn :mock_ref, ^binding_key -> :miss end)
+      expect(CacheMock, :put_new, fn :mock_ref, _replay_key, :verified -> :ok end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> run_request(
+          routes: [Map.put(@route, :extensions, @advertised)],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+
+      assert conn.status == 200
+    end
+
+    test "cache adapter failures while binding fail closed with 500" do
+      facilitator = start_mock_facilitator()
+      binding_key = "pid:" <> @spec_id
+
+      expect(CacheMock, :put_new, fn :mock_ref, ^binding_key, {:bound, _fingerprint} ->
+        {:error, :backend_unreachable}
+      end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> run_request(
+          routes: [Map.put(@route, :extensions, @advertised)],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+
+      assert conn.status == 500
+      refute_received {:verify_called, _, _}
+
+      expect(CacheMock, :put_new, fn :mock_ref, ^binding_key, {:bound, _fingerprint} ->
+        {:error, :already_exists}
+      end)
+
+      expect(CacheMock, :get, fn :mock_ref, ^binding_key -> {:error, :backend_unreachable} end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+        |> run_request(
+          routes: [Map.put(@route, :extensions, @advertised)],
+          facilitator: facilitator,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+
+      assert conn.status == 500
+    end
+
+    test "skips the fingerprint binding without a cache" do
+      facilitator = start_mock_facilitator()
+      route = @route |> Map.put(:path, "/api/*") |> Map.put(:extensions, @advertised)
+
+      for path <- ["/api/one", "/api/two"] do
+        conn =
+          conn(:get, path)
+          |> put_req_header("payment-signature", spec_id_header(@spec_id))
+          |> run_request(routes: [route], facilitator: facilitator)
+
+        assert conn.status == 200
+        assert conn.assigns[:x402_payment_id] == @spec_id
+      end
+    end
+
+    test "the client enricher produces an echo the gate accepts end to end" do
+      facilitator = start_mock_facilitator()
+      route = Map.put(@route, :extensions, @advertised_required)
+
+      payment_required =
+        conn(:get, "/api/resource")
+        |> run_request(routes: [route], facilitator: self())
+        |> decode_payment_required!()
+
+      {:ok, enriched} =
+        PaymentIdentifier.enricher(id: @spec_id).(
+          Map.put(valid_payment_payload(), "extensions", payment_required["extensions"]),
+          payment_required
+        )
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", encode_header(enriched))
+        |> run_request(routes: [route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_payment_id] == @spec_id
     end
   end
 
@@ -3088,6 +3698,28 @@ defmodule X402.Plug.PaymentGateTest do
 
       refute Map.has_key?(required["resource"], "serviceName")
       refute Map.has_key?(required["resource"], "iconUrl")
+    end
+
+    test "rejects service metadata that violates the bazaar validation rules" do
+      for {key, value, fragment} <- [
+            {:service_name, "Wetter für alle", "printable ASCII"},
+            {:service_name, String.duplicate("a", 33), "at most 32"},
+            {:tags, ~w(a b c d e f), "at most 5"},
+            {:tags, ["weather", "Weather"], "unique"},
+            {:tags, ["ok", ""], "non-empty"},
+            {:icon_url, "data:image/png;base64,AAAA", "http(s)"},
+            {:icon_url, "http://localhost/icon.png", "loopback"},
+            {:icon_url, "https://user@api.example.com/icon.png", "userinfo"}
+          ] do
+        route = Map.put(@route, key, value)
+
+        error =
+          assert_raise NimbleOptions.ValidationError, fn ->
+            PaymentGate.init(routes: [route], facilitator: self())
+          end
+
+        assert Exception.message(error) =~ fragment
+      end
     end
 
     test "stringifies atom keys in advertised extra and extensions" do
@@ -3430,6 +4062,30 @@ defmodule X402.Plug.PaymentGateTest do
   end
 
   defp valid_payment_header, do: encode_header(valid_payment_payload())
+
+  # A valid payment carrying a payment id — spec format by default (echoing
+  # `:advertised`, the server's declaration, plus `info.id`), or the
+  # deprecated `paymentIdentifier` map with `legacy: true`. `:nonce` swaps the
+  # signed nonce so the proof mints a different replay key.
+  defp spec_id_header(payment_id, opts \\ []) do
+    extensions =
+      case Keyword.get(opts, :legacy, false) do
+        true ->
+          %{"paymentIdentifier" => %{"paymentId" => payment_id}}
+
+        false ->
+          advertised = Keyword.get(opts, :advertised, PaymentIdentifier.extension())
+          %{"payment-identifier" => put_in(advertised, ["info", "id"], payment_id)}
+      end
+
+    payload = Map.put(valid_payment_payload(), "extensions", extensions)
+
+    case Keyword.get(opts, :nonce) do
+      nil -> payload
+      nonce -> put_in(payload, ["payload", "authorization", "nonce"], nonce)
+    end
+    |> encode_header()
+  end
 
   defp valid_upto_payment_header(value), do: encode_header(valid_upto_payment_payload(value))
 

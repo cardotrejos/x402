@@ -199,6 +199,90 @@ added alongside it, per the spec's append-only rule. Resource servers
 declare support with `build_extension/0` and validate a client's echoed
 data with `extract_info/1` and `validate_info/1` on either module.
 
+## Payment identifiers
+
+The [payment-identifier extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/payment_identifier.md)
+makes a payment idempotent from the client's side: you attach an id you
+generated, and a server that sees it again treats the request as the same
+one (a retry after a lost response is not charged twice, and the same id
+can never be reused for a different request — the server answers 409).
+`X402.Extensions.PaymentIdentifier.enricher/1` attaches it through the
+same `:extensions` option:
+
+```elixir
+alias X402.Extensions.PaymentIdentifier
+
+{:ok, payload} =
+  X402.Client.build_payment(payment_required, signer,
+    extensions: [PaymentIdentifier.enricher()]
+  )
+
+payload["extensions"]["payment-identifier"]["info"]["id"]
+#=> "k3Jm9ZQvT2xW8bNcRfLpHsD4aY7eUqGi"
+```
+
+Each invocation generates a fresh `X402.Extensions.PaymentIdentifier.generate_id/0`
+(32 URL-safe characters); pass `id: my_id` to reuse one across retries —
+that is the point of the extension — provided it is 16 to 128 characters
+of `[A-Za-z0-9_-]` (`valid_id?/1`), or the enricher returns
+`{:error, :invalid_payment_id}`. The enricher echoes the server's
+advertisement (`info.required` and the schema) unchanged and only adds
+`info.id`; it is a no-op when the server did not advertise the extension
+unless you pass `always: true`. A server that advertised
+`required: true` rejects payments without an id.
+
+### Which requirements the client selects
+
+`build_payment/3` picks the first `accepts` entry it can sign, in the
+server's order, filtered by `:network` and `:scheme`. Entries whose
+`extra.paymentFlow` names a flow the client cannot run are skipped: only
+the default `"authorization"` flow (explicit or omitted) is recognized —
+`upfront` and `escrow` commit funds before the resource executes and the
+protocol forbids constructing a payment for a flow you do not implement. A
+`PAYMENT-REQUIRED` offering only such entries yields
+`{:error, :no_acceptable_requirements}`.
+
+## Signing in with X
+
+When a server advertises the
+[sign-in-with-x extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/sign-in-with-x.md)
+under `extensions["sign-in-with-x"]` of its 402, a wallet that already
+paid for the resource can come back and prove its identity instead of
+paying again. The client half is manual for now — automatic handling in
+`X402.Client.Finch` is planned for 0.8.0 — and takes three calls:
+
+```elixir
+alias X402.Extensions.SIWX
+
+{:ok, payment_required} = X402.PaymentRequired.decode(header_value)
+challenge = payment_required["extensions"]["sign-in-with-x"]
+
+{:ok, signed} = SIWX.sign(challenge, signer, chain_id: "eip155:8453")
+{:ok, header} = SIWX.encode_signed(signed)
+
+Finch.build(:get, url, [{"sign-in-with-x", header}])
+|> Finch.request(MyApp.Finch)
+```
+
+`sign/3` copies the challenge's fields (`domain`, `uri`, `nonce`,
+`issuedAt`, `expirationTime`, ...) into the proof, adds your signer's
+address and the chain, builds the CAIP-122 message, and signs it — EIP-4361
+text with EIP-191 `personal_sign` on `eip155:*` chains
+(`X402.Signer.sign_message/2`, implemented by `X402.Signer.LocalKey`), or
+Sign-In-With-Solana text with Ed25519 on `solana:*` chains
+(`X402.Signer.sign_ed25519/2`, implemented by `X402.Signer.SolanaKey`).
+The `:chain_id` must be one the challenge's `supportedChains` lists
+(`{:error, :unsupported_chain}` otherwise). Send the encoded proof in the
+`SIGN-IN-WITH-X` header of the next request: the server serves it without
+payment if the address paid before, or answers 402 with a fresh challenge
+(you may send `PAYMENT-SIGNATURE` in the same request to sign in and pay
+at once). Challenges are single-use — sign the one from the latest 402,
+not a cached copy.
+
+Custom EVM signers implement the optional `c:X402.Signer.sign_message/2`
+callback to support this; signers without it return
+`{:error, :unsupported_signer}`.
+
 ## Paying on Solana (SVM)
 
 The client also signs the `exact` scheme on `solana:*` networks out of the

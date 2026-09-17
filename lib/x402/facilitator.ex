@@ -15,12 +15,23 @@ defmodule X402.Facilitator do
   the calling process (not in the facilitator process), and the duration of an
   operation is bounded by the configured `:receive_timeout_ms` and retry
   policy rather than by a `GenServer.call/3` timeout.
+
+  ## Operation results
+
+  `verify/2` and `settle/2` return the facilitator's HTTP response as a map
+  with `:status`, the decoded JSON `:body` (the `VerifyResponse` /
+  `SettleResponse` object), the response `:headers`, and
+  `:extension_responses` — the decoded `EXTENSION-RESPONSES` sidechannel
+  (§7.2.1), or `nil` when the facilitator sent none or sent a malformed
+  value (see `X402.ExtensionResponses`). The sidechannel is meant for the
+  resource server only and must not be forwarded to the buyer.
   """
 
   use GenServer
 
   require Logger
 
+  alias X402.ExtensionResponses
   alias X402.Facilitator.Auth
   alias X402.Facilitator.Error
   alias X402.Facilitator.HTTP
@@ -90,7 +101,14 @@ defmodule X402.Facilitator do
   @typedoc "Facilitator server identifier accepted by `GenServer.call/3`."
   @type server :: GenServer.server()
 
-  @typedoc "Facilitator response payload, including values recovered or transformed by hooks."
+  @typedoc """
+  Facilitator response payload, including values recovered or transformed
+  by hooks.
+
+  For a response that reached the facilitator this is a
+  `t:X402.Facilitator.HTTP.success/0` map extended with
+  `extension_responses: X402.ExtensionResponses.t() | nil`.
+  """
   @type operation_result :: map()
 
   @type response :: {:ok, operation_result()} | {:error, Error.t() | Hooks.hook_error() | term()}
@@ -510,22 +528,24 @@ defmodule X402.Facilitator do
                    before_context.payload,
                    before_context.requirements
                  ),
-               {:ok, headers} <- auth_headers(state, endpoint, :post) do
-            HTTP.request(
-              state.finch,
-              state.url,
-              endpoint,
-              %{
-                # x402 v2 facilitator wire format (§7.1 / §7.2)
-                "x402Version" => 2,
-                "paymentPayload" => before_context.payload,
-                "paymentRequirements" => before_context.requirements
-              },
-              max_retries: state.max_retries,
-              retry_backoff_ms: state.retry_backoff_ms,
-              receive_timeout_ms: state.receive_timeout_ms,
-              headers: headers
-            )
+               {:ok, headers} <- auth_headers(state, endpoint, :post),
+               {:ok, response} <-
+                 HTTP.request(
+                   state.finch,
+                   state.url,
+                   endpoint,
+                   %{
+                     # x402 v2 facilitator wire format (§7.1 / §7.2)
+                     "x402Version" => 2,
+                     "paymentPayload" => before_context.payload,
+                     "paymentRequirements" => before_context.requirements
+                   },
+                   max_retries: state.max_retries,
+                   retry_backoff_ms: state.retry_backoff_ms,
+                   receive_timeout_ms: state.receive_timeout_ms,
+                   headers: headers
+                 ) do
+            {:ok, put_extension_responses(response)}
           end
 
         handle_operation_result(hooks_module, operation, before_context, result, metadata)
@@ -533,6 +553,13 @@ defmodule X402.Facilitator do
       {:halt, reason} ->
         {:error, reason}
     end
+  end
+
+  # The sidechannel is advisory: a malformed header is dropped (with a
+  # telemetry event) rather than failing an otherwise successful operation.
+  @spec put_extension_responses(HTTP.success()) :: operation_result()
+  defp put_extension_responses(%{headers: headers} = response) do
+    Map.put(response, :extension_responses, ExtensionResponses.from_headers_lenient(headers))
   end
 
   defp auth_headers(state, endpoint, method) do

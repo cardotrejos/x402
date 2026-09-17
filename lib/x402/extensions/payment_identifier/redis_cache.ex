@@ -74,8 +74,9 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCache do
       fails closed like any other adapter error.
 
   Entries are stored under `namespace <> payment_id` (default namespace
-  `"x402:payment_identifier:"`). Cached values are encoded as `"verified"`
-  or `"rejected:" <> Base64(term)`; rejection reasons are decoded with
+  `"x402:payment_identifier:"`). Cached values are encoded as `"verified"`,
+  `"bound:" <> fingerprint`, or `"rejected:" <> Base64(term)`; rejection
+  reasons are decoded with
   `:erlang.binary_to_term/2` in `:safe` mode, so they must be composed of
   existing atoms and data terms (which is true for every reason this
   library produces).
@@ -89,6 +90,9 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCache do
   @default_namespace "x402:payment_identifier:"
   @verified_encoding "verified"
   @rejected_prefix "rejected:"
+  @bound_prefix "bound:"
+  @siwx_nonce_issued "siwx_nonce:issued"
+  @siwx_nonce_used "siwx_nonce:used"
 
   @new_opts_schema [
     conn: [
@@ -282,11 +286,19 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCache do
   defp encode_value({:rejected, reason}),
     do: {:ok, @rejected_prefix <> Base.encode64(:erlang.term_to_binary(reason))}
 
+  defp encode_value({:bound, fingerprint}) when is_binary(fingerprint),
+    do: {:ok, @bound_prefix <> fingerprint}
+
+  defp encode_value({:siwx_nonce, :issued}), do: {:ok, @siwx_nonce_issued}
+  defp encode_value({:siwx_nonce, :used}), do: {:ok, @siwx_nonce_used}
   defp encode_value(_invalid), do: {:error, :invalid_cache_value}
 
   @spec decode_value(String.t()) ::
           {:hit, Cache.value()} | {:error, {:invalid_cache_entry, String.t()}}
   defp decode_value(@verified_encoding), do: {:hit, :verified}
+  defp decode_value(@bound_prefix <> fingerprint), do: {:hit, {:bound, fingerprint}}
+  defp decode_value(@siwx_nonce_issued), do: {:hit, {:siwx_nonce, :issued}}
+  defp decode_value(@siwx_nonce_used), do: {:hit, {:siwx_nonce, :used}}
 
   defp decode_value(@rejected_prefix <> encoded = raw) do
     with {:ok, binary} <- Base.decode64(encoded),

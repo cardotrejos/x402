@@ -379,6 +379,16 @@ defmodule X402.Extensions.BazaarTest do
       end
     end
 
+    test "raises on an invalid route template and omits it when absent" do
+      for template <- ["users/:id", "/users/../admin", "/go/http://evil.example", "/a/%2e%2e", 1] do
+        assert_raise NimbleOptions.ValidationError, ~r/route template/, fn ->
+          Bazaar.build_extension(method: :get, route_template: template)
+        end
+      end
+
+      refute Map.has_key?(Bazaar.build_extension(method: :get), "routeTemplate")
+    end
+
     test "raises when query input is not a map" do
       assert_raise ArgumentError, ~r/expected query :input to be a map/, fn ->
         Bazaar.build_extension(method: :get, input: "bad")

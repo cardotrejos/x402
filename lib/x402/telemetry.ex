@@ -14,6 +14,11 @@ defmodule X402.Telemetry do
   - `[:x402, :payment_signature, :decode_and_validate]`
   - `[:x402, :payment_response, :encode]`
   - `[:x402, :payment_response, :decode]`
+  - `[:x402, :extension_responses, :decode]`
+  - `[:x402, :payment_identifier, :legacy]` — a deprecated `paymentIdentifier`
+    format id was received (metadata `:source` is `:gate` or `:mcp`)
+  - `[:x402, :siwx, :legacy]` — a deprecated `{message, signature}`
+    `SIGN-IN-WITH-X` header was received (metadata `:source` is `:gate`)
   - `[:x402, :client, :select]`
   - `[:x402, :client, :sign]`
   - `[:x402, :client, :build]`
@@ -33,6 +38,9 @@ defmodule X402.Telemetry do
           :payment_required
           | :payment_signature
           | :payment_response
+          | :extension_responses
+          | :payment_identifier
+          | :siwx
           | :client
           | :rpc
           | :verify
@@ -50,6 +58,7 @@ defmodule X402.Telemetry do
           | :svm
           | :verify
           | :settle
+          | :legacy
   @type status :: :ok | :error
 
   @doc since: "0.1.0"

@@ -342,5 +342,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   @spec valid_value?(term()) :: boolean()
   defp valid_value?(:verified), do: true
   defp valid_value?({:rejected, _reason}), do: true
+  defp valid_value?({:bound, fingerprint}) when is_binary(fingerprint), do: true
+  defp valid_value?({:siwx_nonce, state}) when state in [:issued, :used], do: true
   defp valid_value?(_invalid), do: false
 end
