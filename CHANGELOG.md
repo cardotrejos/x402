@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `sign_ed25519/2`, allowing `X402.Signer.SolanaKey` to reach the SVM
   payment flow. Scheme-specific callback checks remain in the signer dispatcher.
 
+### Security
+
+- Update the repository lockfile to Mint `1.10.0`, which fixes
+  [CVE-2026-82728](https://github.com/elixir-mint/mint/security/advisories/GHSA-g83f-2j6r-q6m4)
+  and [CVE-2026-82729](https://github.com/elixir-mint/mint/security/advisories/GHSA-7p8w-j234-7qc8).
+  Applications using Finch should also run `mix deps.update mint` to update
+  their own lockfiles; upgrading x402 alone does not ensure this transitive
+  dependency is updated.
+
 ## [0.6.0] - 2026-08-28
 
 ### Added
