@@ -232,11 +232,15 @@ defmodule X402.Client.SIWX do
         {nil, nil} -> [domain]
       end
 
-    case is_binary(domain) and domain in allowed do
+    case is_binary(domain) and normalize_domain(domain) in Enum.map(allowed, &normalize_domain/1) do
       true -> :ok
       false -> {:error, {:siwx, :domain_mismatch}}
     end
   end
+
+  @spec normalize_domain(String.t() | nil) :: String.t() | nil
+  defp normalize_domain(nil), do: nil
+  defp normalize_domain(domain) when is_binary(domain), do: String.downcase(domain)
 
   @spec url_domains(String.t()) :: [String.t()]
   defp url_domains(url) do
