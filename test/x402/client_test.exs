@@ -94,6 +94,24 @@ defmodule X402.ClientTest do
       assert Client.select_requirements([@evm_requirements]) == {:ok, @evm_requirements}
     end
 
+    test "skips entries whose paymentFlow is not recognized" do
+      upfront = put_in(@evm_requirements, ["extra", "paymentFlow"], "upfront")
+      escrow = put_in(@evm_requirements, ["extra", "paymentFlow"], "escrow")
+      bogus = put_in(@evm_requirements, ["extra", "paymentFlow"], 42)
+      payment_required = %{"accepts" => [upfront, escrow, bogus, @evm_requirements]}
+
+      assert Client.select_requirements(payment_required) == {:ok, @evm_requirements}
+
+      assert Client.select_requirements([upfront, escrow]) ==
+               {:error, :no_acceptable_requirements}
+    end
+
+    test "accepts an explicit authorization paymentFlow" do
+      explicit = put_in(@evm_requirements, ["extra", "paymentFlow"], "authorization")
+
+      assert Client.select_requirements([explicit]) == {:ok, explicit}
+    end
+
     test "filters by exact and wildcard network" do
       base = Map.put(@evm_requirements, "network", "eip155:8453")
       testnet = @evm_requirements
