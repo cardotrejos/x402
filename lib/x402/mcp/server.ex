@@ -713,6 +713,7 @@ defmodule X402.MCP.Server do
   defp rejection_message({:invalid_fields, _fields}), do: "invalid_payload"
   defp rejection_message({:invalid_format, _fields}), do: "invalid_payload"
   defp rejection_message({:invalid_upto_payment, _reason}), do: "invalid_payload"
+  defp rejection_message({:invalid_exact_payment, _reason}), do: "invalid_payload"
   defp rejection_message(:invalid_payment_requirements), do: "invalid_payload"
 
   defp rejection_message({:verification_failed, reason}) when is_binary(reason), do: reason

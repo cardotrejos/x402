@@ -393,6 +393,26 @@ defmodule X402.ClientTest do
                {:error, {:missing_extra, "facilitatorAddress"}}
     end
 
+    test "signs exact requirements via Permit2 when extra selects the permit2 transfer method" do
+      permit2 = put_in(@evm_requirements, ["extra", "assetTransferMethod"], "permit2")
+
+      assert {:ok, payload} = Client.build_payment(permit2, signer())
+      assert payload["accepted"] == permit2
+
+      assert %{"signature" => "0x" <> _, "permit2Authorization" => authorization} =
+               payload["payload"]
+
+      refute Map.has_key?(payload["payload"], "authorization")
+      assert authorization["spender"] == "0x402085c248EeA27D92E8b30b2C58ed07f9E20001"
+      assert authorization["permitted"]["amount"] == permit2["amount"]
+      assert authorization["witness"] == %{"to" => permit2["payTo"], "validAfter" => "0"}
+
+      erc7710 = put_in(@evm_requirements, ["extra", "assetTransferMethod"], "erc7710")
+
+      assert Client.build_payment(erc7710, signer()) ==
+               {:error, {:unsupported_transfer_method, "erc7710"}}
+    end
+
     test "propagates signing errors for bare requirements" do
       missing_domain = Map.put(@evm_requirements, "extra", %{})
 

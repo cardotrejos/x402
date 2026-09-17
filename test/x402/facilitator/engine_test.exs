@@ -107,6 +107,7 @@ defmodule X402.Facilitator.EngineTest do
 
     fields =
       [
+        "eip3009",
         authorization["from"],
         authorization["to"],
         authorization["value"],
@@ -114,6 +115,41 @@ defmodule X402.Facilitator.EngineTest do
         authorization["validBefore"],
         authorization["nonce"],
         requirements["asset"]
+      ]
+      |> Enum.map(&String.downcase(to_string(&1)))
+      |> Enum.intersperse("\n")
+
+    digest = :crypto.hash(:sha256, [:crypto.hash(:sha256, bytes), "\n", fields])
+    Base.encode16(digest, case: :lower)
+  end
+
+  # Permit2 counterpart of pending_key/2: the kind prefix carries the scheme,
+  # and the settled amount is bound last (upto settles the requirements'
+  # amount, exact the permitted amount).
+  defp permit2_pending_key(payload, requirements) do
+    "0x" <> signature_hex = payload["payload"]["signature"]
+    bytes = Base.decode16!(signature_hex, case: :mixed)
+    authorization = payload["payload"]["permit2Authorization"]
+
+    settled =
+      case requirements["scheme"] do
+        "upto" -> requirements["amount"]
+        _exact -> authorization["permitted"]["amount"]
+      end
+
+    fields =
+      [
+        "permit2:#{requirements["scheme"]}",
+        authorization["from"],
+        authorization["spender"],
+        authorization["permitted"]["token"],
+        authorization["permitted"]["amount"],
+        authorization["nonce"],
+        authorization["deadline"],
+        authorization["witness"]["to"],
+        authorization["witness"]["validAfter"],
+        requirements["asset"],
+        settled
       ]
       |> Enum.map(&String.downcase(to_string(&1)))
       |> Enum.intersperse("\n")
@@ -164,7 +200,9 @@ defmodule X402.Facilitator.EngineTest do
       assert Engine.supported(engine) == %{
                "kinds" => [
                  %{"x402Version" => 2, "scheme" => "exact", "network" => @network},
-                 %{"x402Version" => 2, "scheme" => "exact", "network" => "eip155:8453"}
+                 %{"x402Version" => 2, "scheme" => "upto", "network" => @network},
+                 %{"x402Version" => 2, "scheme" => "exact", "network" => "eip155:8453"},
+                 %{"x402Version" => 2, "scheme" => "upto", "network" => "eip155:8453"}
                ],
                "extensions" => [],
                "signers" => %{"eip155:*" => [@facilitator_address]}
@@ -207,6 +245,10 @@ defmodule X402.Facilitator.EngineTest do
       payload = signed_payload(requirements)
 
       assert {:ok, %{"isValid" => false, "invalidReason" => "unsupported_scheme"}} =
+               Engine.verify(engine, payload, requirements(%{"scheme" => "other"}))
+
+      # upto is supported, but only for requirements naming this signer.
+      assert {:ok, %{"isValid" => false, "invalidReason" => "upto_facilitator_mismatch"}} =
                Engine.verify(engine, payload, requirements(%{"scheme" => "upto"}))
 
       assert {:ok, %{"isValid" => false, "invalidReason" => "invalid_network"}} =
@@ -1451,7 +1493,7 @@ defmodule X402.Facilitator.EngineTest do
     test "responses omit the payer when the payload has none", context do
       engine = engine(context)
 
-      assert Engine.verify(engine, %{"x402Version" => 2}, requirements(%{"scheme" => "upto"})) ==
+      assert Engine.verify(engine, %{"x402Version" => 2}, requirements(%{"scheme" => "other"})) ==
                {:ok, %{"isValid" => false, "invalidReason" => "unsupported_scheme"}}
     end
   end
@@ -1530,6 +1572,268 @@ defmodule X402.Facilitator.EngineTest do
 
       assert {:error, {:hook_invalid_return, :on_verify_failure, :bogus}} =
                Engine.verify(engine, payload, requirements(%{"amount" => "20000"}))
+    end
+  end
+
+  # -- Permit2 settlement (exact permit2 + upto) ------------------------------
+
+  describe "settle/3 through the Permit2 proxies" do
+    @exact_proxy "0x402085c248EeA27D92E8b30b2C58ed07f9E20001"
+    @upto_proxy "0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002"
+
+    defp permit2_requirements(overrides \\ %{}) do
+      requirements(
+        Map.merge(
+          %{"extra" => %{"assetTransferMethod" => "permit2", "name" => "USDC", "version" => "2"}},
+          overrides
+        )
+      )
+    end
+
+    defp upto_requirements(overrides \\ %{}) do
+      requirements(
+        Map.merge(
+          %{
+            "scheme" => "upto",
+            "extra" => %{
+              "name" => "USDC",
+              "version" => "2",
+              "facilitatorAddress" => @facilitator_address
+            }
+          },
+          overrides
+        )
+      )
+    end
+
+    defp permit2_payload(%{"scheme" => "upto"} = requirements) do
+      {:ok, scheme_payload} = X402.Permit2.sign_upto(requirements, payer_signer())
+      %{"x402Version" => 2, "accepted" => requirements, "payload" => scheme_payload}
+    end
+
+    defp permit2_payload(requirements) do
+      {:ok, scheme_payload} = X402.Permit2.sign_exact(requirements, payer_signer())
+      %{"x402Version" => 2, "accepted" => requirements, "payload" => scheme_payload}
+    end
+
+    defp signature_bytes(payload) do
+      "0x" <> hex = payload["payload"]["signature"]
+      Base.decode16!(hex, case: :mixed)
+    end
+
+    defp proxy_bytes("0x" <> hex), do: Base.decode16!(hex, case: :mixed)
+
+    test "exact-permit2 sends the exact proxy's settle and confirms the Transfer", context do
+      engine = engine(context)
+      requirements = permit2_requirements()
+      payload = permit2_payload(requirements)
+
+      assert {:ok,
+              %{
+                "success" => true,
+                "transaction" => @tx_hash,
+                "network" => @network,
+                "payer" => @payer
+              }} == Engine.settle(engine, payload, requirements)
+
+      # Re-verify probed the proxy's deployment; the fee-payer estimate
+      # targets the proxy, not the token.
+      assert_received {:rpc, "eth_getCode", [@exact_proxy, "latest"]}
+      assert_received {:rpc, "eth_estimateGas", [call]}
+      assert call["from"] == @facilitator_address
+      assert call["to"] == @exact_proxy
+      assert String.starts_with?(call["data"], "0x13cd3b53")
+
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex]}
+      raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+
+      [_chain, _nonce, _prio, _fee, _gas, to, _value, data | _rest] =
+        TestRLPDecoder.decode_eip1559(raw)
+
+      assert to == proxy_bytes(@exact_proxy)
+
+      assert {:ok, data} ==
+               X402.Permit2.exact_settle_calldata(
+                 payload["payload"]["permit2Authorization"],
+                 signature_bytes(payload)
+               )
+    end
+
+    test "upto settles the requirements' amount through the upto proxy", context do
+      engine = engine(context, stub: %{value: 4_000})
+      payload = permit2_payload(upto_requirements())
+      requirements = upto_requirements(%{"amount" => "4000"})
+
+      assert {:ok, %{"success" => true, "transaction" => @tx_hash, "payer" => @payer}} =
+               Engine.settle(engine, payload, requirements)
+
+      assert_received {:rpc, "eth_getCode", [@upto_proxy, "latest"]}
+      assert_received {:rpc, "eth_estimateGas", [call]}
+      assert call["to"] == @upto_proxy
+      assert String.starts_with?(call["data"], "0xff11e7b4")
+
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex]}
+      raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+
+      [_chain, _nonce, _prio, _fee, _gas, to, _value, data | _rest] =
+        TestRLPDecoder.decode_eip1559(raw)
+
+      assert to == proxy_bytes(@upto_proxy)
+
+      assert {:ok, data} ==
+               X402.Permit2.upto_settle_calldata(
+                 payload["payload"]["permit2Authorization"],
+                 "4000",
+                 signature_bytes(payload)
+               )
+    end
+
+    test "the Transfer log must carry the settled amount, not the permitted ceiling", context do
+      # The stub's default log moves 10_000 (the ceiling); settling 4_000
+      # must reject it as a mismatch.
+      engine = engine(context)
+      payload = permit2_payload(upto_requirements())
+      requirements = upto_requirements(%{"amount" => "4000"})
+
+      assert {:ok,
+              %{"success" => false, "errorReason" => "invalid_exact_evm_transfer_event_mismatch"}} =
+               Engine.settle(engine, payload, requirements)
+    end
+
+    test "a reverted upto transaction uses the upto failure reason", context do
+      engine = engine(context, stub: %{receipts: [%{"status" => "0x0"}]})
+      requirements = upto_requirements()
+      payload = permit2_payload(requirements)
+
+      assert {:ok,
+              %{
+                "success" => false,
+                "errorReason" => "invalid_upto_evm_transaction_failed",
+                "transaction" => @tx_hash
+              }} = Engine.settle(engine, payload, requirements)
+
+      engine = engine(context, stub: %{receipts: [%{"status" => "0x0"}]})
+      requirements = permit2_requirements()
+
+      assert {:ok, %{"success" => false, "errorReason" => "invalid_exact_evm_transaction_failed"}} =
+               Engine.settle(engine, permit2_payload(requirements), requirements)
+    end
+
+    test "upto requirements naming another facilitator are unsupported", context do
+      engine = engine(context)
+      requirements = upto_requirements(%{"extra" => %{"facilitatorAddress" => @pay_to}})
+      payload = permit2_payload(requirements)
+
+      assert {:ok, %{"success" => false, "errorReason" => "upto_facilitator_mismatch"}} =
+               Engine.settle(engine, payload, requirements)
+
+      refute_received {:rpc, "eth_estimateGas", _params}
+    end
+
+    test "re-verification failures are protocol-level rejections", context do
+      engine = engine(context, stub: %{balance: 9_999})
+      requirements = permit2_requirements()
+
+      assert {:ok, %{"success" => false, "errorReason" => "permit2_insufficient_balance"}} =
+               Engine.settle(engine, permit2_payload(requirements), requirements)
+
+      refute_received {:rpc, "eth_estimateGas", _params}
+
+      engine = engine(context, stub: %{code: %{String.downcase(@asset) => "0x6001"}})
+
+      assert {:ok, %{"success" => false, "errorReason" => "permit2_proxy_not_deployed"}} =
+               Engine.settle(engine, permit2_payload(requirements), requirements)
+    end
+
+    test "an estimateGas revert is classified with the Permit2 error table", context do
+      invalid_nonce = "0x756688fe"
+
+      engine =
+        engine(context,
+          stub: %{
+            estimate_gas:
+              {:error, %{"code" => 3, "message" => "execution reverted", "data" => invalid_nonce}}
+          }
+        )
+
+      requirements = permit2_requirements()
+
+      assert {:ok, %{"success" => false, "errorReason" => "permit2_invalid_nonce"}} =
+               Engine.settle(engine, permit2_payload(requirements), requirements)
+
+      engine =
+        engine(context,
+          stub: %{estimate_gas: {:error, %{"code" => 3, "message" => "execution reverted"}}}
+        )
+
+      assert {:ok, %{"success" => false, "errorReason" => "permit2_simulation_failed"}} =
+               Engine.settle(engine, permit2_payload(requirements), requirements)
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+
+    test "pending entries bind the Permit2 fields and the settled amount", context do
+      store = pending_store(__MODULE__.Permit2Store)
+      {:ok, queue} = Agent.start_link(fn -> [] end)
+
+      engine =
+        engine(context,
+          pending_settlement_store: store,
+          receipt_timeout_ms: 50,
+          receipt_interval_ms: 10,
+          stub: %{receipt_queue: queue, value: 4_000}
+        )
+
+      payload = permit2_payload(upto_requirements())
+      requirements = upto_requirements(%{"amount" => "4000"})
+
+      assert {:ok, %{"success" => false, "errorReason" => "settlement_pending"}} =
+               Engine.settle(engine, payload, requirements)
+
+      assert {:hit, %{transaction: @tx_hash}} =
+               PendingSettlementStore.get(store, permit2_pending_key(payload, requirements))
+
+      # Settling a different amount under the same signature is a different
+      # payment: it misses the entry rather than reconciling against it.
+      assert PendingSettlementStore.get(
+               store,
+               permit2_pending_key(payload, upto_requirements(%{"amount" => "3000"}))
+             ) == :miss
+
+      assert_received {:rpc, "eth_sendRawTransaction", [_raw_hex]}
+      Agent.update(queue, fn _empty -> [%{"status" => "0x1"}] end)
+
+      assert {:ok, %{"success" => true, "transaction" => @tx_hash}} =
+               Engine.settle(engine, payload, requirements)
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+
+      assert PendingSettlementStore.get(store, permit2_pending_key(payload, requirements)) ==
+               :miss
+    end
+
+    test "verify/3 accepts both Permit2 kinds", context do
+      engine = engine(context)
+
+      exact = permit2_requirements()
+
+      assert {:ok, %{"isValid" => true, "payer" => @payer}} =
+               Engine.verify(engine, permit2_payload(exact), exact)
+
+      upto = upto_requirements()
+
+      assert {:ok, %{"isValid" => true, "payer" => @payer}} =
+               Engine.verify(engine, permit2_payload(upto), upto)
+
+      wrong_proxy =
+        put_in(
+          permit2_payload(exact),
+          ["payload", "permit2Authorization", "spender"],
+          @upto_proxy
+        )
+
+      assert {:ok, %{"isValid" => false, "invalidReason" => "invalid_permit2_spender"}} =
+               Engine.verify(engine, wrong_proxy, exact)
     end
   end
 

@@ -162,6 +162,7 @@ defmodule X402.Plug.PaymentGateTest do
   }
 
   @upto_route Map.put(@route, :scheme, "upto")
+  @permit2_route Map.put(@route, :extra, %{"assetTransferMethod" => "permit2"})
 
   # ---------------------------------------------------------------------------
   # Route matching
@@ -2595,6 +2596,72 @@ defmodule X402.Plug.PaymentGateTest do
       refute_received {:verify_called, _, _}
     end
 
+    test "exact Permit2 replay keys derive from the signed permit nonce" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+
+      opts = [
+        routes: [@permit2_route],
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      payload = valid_exact_permit2_payment_payload()
+      header = encode_header(payload)
+      reencoded = payload |> Jason.encode!(pretty: true) |> Base.encode64()
+      assert reencoded != header
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(opts)
+
+      assert first.status == 200
+      assert_receive {:verify_called, _, _}
+
+      duplicate =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", reencoded)
+        |> run_request(opts)
+
+      assert duplicate.status == 402
+      assert decode_payment_required!(duplicate)["error"] == "payment already processed"
+      refute_received {:verify_called, _, _}
+    end
+
+    test "exact and upto Permit2 payments share the owner's nonce bitmap" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+
+      base = [
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header(
+          "payment-signature",
+          encode_header(valid_exact_permit2_payment_payload())
+        )
+        |> run_request([routes: [@permit2_route]] ++ base)
+
+      assert first.status == 200
+
+      # Permit2's unordered nonces are keyed per owner, not per spender: an
+      # upto permit with the same owner and nonce burns the same on-chain
+      # slot, so the gate treats it as the same payment.
+      duplicate =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", encode_header(valid_upto_payment_payload(@amount)))
+        |> run_request([routes: [@upto_route]] ++ base)
+
+      assert duplicate.status == 402
+      assert decode_payment_required!(duplicate)["error"] == "payment already processed"
+    end
+
     test "svm replay keys derive from the signed message bytes" do
       facilitator = start_mock_facilitator()
       cache = start_supervised!({ETSCache, name: unique_cache_name()})
@@ -4088,6 +4155,26 @@ defmodule X402.Plug.PaymentGateTest do
   end
 
   defp valid_upto_payment_header(value), do: encode_header(valid_upto_payment_payload(value))
+
+  # Same owner and nonce as the upto fixture, signed for the exact proxy.
+  defp valid_exact_permit2_payment_payload do
+    valid_payment_payload()
+    |> put_in(["accepted", "extra"], %{"assetTransferMethod" => "permit2"})
+    |> put_in(
+      ["payload"],
+      %{
+        "signature" => "0xpermit2-signature",
+        "permit2Authorization" => %{
+          "permitted" => %{"token" => @asset, "amount" => @amount},
+          "from" => @receiver,
+          "spender" => "0x402085c248EeA27D92E8b30b2C58ed07f9E20001",
+          "nonce" => "1",
+          "deadline" => "9999999999",
+          "witness" => %{"to" => @receiver, "validAfter" => "0"}
+        }
+      }
+    )
+  end
 
   defp valid_upto_payment_payload(value) do
     valid_payment_payload()

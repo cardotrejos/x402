@@ -1961,6 +1961,61 @@ defmodule X402.FacilitatorTest do
     end
   end
 
+  describe "exact Permit2 amount validation" do
+    setup %{finch: finch, facilitator_url: facilitator_url} do
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      {:ok, facilitator: facilitator}
+    end
+
+    defp permit2_payload(amount) do
+      %{"payload" => %{"permit2Authorization" => %{"permitted" => %{"amount" => amount}}}}
+    end
+
+    test "verify and settle reject a permitted amount that differs from the requirements",
+         %{facilitator: facilitator} do
+      requirements = %{"scheme" => "exact", "amount" => "10000"}
+
+      capture_log(fn ->
+        assert {:error, {:invalid_exact_payment, :amount_mismatch}} =
+                 Facilitator.verify(facilitator, permit2_payload("9999"), requirements)
+
+        assert {:error, {:invalid_exact_payment, :amount_mismatch}} =
+                 Facilitator.settle(facilitator, permit2_payload("10001"), requirements)
+
+        assert {:error, {:invalid_exact_payment, :invalid_payment_value}} =
+                 Facilitator.verify(facilitator, permit2_payload("abc"), requirements)
+
+        assert {:error, {:invalid_exact_payment, :invalid_amount}} =
+                 Facilitator.verify(facilitator, permit2_payload("1"), %{
+                   "scheme" => "exact",
+                   "amount" => "abc"
+                 })
+      end)
+    end
+
+    test "skips the check for EIP-3009 payloads and requirements without an amount",
+         %{facilitator: facilitator, bypass: bypass} do
+      Bypass.stub(bypass, "POST", "/verify", fn conn ->
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"isValid" => true}))
+      end)
+
+      # Both reach the facilitator instead of failing locally.
+      assert {:ok, %{body: %{"isValid" => true}}} =
+               Facilitator.verify(facilitator, permit2_payload("9999"), %{"scheme" => "exact"})
+
+      assert {:ok, %{body: %{"isValid" => true}}} =
+               Facilitator.verify(
+                 facilitator,
+                 %{"payload" => %{"authorization" => %{"value" => "9999"}}},
+                 %{"scheme" => "exact", "amount" => "10000"}
+               )
+    end
+  end
+
   describe "auth request info derivation" do
     test "a URL without a host binds auth to an empty host", %{finch: finch} do
       facilitator =

@@ -9,8 +9,10 @@ defmodule X402.Scheme.EVM do
 
   The checks mirror the first checks every reference facilitator performs
   (payTo equality, exact amount equality, time window), so junk traffic is
-  rejected without paying a facilitator verify call. Payloads without a
-  `payload.authorization` map — other payload shapes, Permit2 — are skipped
+  rejected without paying a facilitator verify call. Two payload shapes are
+  covered — EIP-3009 `payload.authorization`
+  (`authorization_precheck/3`) and Permit2 `payload.permit2Authorization`
+  (`permit2_precheck/3`); payloads without the expected map are skipped
   entirely, as is any individual absent field: the facilitator remains the
   authority, these checks only fail fast on certain mismatch.
   """
@@ -26,6 +28,8 @@ defmodule X402.Scheme.EVM do
           :pay_to_mismatch
           | :amount_mismatch
           | :invalid_authorization_value
+          | :token_mismatch
+          | :spender_mismatch
           | :authorization_not_yet_valid
           | :authorization_expired
           | :invalid_authorization_timing
@@ -95,9 +99,93 @@ defmodule X402.Scheme.EVM do
                precheck_exact_amount(
                  Keyword.get(opts, :enforce_exact_amount, false),
                  authorization,
-                 requirements
+                 requirements,
+                 {"value", :value}
                ) do
           precheck_timing(authorization)
+        end
+    end
+  end
+
+  @doc since: "0.8.0"
+  @doc """
+  Runs cheap local checks on a Permit2 `payload.permit2Authorization`.
+
+  Checks, in order: the witness `to` must equal the requirements' `payTo`;
+  with `enforce_exact_amount: true` the `permitted.amount` must equal the
+  requirements' `amount`; the `permitted.token` must equal the
+  requirements' `asset`; the `spender` must equal the `:spender` option
+  when one is given; and the `witness.validAfter`/`deadline` window must
+  cover now (with a #{@time_buffer_seconds}s settlement buffer on
+  `deadline`). Addresses compare case-insensitively. Payloads without a
+  `payload.permit2Authorization` map pass with `:ok`, as does any
+  individual absent field.
+
+  ## Options
+
+  * `:enforce_exact_amount` (default `false`) — require `permitted.amount`
+    to equal the requirements' `amount` exactly (the `exact` scheme's
+    Permit2 transfer method). For `upto`, the permitted amount is a
+    ceiling.
+  * `:spender` — the proxy contract the authorization must name as
+    `spender` (`X402.Permit2.exact_proxy_address/0` /
+    `X402.Permit2.upto_proxy_address/0`). Skipped when absent.
+
+  ## Examples
+
+      iex> X402.Scheme.EVM.permit2_precheck(%{"payload" => %{}}, %{})
+      :ok
+
+      iex> payload = %{
+      ...>   "payload" => %{
+      ...>     "permit2Authorization" => %{
+      ...>       "permitted" => %{"token" => "0xAAAA", "amount" => "10"},
+      ...>       "spender" => "0x402085c248EeA27D92E8b30b2C58ed07f9E20001",
+      ...>       "witness" => %{"to" => "0xAb", "validAfter" => "0"}
+      ...>     }
+      ...>   }
+      ...> }
+      iex> requirements = %{"payTo" => "0xab", "amount" => "10", "asset" => "0xaaaa"}
+      iex> X402.Scheme.EVM.permit2_precheck(payload, requirements,
+      ...>   enforce_exact_amount: true,
+      ...>   spender: "0x402085c248eea27d92e8b30b2c58ed07f9e20001"
+      ...> )
+      :ok
+
+      iex> payload = %{
+      ...>   "payload" => %{
+      ...>     "permit2Authorization" => %{"witness" => %{"to" => "0xother"}}
+      ...>   }
+      ...> }
+      iex> X402.Scheme.EVM.permit2_precheck(payload, %{"payTo" => "0xab"})
+      {:error, {:precheck_failed, :pay_to_mismatch}}
+  """
+  @spec permit2_precheck(map(), map(), keyword()) ::
+          :ok | {:error, {:precheck_failed, precheck_failure()}}
+  def permit2_precheck(payload, requirements, opts \\ [])
+      when is_map(payload) and is_map(requirements) and is_list(opts) do
+    case permit2_authorization(payload) do
+      nil ->
+        :ok
+
+      authorization ->
+        witness = map_or_empty(Utils.map_value(authorization, {"witness", :witness}))
+        permitted = map_or_empty(Utils.map_value(authorization, {"permitted", :permitted}))
+
+        with :ok <- precheck_pay_to(witness, requirements),
+             :ok <-
+               precheck_exact_amount(
+                 Keyword.get(opts, :enforce_exact_amount, false),
+                 permitted,
+                 requirements,
+                 {"amount", :amount}
+               ),
+             :ok <- precheck_token(permitted, requirements),
+             :ok <- precheck_spender(authorization, Keyword.get(opts, :spender)) do
+          precheck_timing(%{
+            "validAfter" => Utils.map_value(witness, {"validAfter", :validAfter}),
+            "validBefore" => Utils.map_value(authorization, {"deadline", :deadline})
+          })
         end
     end
   end
@@ -112,6 +200,21 @@ defmodule X402.Scheme.EVM do
       _other -> nil
     end
   end
+
+  @spec permit2_authorization(map()) :: map() | nil
+  defp permit2_authorization(payload) do
+    case Utils.nested_map_value(payload, [
+           {"payload", :payload},
+           {"permit2Authorization", :permit2Authorization}
+         ]) do
+      authorization when is_map(authorization) -> authorization
+      _other -> nil
+    end
+  end
+
+  @spec map_or_empty(term()) :: map()
+  defp map_or_empty(value) when is_map(value), do: value
+  defp map_or_empty(_value), do: %{}
 
   @spec precheck_pay_to(map(), map()) ::
           :ok | {:error, {:precheck_failed, :pay_to_mismatch}}
@@ -131,6 +234,30 @@ defmodule X402.Scheme.EVM do
     end
   end
 
+  @spec precheck_token(map(), map()) :: :ok | {:error, {:precheck_failed, :token_mismatch}}
+  defp precheck_token(permitted, requirements) do
+    token = Utils.map_value(permitted, {"token", :token})
+    asset = Utils.map_value(requirements, {"asset", :asset})
+
+    case is_binary(token) and is_binary(asset) and not same_address?(token, asset) do
+      true -> {:error, {:precheck_failed, :token_mismatch}}
+      false -> :ok
+    end
+  end
+
+  @spec precheck_spender(map(), String.t() | nil) ::
+          :ok | {:error, {:precheck_failed, :spender_mismatch}}
+  defp precheck_spender(_authorization, nil), do: :ok
+
+  defp precheck_spender(authorization, expected) do
+    spender = Utils.map_value(authorization, {"spender", :spender})
+
+    case is_binary(spender) and not same_address?(spender, expected) do
+      true -> {:error, {:precheck_failed, :spender_mismatch}}
+      false -> :ok
+    end
+  end
+
   @spec same_address?(String.t(), String.t()) :: boolean()
   defp same_address?(left, right) do
     case hex_address?(left) and hex_address?(right) do
@@ -145,12 +272,12 @@ defmodule X402.Scheme.EVM do
 
   defp hex_address?(_address), do: false
 
-  @spec precheck_exact_amount(boolean(), map(), map()) ::
+  @spec precheck_exact_amount(boolean(), map(), map(), {String.t(), atom()}) ::
           :ok | {:error, {:precheck_failed, :amount_mismatch | :invalid_authorization_value}}
-  defp precheck_exact_amount(false, _authorization, _requirements), do: :ok
+  defp precheck_exact_amount(false, _authorization, _requirements, _key), do: :ok
 
-  defp precheck_exact_amount(true, authorization, requirements) do
-    value = Utils.map_value(authorization, {"value", :value})
+  defp precheck_exact_amount(true, authorization, requirements, value_key) do
+    value = Utils.map_value(authorization, value_key)
     amount = Utils.map_value(requirements, {"amount", :amount})
 
     case not is_nil(value) and not is_nil(amount) do
