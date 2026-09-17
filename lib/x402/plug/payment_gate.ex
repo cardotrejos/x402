@@ -106,8 +106,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     signed authorization (JSON key order, whitespace, Base64 variant) cannot
     mint a fresh key:
 
-    * `"exact"` on `eip155:*` — the EIP-3009 authorization's `from` + `nonce`
+    * `"exact"` on `eip155:*` — the EIP-3009 authorization's `from` + `nonce`,
+      or for the Permit2 transfer method (`extra.assetTransferMethod`
+      `"permit2"`) the Permit2 authorization's `from` + `nonce`
     * `"upto"` on `eip155:*` — the Permit2 authorization's `from` + `nonce`
+      (Permit2 nonces are per owner across spenders, so an exact-Permit2
+      and an upto authorization sharing owner and nonce share one key)
     * `"exact"` on `solana:*` — the SHA-256 of the transaction's signed
       message bytes (immune to the mutable fee-payer signature slot)
     * everything else — the SHA-256 hash of the raw `PAYMENT-SIGNATURE`
@@ -1890,38 +1894,25 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    # EIP-3009: the authorization's from + nonce are covered by the
-    # signature and uniquely identify the authorization on its network.
+    # EVM exact: an EIP-3009 payload carries `authorization`, whose from +
+    # nonce are covered by the signature and uniquely identify the
+    # authorization on its network; a Permit2 payload (assetTransferMethod
+    # "permit2") carries `permit2Authorization` instead.
     @spec derive_replay_key(term(), term(), term()) :: {:ok, String.t()} | :error
     defp derive_replay_key("exact", "eip155:" <> _reference = network, scheme_payload)
          when is_map(scheme_payload) do
-      scheme_payload
-      |> Utils.map_value({"authorization", :authorization})
-      |> signer_nonce_key("evm:", network)
-    end
+      case Utils.map_value(scheme_payload, {"authorization", :authorization}) do
+        authorization when is_map(authorization) ->
+          signer_nonce_key(authorization, "evm:", network)
 
-    # Permit2: the permit's owner (from) + nonce are covered by the
-    # PermitWitnessTransferFrom signature. The nonce is a uint256, so
-    # canonicalize it to its 32-byte encoding — equivalent JSON forms
-    # (`1`, `"1"`, `"01"`) must mint the same replay key so a re-encoded
-    # header cannot bypass dedup while sharing the same signature.
-    defp derive_replay_key("upto", "eip155:" <> _reference = network, scheme_payload)
-         when is_map(scheme_payload) do
-      with authorization when is_map(authorization) <-
-             Utils.map_value(scheme_payload, {"permit2Authorization", :permit2Authorization}),
-           from when is_binary(from) and from != "" <-
-             Utils.map_value(authorization, {"from", :from}),
-           {:ok, nonce_word} <-
-             EIP712.encode_uint256(Utils.map_value(authorization, {"nonce", :nonce})) do
-        {:ok,
-         "evm-upto:" <>
-           network <>
-           ":" <>
-           String.downcase(from) <> ":" <> Base.encode16(nonce_word, case: :lower)}
-      else
-        _other -> :error
+        _absent ->
+          permit2_replay_key(scheme_payload, network)
       end
     end
+
+    defp derive_replay_key("upto", "eip155:" <> _reference = network, scheme_payload)
+         when is_map(scheme_payload),
+         do: permit2_replay_key(scheme_payload, network)
 
     # SVM: hash the signed message bytes, not the wire transaction — the
     # fee-payer signature slot is mutable, so a facilitator co-signature
@@ -1943,8 +1934,34 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp derive_replay_key(_scheme, _network, _scheme_payload), do: :error
 
-    @spec signer_nonce_key(term(), String.t(), String.t()) :: {:ok, String.t()} | :error
-    defp signer_nonce_key(authorization, prefix, network) when is_map(authorization) do
+    # Permit2: the permit's owner (from) + nonce are covered by the
+    # PermitWitnessTransferFrom signature. Permit2's nonce bitmap is per
+    # owner and shared by every spender, so exact and upto authorizations
+    # with the same owner + nonce are the same on-chain slot and share one
+    # key. The nonce is a uint256, so canonicalize it to its 32-byte
+    # encoding — equivalent JSON forms (`1`, `"1"`, `"01"`) must mint the
+    # same replay key so a re-encoded header cannot bypass dedup while
+    # sharing the same signature.
+    @spec permit2_replay_key(map(), String.t()) :: {:ok, String.t()} | :error
+    defp permit2_replay_key(scheme_payload, network) do
+      with authorization when is_map(authorization) <-
+             Utils.map_value(scheme_payload, {"permit2Authorization", :permit2Authorization}),
+           from when is_binary(from) and from != "" <-
+             Utils.map_value(authorization, {"from", :from}),
+           {:ok, nonce_word} <-
+             EIP712.encode_uint256(Utils.map_value(authorization, {"nonce", :nonce})) do
+        {:ok,
+         "evm-permit2:" <>
+           network <>
+           ":" <>
+           String.downcase(from) <> ":" <> Base.encode16(nonce_word, case: :lower)}
+      else
+        _other -> :error
+      end
+    end
+
+    @spec signer_nonce_key(map(), String.t(), String.t()) :: {:ok, String.t()} | :error
+    defp signer_nonce_key(authorization, prefix, network) do
       from = Utils.map_value(authorization, {"from", :from})
       nonce = Utils.map_value(authorization, {"nonce", :nonce})
 
@@ -1957,8 +1974,6 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           :error
       end
     end
-
-    defp signer_nonce_key(_authorization, _prefix, _network), do: :error
 
     # The echoed id is surfaced for correlation and bound to the request
     # fingerprint — never used as the replay key (see replay_key/3): it is
@@ -2395,6 +2410,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp status_for_reason({:missing_fields, _fields}), do: 400
     defp status_for_reason({:precheck_failed, _reason}), do: 402
     defp status_for_reason({:invalid_upto_payment, _reason}), do: 400
+    defp status_for_reason({:invalid_exact_payment, _reason}), do: 400
     defp status_for_reason({:invalid_scheme_payment, _reason}), do: 400
     defp status_for_reason({:invalid_fields, _fields}), do: 400
     defp status_for_reason(:invalid_payment_requirements), do: 400
@@ -2496,6 +2512,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       do: "payment authorization does not satisfy the payment requirements"
 
     defp rejection_error({:invalid_upto_payment, _reason}), do: "invalid_payload"
+    defp rejection_error({:invalid_exact_payment, _reason}), do: "invalid_payload"
     defp rejection_error({:invalid_scheme_payment, _reason}), do: "invalid_payload"
     defp rejection_error({:invalid_fields, _fields}), do: "invalid_payload"
     defp rejection_error(:invalid_payment_requirements), do: "invalid_payload"

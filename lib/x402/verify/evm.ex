@@ -1,12 +1,36 @@
 defmodule X402.Verify.EVM do
   @moduledoc """
-  Local verification of EVM `exact`/`eip3009` payment payloads.
+  Local verification of EVM `exact` (EIP-3009 and Permit2) and `upto`
+  (Permit2) payment payloads.
 
-  Runs the full facilitator verify checklist from the exact-EVM scheme
-  specification locally, so an Elixir resource server can cryptographically
-  verify payments instead of trusting a remote facilitator's `verify`
-  endpoint. The checks mirror the reference TypeScript/Go/Python facilitator
-  engines check for check.
+  Runs the full facilitator verify checklist from the exact-EVM and
+  upto-EVM scheme specifications locally, so an Elixir resource server can
+  cryptographically verify payments instead of trusting a remote
+  facilitator's `verify` endpoint. The checks mirror the reference
+  TypeScript/Go/Python facilitator engines check for check.
+
+  ## Payment kinds
+
+  The requirements select the flow; the result's `kind` echoes it:
+
+  * `:eip3009` — `exact` with `extra.assetTransferMethod` absent or
+    `"eip3009"`; the scheme payload carries `authorization`.
+  * `:permit2_exact` — `exact` with `extra.assetTransferMethod` `"permit2"`;
+    the payload carries `permit2Authorization`, the `spender` must be the
+    `x402ExactPermit2Proxy`, the witness `to` must equal `payTo`, the
+    `permitted.amount` must equal `amount` and `permitted.token` the
+    `asset`, and the `deadline`/`witness.validAfter` window must cover now.
+  * `:permit2_upto` — `upto`; as `:permit2_exact` but the spender is the
+    `x402UptoPermit2Proxy`, the witness additionally binds
+    `extra.facilitatorAddress`, and the requirements' `amount` (what gets
+    settled) may be at most `permitted.amount`.
+
+  At `:full`, Permit2 flows simulate the proxy's `settle` via `eth_call`
+  (for `upto` as the witness facilitator, the only sender the proxy
+  accepts) and diagnose a failure the way the reference facilitator does:
+  proxy not deployed, insufficient balance, missing ERC-20 allowance to
+  the canonical Permit2 contract, or a generic simulation failure —
+  after mapping any named Permit2/proxy custom error first.
 
   ## Verification levels
 
@@ -101,7 +125,9 @@ defmodule X402.Verify.EVM do
   alias X402.EIP3009
   alias X402.EIP712
   alias X402.ERC6492
+  alias X402.Permit2
   alias X402.RPC
+  alias X402.Scheme.ExactEVM
   alias X402.Telemetry
   alias X402.Utils
   alias X402.Wallet
@@ -122,11 +148,66 @@ defmodule X402.Verify.EVM do
   @selector_name <<0x06, 0xFD, 0xDE, 0x03>>
   @selector_version <<0x54, 0xFD, 0x4D, 0x50>>
   @selector_aggregate3 <<0x82, 0xAD, 0x56, 0xCB>>
+  # allowance(address,address)
+  @selector_allowance <<0xDD, 0x62, 0xED, 0x3E>>
+  # PERMIT2() — the proxies' immutable getter, used to probe deployment
+  @selector_permit2_getter <<0x6A, 0xFD, 0xD8, 0x50>>
 
   @erc1271_magic_value <<0x16, 0x26, 0xBA, 0x7E>>
 
+  # Custom-error selectors raised by Permit2 and the x402 proxies, mapped
+  # onto the reference facilitator's reasons. Signature-related errors all
+  # collapse onto the single canonical signature reason.
+  @permit2_error_selectors %{
+    # Permit2612AmountMismatch()
+    <<0x05, 0x0C, 0xDA, 0x49>> => :permit2_2612_amount_mismatch,
+    # InvalidAmount(uint256)
+    <<0x37, 0x28, 0xB8, 0x3D>> => :permit2_invalid_amount,
+    # InvalidDestination()
+    <<0xAC, 0x6B, 0x05, 0xF5>> => :permit2_invalid_destination,
+    # InvalidOwner()
+    <<0x49, 0xE2, 0x7C, 0xFF>> => :permit2_invalid_owner,
+    # PaymentTooEarly()
+    <<0xA6, 0x55, 0x39, 0xFA>> => :permit2_payment_too_early,
+    # InvalidSignature()
+    <<0x8B, 0xAA, 0x57, 0x9F>> => :invalid_signature,
+    # InvalidSigner()
+    <<0x81, 0x5E, 0x1D, 0x64>> => :invalid_signature,
+    # InvalidContractSignature()
+    <<0xB0, 0x66, 0x9C, 0xBC>> => :invalid_signature,
+    # InvalidSignatureLength()
+    <<0x4B, 0xE6, 0x32, 0x1B>> => :invalid_signature,
+    # SignatureExpired(uint256)
+    <<0xCD, 0x21, 0xDB, 0x4F>> => :invalid_signature,
+    # InvalidNonce()
+    <<0x75, 0x66, 0x88, 0xFE>> => :permit2_invalid_nonce,
+    # AmountExceedsPermitted()
+    <<0xFE, 0x64, 0xB4, 0xC7>> => :upto_amount_exceeds_permitted,
+    # UnauthorizedFacilitator()
+    <<0x0F, 0x6F, 0xAE, 0x87>> => :upto_unauthorized_facilitator
+  }
+
+  @permit2_error_names [
+    {"Permit2612AmountMismatch", :permit2_2612_amount_mismatch},
+    {"InvalidAmount", :permit2_invalid_amount},
+    {"InvalidDestination", :permit2_invalid_destination},
+    {"InvalidOwner", :permit2_invalid_owner},
+    {"PaymentTooEarly", :permit2_payment_too_early},
+    {"Too early", :permit2_payment_too_early},
+    {"InvalidSignature", :invalid_signature},
+    {"InvalidSigner", :invalid_signature},
+    {"InvalidContractSignature", :invalid_signature},
+    {"SignatureExpired", :invalid_signature},
+    {"InvalidNonce", :permit2_invalid_nonce},
+    {"AmountExceedsPermitted", :upto_amount_exceeds_permitted},
+    {"UnauthorizedFacilitator", :upto_unauthorized_facilitator}
+  ]
+
   @typedoc "Requested verification depth."
   @type level :: :structural | :signature | :full
+
+  @typedoc "The payment flow a payload belongs to."
+  @type kind :: :eip3009 | :permit2_exact | :permit2_upto
 
   @typedoc """
   Simulation mode for level `:full`.
@@ -143,12 +224,14 @@ defmodule X402.Verify.EVM do
   @typedoc """
   A successful verification.
 
-  `payer` is the lowercase authorization `from` address. `level` echoes the
-  level that was run. `signature_type` is `nil` at `:structural` (no
-  signature classification happens without cryptography).
+  `payer` is the lowercase authorization `from` address. `kind` is the
+  payment flow (see the module documentation). `level` echoes the level
+  that was run. `signature_type` is `nil` at `:structural` (no signature
+  classification happens without cryptography).
   """
   @type verification :: %{
           payer: String.t(),
+          kind: kind(),
           level: level(),
           signature_type: signature_type() | nil
         }
@@ -157,7 +240,8 @@ defmodule X402.Verify.EVM do
   Why a payment was rejected.
 
   Reasons map onto the canonical cross-SDK `invalidReason` strings via
-  `reason_string/1` where an equivalent exists.
+  `reason_string/1` where an equivalent exists. The `permit2_*` and
+  `upto_*` reasons are produced by the Permit2 flows only.
   """
   @type invalid_reason ::
           :invalid_payload
@@ -184,6 +268,29 @@ defmodule X402.Verify.EVM do
           | :token_name_mismatch
           | :token_version_mismatch
           | :simulation_failed
+          | :upto_scheme_mismatch
+          | :upto_network_mismatch
+          | :upto_facilitator_mismatch
+          | :settlement_exceeds_amount
+          | :invalid_permit2_spender
+          | :permit2_recipient_mismatch
+          | :permit2_deadline_expired
+          | :permit2_not_yet_valid
+          | :permit2_amount_mismatch
+          | :permit2_token_mismatch
+          | :invalid_permit2_signature
+          | :permit2_proxy_not_deployed
+          | :permit2_insufficient_balance
+          | :permit2_allowance_required
+          | :permit2_simulation_failed
+          | :permit2_2612_amount_mismatch
+          | :permit2_invalid_amount
+          | :permit2_invalid_destination
+          | :permit2_invalid_owner
+          | :permit2_payment_too_early
+          | :permit2_invalid_nonce
+          | :upto_amount_exceeds_permitted
+          | :upto_unauthorized_facilitator
 
   @typedoc "Verification errors."
   @type error ::
@@ -332,9 +439,60 @@ defmodule X402.Verify.EVM do
       nonce_already_used: "invalid_exact_evm_nonce_already_used",
       token_name_mismatch: "invalid_exact_evm_token_name_mismatch",
       token_version_mismatch: "invalid_exact_evm_token_version_mismatch",
-      simulation_failed: "invalid_exact_evm_transaction_simulation_failed"
+      simulation_failed: "invalid_exact_evm_transaction_simulation_failed",
+      upto_scheme_mismatch: "invalid_upto_evm_scheme",
+      upto_network_mismatch: "invalid_upto_evm_network_mismatch",
+      settlement_exceeds_amount: "invalid_upto_evm_payload_settlement_exceeds_amount",
+      permit2_recipient_mismatch: "invalid_permit2_recipient_mismatch"
     }
   end
+
+  # Reasons shared with the EIP-3009 pipeline are renamed onto the Permit2
+  # family so the wire string matches the reference facilitator.
+  @permit2_reason_translation %{
+    invalid_signature: :invalid_permit2_signature,
+    smart_wallet_requires_rpc: :invalid_permit2_signature,
+    insufficient_balance: :permit2_insufficient_balance,
+    balance_check_failed: :permit2_simulation_failed,
+    simulation_failed: :permit2_simulation_failed
+  }
+
+  @doc false
+  # Classifies a Permit2 / x402-proxy `settle` revert onto a verify reason
+  # from its ABI-encoded custom-error data (selector) or, failing that, the
+  # error name inside the node's message. Public so
+  # `X402.Facilitator.Engine` can classify `eth_estimateGas` reverts during
+  # settlement. Returns `nil` when unrecognized.
+  @spec classify_permit2_revert(RPC.jsonrpc_error()) :: invalid_reason() | nil
+  def classify_permit2_revert(error) do
+    selector_reason =
+      case error.data do
+        "0x" <> _rest = data ->
+          case unhex(data) do
+            {:ok, <<selector::binary-size(4), _rest::binary>>} ->
+              Map.get(@permit2_error_selectors, selector)
+
+            _other ->
+              nil
+          end
+
+        _other ->
+          nil
+      end
+
+    reason = selector_reason || permit2_message_reason(error.message || "")
+    reason && translate_permit2_reason(reason)
+  end
+
+  @spec permit2_message_reason(String.t()) :: invalid_reason() | nil
+  defp permit2_message_reason(message) do
+    Enum.find_value(@permit2_error_names, fn {name, reason} ->
+      if String.contains?(message, name), do: reason
+    end)
+  end
+
+  @spec translate_permit2_reason(invalid_reason()) :: invalid_reason()
+  defp translate_permit2_reason(reason), do: Map.get(@permit2_reason_translation, reason, reason)
 
   # -- Pipeline ---------------------------------------------------------------
 
@@ -342,9 +500,19 @@ defmodule X402.Verify.EVM do
           {:ok, verification()} | {:error, error()}
   defp do_verify(payment_payload, requirements, level, opts) do
     with {:ok, ctx} <- build_context(payment_payload, requirements) do
-      run_level(level, ctx, opts)
+      ctx
+      |> then(&run_level(level, &1, opts))
+      |> translate_error(ctx.kind)
     end
   end
+
+  @spec translate_error({:ok, verification()} | {:error, error()}, kind()) ::
+          {:ok, verification()} | {:error, error()}
+  defp translate_error({:error, {:invalid, reason}}, kind)
+       when kind in [:permit2_exact, :permit2_upto],
+       do: {:error, {:invalid, translate_permit2_reason(reason)}}
+
+  defp translate_error(outcome, _kind), do: outcome
 
   @spec run_level(level(), map(), keyword()) :: {:ok, verification()} | {:error, error()}
   defp run_level(:structural, ctx, _opts), do: {:ok, result(ctx, :structural, nil)}
@@ -353,17 +521,50 @@ defmodule X402.Verify.EVM do
 
   @spec result(map(), level(), signature_type() | nil) :: verification()
   defp result(ctx, level, signature_type),
-    do: %{payer: ctx.payer, level: level, signature_type: signature_type}
+    do: %{payer: ctx.payer, kind: ctx.kind, level: level, signature_type: signature_type}
 
   # -- Structural checks (no crypto, no RPC) ----------------------------------
 
+  # The context is the kind-independent state the signature and full levels
+  # consume: `authorization` (whatever object the digest is computed from),
+  # `asset`, `chain_id`, `value` (the amount that settles), `nonce`, and
+  # `payer`. Permit2 kinds add `spender` (the proxy) and `witness`.
   @spec build_context(map(), map()) :: {:ok, map()} | {:error, {:invalid, invalid_reason()}}
   defp build_context(payment_payload, requirements) do
     accepted = Utils.map_value(payment_payload, {"accepted", :accepted})
     scheme_payload = Utils.map_value(payment_payload, {"payload", :payload})
 
     with :ok <- ensure_maps(accepted, scheme_payload),
-         :ok <- check_scheme(accepted, requirements),
+         {:ok, kind} <- detect_kind(requirements) do
+      case kind do
+        :eip3009 -> build_eip3009_context(accepted, scheme_payload, requirements)
+        _permit2 -> build_permit2_context(kind, accepted, scheme_payload, requirements)
+      end
+    end
+  end
+
+  @spec detect_kind(map()) :: {:ok, kind()} | {:error, {:invalid, invalid_reason()}}
+  defp detect_kind(requirements) do
+    case Utils.map_value(requirements, {"scheme", :scheme}) do
+      "upto" ->
+        {:ok, :permit2_upto}
+
+      "exact" ->
+        case ExactEVM.transfer_method(requirements) do
+          {:ok, :eip3009} -> {:ok, :eip3009}
+          {:ok, :permit2} -> {:ok, :permit2_exact}
+          {:error, _reason} -> {:error, {:invalid, :unsupported_transfer_method}}
+        end
+
+      _other ->
+        {:error, {:invalid, :scheme_mismatch}}
+    end
+  end
+
+  @spec build_eip3009_context(map(), map(), map()) ::
+          {:ok, map()} | {:error, {:invalid, invalid_reason()}}
+  defp build_eip3009_context(accepted, scheme_payload, requirements) do
+    with :ok <- check_scheme(accepted, requirements),
          :ok <- check_network_match(accepted, requirements),
          {:ok, domain} <- derive_domain(requirements),
          {:ok, signature_bytes} <- extract_signature(scheme_payload),
@@ -376,6 +577,7 @@ defmodule X402.Verify.EVM do
          :ok <- check_timing(timing) do
       {:ok,
        %{
+         kind: :eip3009,
          domain: domain,
          authorization: authorization,
          signature_bytes: signature_bytes,
@@ -387,6 +589,198 @@ defmodule X402.Verify.EVM do
          value: value,
          nonce: Utils.map_value(authorization, {"nonce", :nonce})
        }}
+    end
+  end
+
+  # Mirrors the reference Permit2 verify order: scheme, network, spender,
+  # recipient, (facilitator for upto), deadline, validAfter, amount, token.
+  @spec build_permit2_context(kind(), map(), map(), map()) ::
+          {:ok, map()} | {:error, {:invalid, invalid_reason()}}
+  defp build_permit2_context(kind, accepted, scheme_payload, requirements) do
+    with :ok <- check_permit2_scheme(kind, accepted, requirements),
+         :ok <- check_permit2_network(kind, accepted, requirements),
+         {:ok, domain} <- derive_permit2_domain(requirements),
+         {:ok, asset} <- extract_asset(requirements),
+         {:ok, signature_bytes} <- extract_signature(scheme_payload),
+         {:ok, authorization, permitted, witness} <- extract_permit2_authorization(scheme_payload),
+         {:ok, spender} <- check_spender(kind, authorization),
+         :ok <- check_permit2_recipient(witness, requirements),
+         :ok <- check_facilitator(kind, witness, requirements),
+         :ok <- check_permit2_timing(authorization, witness),
+         {:ok, permitted_amount} <-
+           extract_amount(Utils.map_value(permitted, {"amount", :amount})),
+         {:ok, amount} <- extract_amount(Utils.map_value(requirements, {"amount", :amount})),
+         {:ok, value} <- check_permit2_amount(kind, permitted_amount, amount),
+         :ok <- check_permit2_token(permitted, asset),
+         {:ok, nonce} <- extract_amount(Utils.map_value(authorization, {"nonce", :nonce})) do
+      {:ok,
+       %{
+         kind: kind,
+         domain: domain,
+         authorization: authorization,
+         signature_bytes: signature_bytes,
+         payer: String.downcase(Utils.map_value(authorization, {"from", :from})),
+         asset: asset,
+         spender: spender,
+         witness: witness,
+         chain_id: domain.chain_id,
+         value: value,
+         nonce: nonce
+       }}
+    end
+  end
+
+  @spec check_permit2_scheme(kind(), map(), map()) ::
+          :ok | {:error, {:invalid, :scheme_mismatch | :upto_scheme_mismatch}}
+  defp check_permit2_scheme(:permit2_exact, accepted, requirements),
+    do: check_scheme(accepted, requirements)
+
+  defp check_permit2_scheme(:permit2_upto, accepted, _requirements) do
+    case Utils.map_value(accepted, {"scheme", :scheme}) do
+      "upto" -> :ok
+      _other -> {:error, {:invalid, :upto_scheme_mismatch}}
+    end
+  end
+
+  @spec check_permit2_network(kind(), map(), map()) ::
+          :ok | {:error, {:invalid, :network_mismatch | :upto_network_mismatch}}
+  defp check_permit2_network(kind, accepted, requirements) do
+    case {check_network_match(accepted, requirements), kind} do
+      {:ok, _kind} -> :ok
+      {{:error, _reason}, :permit2_upto} -> {:error, {:invalid, :upto_network_mismatch}}
+      {error, _kind} -> error
+    end
+  end
+
+  @spec derive_permit2_domain(map()) ::
+          {:ok, EIP712.domain()} | {:error, {:invalid, :unsupported_network}}
+  defp derive_permit2_domain(requirements) do
+    case Permit2.domain(requirements) do
+      {:ok, domain} -> {:ok, domain}
+      {:error, _reason} -> {:error, {:invalid, :unsupported_network}}
+    end
+  end
+
+  @spec extract_asset(map()) :: {:ok, String.t()} | {:error, {:invalid, :invalid_requirements}}
+  defp extract_asset(requirements) do
+    asset = Utils.map_value(requirements, {"asset", :asset})
+
+    case Wallet.valid_evm?(asset) do
+      true -> {:ok, asset}
+      false -> {:error, {:invalid, :invalid_requirements}}
+    end
+  end
+
+  @spec extract_permit2_authorization(map()) ::
+          {:ok, map(), map(), map()} | {:error, {:invalid, :invalid_authorization}}
+  defp extract_permit2_authorization(scheme_payload) do
+    authorization =
+      Utils.map_value(scheme_payload, {"permit2Authorization", :permit2Authorization})
+
+    with true <- is_map(authorization),
+         permitted = Utils.map_value(authorization, {"permitted", :permitted}),
+         witness = Utils.map_value(authorization, {"witness", :witness}),
+         true <- is_map(permitted) and is_map(witness),
+         true <- Wallet.valid_evm?(Utils.map_value(authorization, {"from", :from})),
+         true <- Wallet.valid_evm?(Utils.map_value(witness, {"to", :to})),
+         true <- Wallet.valid_evm?(Utils.map_value(permitted, {"token", :token})) do
+      {:ok, authorization, permitted, witness}
+    else
+      _other -> {:error, {:invalid, :invalid_authorization}}
+    end
+  end
+
+  @spec check_spender(kind(), map()) ::
+          {:ok, String.t()} | {:error, {:invalid, :invalid_permit2_spender}}
+  defp check_spender(kind, authorization) do
+    expected =
+      case kind do
+        :permit2_exact -> Permit2.exact_proxy_address()
+        :permit2_upto -> Permit2.upto_proxy_address()
+      end
+
+    spender = Utils.map_value(authorization, {"spender", :spender})
+
+    case is_binary(spender) and String.downcase(spender) == String.downcase(expected) do
+      true -> {:ok, expected}
+      false -> {:error, {:invalid, :invalid_permit2_spender}}
+    end
+  end
+
+  @spec check_permit2_recipient(map(), map()) ::
+          :ok | {:error, {:invalid, :permit2_recipient_mismatch}}
+  defp check_permit2_recipient(witness, requirements) do
+    to = Utils.map_value(witness, {"to", :to})
+    pay_to = Utils.map_value(requirements, {"payTo", :payTo})
+
+    case is_binary(pay_to) and String.downcase(to) == String.downcase(pay_to) do
+      true -> :ok
+      false -> {:error, {:invalid, :permit2_recipient_mismatch}}
+    end
+  end
+
+  @spec check_facilitator(kind(), map(), map()) ::
+          :ok | {:error, {:invalid, :upto_facilitator_mismatch}}
+  defp check_facilitator(:permit2_exact, _witness, _requirements), do: :ok
+
+  defp check_facilitator(:permit2_upto, witness, requirements) do
+    facilitator = Utils.map_value(witness, {"facilitator", :facilitator})
+
+    with {:ok, expected} <- Permit2.facilitator_address(requirements),
+         true <- is_binary(facilitator),
+         true <- String.downcase(facilitator) == String.downcase(expected) do
+      :ok
+    else
+      _mismatch -> {:error, {:invalid, :upto_facilitator_mismatch}}
+    end
+  end
+
+  @spec check_permit2_timing(map(), map()) ::
+          :ok
+          | {:error,
+             {:invalid,
+              :invalid_authorization | :permit2_deadline_expired | :permit2_not_yet_valid}}
+  defp check_permit2_timing(authorization, witness) do
+    with {:ok, deadline} <-
+           extract_amount(Utils.map_value(authorization, {"deadline", :deadline})),
+         {:ok, valid_after} <-
+           extract_amount(Utils.map_value(witness, {"validAfter", :validAfter})) do
+      now = System.system_time(:second)
+
+      cond do
+        deadline < now + @time_buffer_seconds -> {:error, {:invalid, :permit2_deadline_expired}}
+        valid_after > now -> {:error, {:invalid, :permit2_not_yet_valid}}
+        true -> :ok
+      end
+    end
+  end
+
+  # Exact: the permitted amount must equal the advertised amount and is what
+  # settles. Upto: the advertised amount settles and may not exceed the
+  # permitted ceiling.
+  @spec check_permit2_amount(kind(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, non_neg_integer()}
+          | {:error, {:invalid, :permit2_amount_mismatch | :settlement_exceeds_amount}}
+  defp check_permit2_amount(:permit2_exact, permitted, amount) when permitted == amount,
+    do: {:ok, amount}
+
+  defp check_permit2_amount(:permit2_exact, _permitted, _amount),
+    do: {:error, {:invalid, :permit2_amount_mismatch}}
+
+  defp check_permit2_amount(:permit2_upto, permitted, amount) when amount <= permitted,
+    do: {:ok, amount}
+
+  defp check_permit2_amount(:permit2_upto, _permitted, _amount),
+    do: {:error, {:invalid, :settlement_exceeds_amount}}
+
+  @spec check_permit2_token(map(), String.t()) ::
+          :ok | {:error, {:invalid, :permit2_token_mismatch}}
+  defp check_permit2_token(permitted, asset) do
+    token = Utils.map_value(permitted, {"token", :token})
+
+    case String.downcase(token) == String.downcase(asset) do
+      true -> :ok
+      false -> {:error, {:invalid, :permit2_token_mismatch}}
     end
   end
 
@@ -581,12 +975,18 @@ defmodule X402.Verify.EVM do
 
   @spec compute_digest(map()) :: {:ok, <<_::256>>} | {:error, error()}
   defp compute_digest(ctx) do
-    case EIP3009.eip712_digest(ctx.domain, ctx.authorization) do
+    case digest_for(ctx) do
       {:ok, digest} -> {:ok, digest}
       {:error, :missing_dependency} -> {:error, :missing_dependency}
       {:error, _reason} -> {:error, {:invalid, :invalid_authorization}}
     end
   end
+
+  @spec digest_for(map()) :: {:ok, <<_::256>>} | {:error, term()}
+  defp digest_for(%{kind: :eip3009} = ctx),
+    do: EIP3009.eip712_digest(ctx.domain, ctx.authorization)
+
+  defp digest_for(ctx), do: Permit2.digest(ctx.domain, ctx.authorization)
 
   @spec verify_eoa(map(), binary(), binary()) ::
           :ok | {:error, :missing_dependency | {:invalid, :invalid_signature}}
@@ -612,6 +1012,7 @@ defmodule X402.Verify.EVM do
          {:ok, chain_state} <- preflight(rpc, ctx, opts),
          :ok <- check_chain_id(chain_state, ctx, opts),
          :ok <- check_asset_deployed(chain_state),
+         :ok <- check_proxy_deployed(chain_state),
          :ok <- check_balance(chain_state, ctx),
          {:ok, signature_type} <- classify_and_verify(rpc, ctx, parsed, digest, chain_state, opts),
          :ok <- maybe_simulate(rpc, ctx, parsed, signature_type, opts) do
@@ -628,16 +1029,18 @@ defmodule X402.Verify.EVM do
   end
 
   # One batched round-trip: chain id (optional), payer code, asset code,
-  # payer balance.
+  # payer balance, and — for Permit2 kinds — the proxy's code.
   @spec preflight(RPC.t(), map(), keyword()) :: {:ok, map()} | {:error, error()}
   defp preflight(rpc, ctx, opts) do
     verify_chain_id? = Keyword.fetch!(opts, :verify_chain_id)
+    proxy = Map.get(ctx, :spender)
 
-    base_requests = [
-      {"eth_getCode", [ctx.payer, "latest"]},
-      {"eth_getCode", [ctx.asset, "latest"]},
-      {"eth_call", [%{"to" => ctx.asset, "data" => balance_of_calldata(ctx)}, "latest"]}
-    ]
+    base_requests =
+      [
+        {"eth_getCode", [ctx.payer, "latest"]},
+        {"eth_getCode", [ctx.asset, "latest"]},
+        {"eth_call", [%{"to" => ctx.asset, "data" => balance_of_calldata(ctx)}, "latest"]}
+      ] ++ List.wrap(proxy && {"eth_getCode", [proxy, "latest"]})
 
     requests =
       case verify_chain_id? do
@@ -646,7 +1049,7 @@ defmodule X402.Verify.EVM do
       end
 
     with {:ok, results} <- rpc_batch(rpc, requests) do
-      {chain_id_result, [payer_code, asset_code, balance]} =
+      {chain_id_result, [payer_code, asset_code, balance | proxy_results]} =
         case verify_chain_id? do
           true ->
             [chain_id_result | rest] = results
@@ -657,17 +1060,24 @@ defmodule X402.Verify.EVM do
         end
 
       with {:ok, payer_code} <- expect_rpc_ok(payer_code),
-           {:ok, asset_code} <- expect_rpc_ok(asset_code) do
+           {:ok, asset_code} <- expect_rpc_ok(asset_code),
+           {:ok, proxy_code} <- expect_proxy_code(proxy_results) do
         {:ok,
          %{
            chain_id: chain_id_result,
            payer_code: payer_code,
            asset_code: asset_code,
+           proxy_code: proxy_code,
            balance: balance
          }}
       end
     end
   end
+
+  @spec expect_proxy_code([RPC.batch_result()]) ::
+          {:ok, term()} | {:error, {:rpc_error, RPC.error()}}
+  defp expect_proxy_code([]), do: {:ok, nil}
+  defp expect_proxy_code([proxy_code]), do: expect_rpc_ok(proxy_code)
 
   @spec rpc_batch(RPC.t(), [RPC.batch_request()]) ::
           {:ok, [RPC.batch_result()]} | {:error, {:rpc_error, RPC.error()}}
@@ -706,6 +1116,18 @@ defmodule X402.Verify.EVM do
     case deployed_code?(code) do
       true -> :ok
       false -> {:error, {:invalid, :asset_not_deployed_contract}}
+    end
+  end
+
+  # Permit2 kinds only (`proxy_code` is nil otherwise): a missing proxy on
+  # this chain means settle can never succeed.
+  @spec check_proxy_deployed(map()) :: :ok | {:error, {:invalid, :permit2_proxy_not_deployed}}
+  defp check_proxy_deployed(%{proxy_code: nil}), do: :ok
+
+  defp check_proxy_deployed(%{proxy_code: code}) do
+    case deployed_code?(code) do
+      true -> :ok
+      false -> {:error, {:invalid, :permit2_proxy_not_deployed}}
     end
   end
 
@@ -828,7 +1250,7 @@ defmodule X402.Verify.EVM do
           :ok | {:error, error()}
   defp simulate_transfer(rpc, ctx, parsed, signature_type) do
     with {:ok, calldata} <- transfer_calldata(ctx, parsed.inner_signature, signature_type) do
-      case RPC.call(rpc, %{"to" => ctx.asset, "data" => hex(calldata)}) do
+      case RPC.call(rpc, simulation_call(ctx, calldata)) do
         {:ok, _return} -> :ok
         {:error, {:jsonrpc_error, error}} -> handle_simulation_revert(rpc, ctx, error)
         {:error, reason} -> {:error, {:rpc_error, reason}}
@@ -836,11 +1258,32 @@ defmodule X402.Verify.EVM do
     end
   end
 
+  # EIP-3009 transfers go to the token; Permit2 settlements go to the proxy.
+  # The upto proxy only accepts the witness facilitator as msg.sender, so
+  # that simulation must originate from it.
+  @spec simulation_call(map(), binary()) :: map()
+  defp simulation_call(%{kind: :eip3009} = ctx, calldata),
+    do: %{"to" => ctx.asset, "data" => hex(calldata)}
+
+  defp simulation_call(%{kind: :permit2_exact} = ctx, calldata),
+    do: %{"to" => ctx.spender, "data" => hex(calldata), "from" => ctx.payer}
+
+  defp simulation_call(%{kind: :permit2_upto} = ctx, calldata) do
+    facilitator = Utils.map_value(ctx.witness, {"facilitator", :facilitator})
+    %{"to" => ctx.spender, "data" => hex(calldata), "from" => facilitator}
+  end
+
+  @spec simulation_target(map()) :: String.t()
+  defp simulation_target(%{kind: :eip3009} = ctx), do: ctx.asset
+  defp simulation_target(ctx), do: ctx.spender
+
   # Counterfactual wallets are deployed and charged in a single atomic
   # eth_call through Multicall3 — factory deployment then
-  # transferWithAuthorization, with the deployment's state visible to the
-  # transfer. This is the only check that can prove an ERC-6492
-  # counterfactual signature.
+  # transferWithAuthorization (or the proxy's settle), with the deployment's
+  # state visible to the transfer. This is the only check that can prove an
+  # ERC-6492 counterfactual signature. Note the upto proxy rejects
+  # Multicall3 as msg.sender, so counterfactual upto payments cannot be
+  # proven this way and surface as `:upto_unauthorized_facilitator`.
   @spec simulate_counterfactual(RPC.t(), map(), ERC6492.parsed(), keyword()) ::
           :ok | {:error, error()}
   defp simulate_counterfactual(rpc, ctx, parsed, opts) do
@@ -849,7 +1292,7 @@ defmodule X402.Verify.EVM do
       calldata =
         aggregate3_calldata([
           {parsed.factory, parsed.factory_calldata},
-          {ctx.asset, transfer}
+          {simulation_target(ctx), transfer}
         ])
 
       multicall = Keyword.fetch!(opts, :multicall_address)
@@ -869,7 +1312,9 @@ defmodule X402.Verify.EVM do
         :ok
 
       {:ok, [_deploy_result, {false, return_data}]} ->
-        case classify_revert_text(decode_revert_string(return_data) || "") do
+        error = %{code: nil, message: nil, data: hex(return_data)}
+
+        case classify_for_kind(ctx, error) do
           nil -> diagnose(rpc, ctx)
           reason -> {:error, {:invalid, reason}}
         end
@@ -881,11 +1326,15 @@ defmodule X402.Verify.EVM do
 
   @spec handle_simulation_revert(RPC.t(), map(), RPC.jsonrpc_error()) :: {:error, error()}
   defp handle_simulation_revert(rpc, ctx, error) do
-    case classify_revert_text(revert_text(error)) do
+    case classify_for_kind(ctx, error) do
       nil -> diagnose(rpc, ctx)
       reason -> {:error, {:invalid, reason}}
     end
   end
+
+  @spec classify_for_kind(map(), RPC.jsonrpc_error()) :: invalid_reason() | nil
+  defp classify_for_kind(%{kind: :eip3009}, error), do: classify_revert(error)
+  defp classify_for_kind(_ctx, error), do: classify_permit2_revert(error)
 
   # Classifies a node revert (message plus any ABI-encoded Error(string)
   # data) onto the canonical invalid reasons. Public so
@@ -948,7 +1397,7 @@ defmodule X402.Verify.EVM do
   # the reference multicall probe: authorizationState, token name/version,
   # and balance, most-specific reason first.
   @spec diagnose(RPC.t(), map()) :: {:error, error()}
-  defp diagnose(rpc, ctx) do
+  defp diagnose(rpc, %{kind: :eip3009} = ctx) do
     requests = [
       eth_call_request(ctx.asset, @selector_authorization_state <> authorization_state_args(ctx)),
       eth_call_request(ctx.asset, @selector_name),
@@ -964,6 +1413,51 @@ defmodule X402.Verify.EVM do
         {:error, {:invalid, :simulation_failed}}
     end
   end
+
+  # Permit2 probe, mirroring the reference facilitator: is the proxy
+  # deployed (its PERMIT2() getter answers), does the payer hold the amount,
+  # and has the payer approved the canonical Permit2 contract for it.
+  defp diagnose(rpc, ctx) do
+    requests = [
+      eth_call_request(ctx.spender, @selector_permit2_getter),
+      eth_call_request(ctx.asset, @selector_balance_of <> address_word(ctx.payer)),
+      eth_call_request(ctx.asset, @selector_allowance <> allowance_args(ctx))
+    ]
+
+    case RPC.batch(rpc, requests) do
+      {:ok, [proxy, balance, allowance]} ->
+        {:error, {:invalid, diagnose_permit2_reason(ctx, proxy, balance, allowance)}}
+
+      {:error, _reason} ->
+        {:error, {:invalid, :permit2_simulation_failed}}
+    end
+  end
+
+  @spec diagnose_permit2_reason(
+          map(),
+          RPC.batch_result(),
+          RPC.batch_result(),
+          RPC.batch_result()
+        ) :: invalid_reason()
+  defp diagnose_permit2_reason(ctx, proxy, balance, allowance) do
+    cond do
+      not match?({:ok, _hex}, proxy) or not deployed_code?(elem(proxy, 1)) ->
+        :permit2_proxy_not_deployed
+
+      balance_below?(balance, ctx.value) ->
+        :permit2_insufficient_balance
+
+      balance_below?(allowance, ctx.value) ->
+        :permit2_allowance_required
+
+      true ->
+        :permit2_simulation_failed
+    end
+  end
+
+  @spec allowance_args(map()) :: binary()
+  defp allowance_args(ctx),
+    do: address_word(ctx.payer) <> address_word(Permit2.permit2_address())
 
   @spec diagnose_reason(
           map(),
@@ -1040,14 +1534,28 @@ defmodule X402.Verify.EVM do
   # type, never byte length: a smart wallet's ERC-1271 signature can be
   # exactly 65 bytes, and the (v, r, s) overload performs on-chain ECDSA,
   # which would wrongly reject it.
+  #
+  # Permit2 settlements always pass the raw signature bytes: Permit2 routes
+  # EOA vs. contract verification itself from the owner's bytecode.
   @spec transfer_calldata(map(), binary(), signature_type()) ::
           {:ok, binary()} | {:error, {:invalid, :invalid_signature}}
   defp transfer_calldata(ctx, inner_signature, signature_type) do
-    case EIP3009.transfer_calldata(ctx.authorization, inner_signature, signature_type) do
+    case settlement_calldata(ctx, inner_signature, signature_type) do
       {:ok, calldata} -> {:ok, calldata}
       {:error, _reason} -> {:error, {:invalid, :invalid_signature}}
     end
   end
+
+  @spec settlement_calldata(map(), binary(), signature_type()) ::
+          {:ok, binary()} | {:error, term()}
+  defp settlement_calldata(%{kind: :eip3009} = ctx, inner_signature, signature_type),
+    do: EIP3009.transfer_calldata(ctx.authorization, inner_signature, signature_type)
+
+  defp settlement_calldata(%{kind: :permit2_exact} = ctx, inner_signature, _signature_type),
+    do: Permit2.exact_settle_calldata(ctx.authorization, inner_signature)
+
+  defp settlement_calldata(%{kind: :permit2_upto} = ctx, inner_signature, _signature_type),
+    do: Permit2.upto_settle_calldata(ctx.authorization, ctx.value, inner_signature)
 
   # aggregate3(Call3[] calls) with Call3 = (address target, bool allowFailure,
   # bytes callData). Every sub-call is encoded with allowFailure = true so the

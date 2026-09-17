@@ -711,8 +711,51 @@ defmodule X402.Facilitator do
       "upto" ->
         validate_upto_payment(operation, payload, requirements)
 
+      "exact" ->
+        validate_exact_payment(payload, requirements)
+
       _scheme ->
         :ok
+    end
+  end
+
+  # Exact payments using the Permit2 transfer method settle exactly
+  # `permitted.amount`, so a permitted amount that differs from the
+  # requirements' amount can never be a valid payment for these
+  # requirements — reject it locally before the facilitator round-trip.
+  # EIP-3009 payloads (no permit2Authorization) are left to the facilitator.
+  defp validate_exact_payment(payload, requirements) do
+    permitted =
+      Utils.nested_map_value(payload, [
+        {"payload", :payload},
+        {"permit2Authorization", :permit2Authorization},
+        {"permitted", :permitted},
+        {"amount", :amount}
+      ])
+
+    amount = Utils.map_value(requirements, {"amount", :amount})
+
+    case {permitted, amount} do
+      {nil, _amount} -> :ok
+      {_permitted, nil} -> :ok
+      {permitted, amount} -> ensure_exact_amount(permitted, amount)
+    end
+  end
+
+  defp ensure_exact_amount(permitted, amount) do
+    with {:ok, permitted} <- parse_exact_amount(permitted, :invalid_payment_value),
+         {:ok, amount} <- parse_exact_amount(amount, :invalid_amount) do
+      case Utils.compare_decimal(permitted, amount) do
+        :eq -> :ok
+        _comparison -> {:error, {:invalid_exact_payment, :amount_mismatch}}
+      end
+    end
+  end
+
+  defp parse_exact_amount(value, reason) do
+    case Utils.parse_decimal(value) do
+      {:ok, parsed} -> {:ok, parsed}
+      :error -> {:error, {:invalid_exact_payment, reason}}
     end
   end
 

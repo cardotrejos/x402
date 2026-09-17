@@ -233,7 +233,8 @@ defmodule X402.Plug.FacilitatorTest do
 
       assert json_response(conn) == %{
                "kinds" => [
-                 %{"x402Version" => 2, "scheme" => "exact", "network" => @network}
+                 %{"x402Version" => 2, "scheme" => "exact", "network" => @network},
+                 %{"x402Version" => 2, "scheme" => "upto", "network" => @network}
                ],
                "extensions" => [],
                "signers" => %{"eip155:*" => [@facilitator_address]}
@@ -647,7 +648,7 @@ defmodule X402.Plug.FacilitatorTest do
       assert json_response(conn) == %{"isValid" => false, "invalidReason" => "invalid_network"}
 
       # A scheme no engine serves.
-      wrong_scheme = requirements(%{"scheme" => "upto"})
+      wrong_scheme = requirements(%{"scheme" => "other"})
       conn = post_json(options, "/verify", wire_body(payload, wrong_scheme))
       assert conn.status == 200
 
@@ -677,6 +678,7 @@ defmodule X402.Plug.FacilitatorTest do
       assert json_response(conn) == %{
                "kinds" => [
                  %{"x402Version" => 2, "scheme" => "exact", "network" => @network},
+                 %{"x402Version" => 2, "scheme" => "upto", "network" => @network},
                  %{
                    "x402Version" => 2,
                    "scheme" => "exact",
