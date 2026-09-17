@@ -13,7 +13,21 @@ defmodule X402.Facilitator.HTTP do
   @accept_json_headers [{"accept", "application/json"}]
 
   @type finch_name :: atom() | pid() | {:via, module(), term()}
-  @type response :: {:ok, %{status: non_neg_integer(), body: map()}} | {:error, Error.t()}
+
+  @typedoc """
+  A successful facilitator HTTP response.
+
+  `:headers` carries the response headers as returned by Finch (names
+  lower-cased), so callers can read transport sidechannels such as
+  `EXTENSION-RESPONSES` (see `X402.ExtensionResponses`).
+  """
+  @type success :: %{
+          status: non_neg_integer(),
+          body: map(),
+          headers: [{String.t(), String.t()}]
+        }
+
+  @type response :: {:ok, success()} | {:error, Error.t()}
 
   @typedoc "Query string parameters accepted by `get/4`."
   @type query :: [{String.t(), String.t() | integer()}]
@@ -183,8 +197,8 @@ defmodule X402.Facilitator.HTTP do
       end
 
     case response do
-      {:ok, %{status: status, body: body}} when status in 200..299 ->
-        decode_success_response(status, body, attempt)
+      {:ok, %{status: status, body: body} = success} when status in 200..299 ->
+        decode_success_response(status, body, response_headers(success), attempt)
 
       {:ok, %{status: status, body: body}} when status in @transient_statuses ->
         {:error,
@@ -239,10 +253,13 @@ defmodule X402.Facilitator.HTTP do
     ok
   end
 
-  defp decode_success_response(status, body, attempt) do
+  defp response_headers(%{headers: headers}) when is_list(headers), do: headers
+  defp response_headers(_response), do: []
+
+  defp decode_success_response(status, body, headers, attempt) do
     case decode_json_body(body) do
       {:ok, decoded_body} ->
-        {:ok, %{status: status, body: decoded_body}}
+        {:ok, %{status: status, body: decoded_body, headers: headers}}
 
       {:error, reason} ->
         {:error,

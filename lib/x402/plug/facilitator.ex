@@ -50,6 +50,17 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     `verify/3`, `settle/3`, and `supported/1` with the engine wire
     contract can be listed.
 
+    ## Extension responses sidechannel
+
+    An engine's `verify/3` or `settle/3` may return
+    `{:ok, wire_response, extension_responses}` where the third element is
+    a map of extension outcomes keyed by extension name (for example
+    `%{"bazaar" => %{"status" => "success"}}`). The plug encodes it into the
+    `EXTENSION-RESPONSES` response header (x402 v2 §7.2.1, see
+    `X402.ExtensionResponses`), keeping it out of the JSON body that
+    resource servers may relay to buyers. The built-in engines return the
+    two-element form.
+
     ## Request/response contract
 
     `POST /verify` and `POST /settle` require exactly the v2 facilitator
@@ -79,6 +90,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @behaviour Plug
 
+    alias X402.ExtensionResponses
     alias X402.Facilitator.Engine
 
     require Logger
@@ -87,6 +99,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       only: [
         get_req_header: 2,
         put_resp_content_type: 2,
+        put_resp_header: 3,
         read_body: 2,
         send_resp: 3
       ]
@@ -283,6 +296,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             {:ok, response} ->
               send_json(conn, 200, response)
 
+            {:ok, response, extension_responses} ->
+              conn
+              |> put_extension_responses(operation, extension_responses)
+              |> send_json(200, response)
+
             {:error, reason} ->
               # Opaque on the wire; the operator sees the real reason here.
               Logger.error("x402 facilitator #{operation} failed: #{inspect(reason)}")
@@ -293,6 +311,27 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           # Facilitator convention: no matching engine is a protocol-level
           # rejection, not a transport error.
           send_json(conn, 200, unsupported_response(operation, reason, network))
+      end
+    end
+
+    # The sidechannel is advisory, so an outcome map the engine could not
+    # encode is logged and dropped instead of turning a valid verdict into a
+    # 500.
+    @spec put_extension_responses(Plug.Conn.t(), :verify | :settle, term()) :: Plug.Conn.t()
+    defp put_extension_responses(conn, _operation, empty) when empty in [nil, %{}], do: conn
+
+    defp put_extension_responses(conn, operation, extension_responses) do
+      case ExtensionResponses.encode(extension_responses) do
+        {:ok, value} ->
+          put_resp_header(conn, "extension-responses", value)
+
+        {:error, reason} ->
+          Logger.error(
+            "x402 facilitator #{operation} returned unencodable extension responses " <>
+              "(#{inspect(reason)}): #{inspect(extension_responses)}"
+          )
+
+          conn
       end
     end
 

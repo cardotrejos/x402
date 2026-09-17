@@ -26,6 +26,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
        can reconcile — mirroring the reference resource servers. Successful
        settlements attach a `PAYMENT-RESPONSE` header and assign
        `:x402_payment_payload` / `:x402_payment_requirements` on the conn.
+       When the facilitator reports extension outcomes through the
+       `EXTENSION-RESPONSES` sidechannel (see `X402.ExtensionResponses`),
+       the verify-time outcomes are assigned as `:x402_extension_responses`
+       and settle-time outcomes are attached to the
+       `[:x402, :plug, :payment_verified]` telemetry metadata; the
+       sidechannel is never forwarded to the buyer.
 
     HTTP status mapping (HTTP transport v2):
 
@@ -840,7 +846,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
            {:ok, client_payment_id} <- extract_client_payment_id(payment_payload),
            payment_id = replay_key(header, payment_payload, requirements),
            :ok <- run_local_prechecks(opts, payment_payload, requirements),
-           :ok <- claim_and_verify(opts, payment_id, payment_payload, requirements) do
+           {:ok, verify_response} <-
+             claim_and_verify(opts, payment_id, payment_payload, requirements) do
         settlement_context = %{
           facilitator: opts.facilitator,
           hooks: opts.hooks,
@@ -858,6 +865,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         |> assign(:x402_payment_payload, payment_payload)
         |> assign(:x402_payment_requirements, requirements)
         |> maybe_assign_client_payment_id(client_payment_id)
+        |> maybe_assign_extension_responses(verify_response)
         |> register_before_send(fn response_conn ->
           settle_after_resource(response_conn, settlement_context)
         end)
@@ -964,7 +972,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
           emit(
             :payment_verified,
-            maybe_put(metadata, :payment_id, settlement_context.client_payment_id)
+            metadata
+            |> maybe_put(:payment_id, settlement_context.client_payment_id)
+            |> maybe_put(:extension_responses, extension_responses(settle_response))
           )
 
           response_conn
@@ -1148,10 +1158,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # :before_verify — claim first, rejecting duplicates without contacting
     # the facilitator; release the claim when verification fails for any
     # reason so the payer can retry.
-    @spec claim_and_verify(options(), String.t(), map(), map()) :: :ok | {:error, term()}
+    @spec claim_and_verify(options(), String.t(), map(), map()) ::
+            {:ok, map()} | {:error, term()}
     defp claim_and_verify(%{claim_order: :after_verify} = opts, payment_id, payload, requirements) do
-      with :ok <- verify_payment(opts, payload, requirements) do
-        claim_payment(opts.payment_identifier_cache, payment_id)
+      with {:ok, verify_response} <- verify_payment(opts, payload, requirements),
+           :ok <- claim_payment(opts.payment_identifier_cache, payment_id) do
+        {:ok, verify_response}
       end
     end
 
@@ -1172,11 +1184,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # before letting the exit propagate, or the payer's legitimate retry is
     # rejected as a duplicate until the cache TTL expires.
     @spec verify_with_claim_release(options(), String.t(), map(), map()) ::
-            :ok | {:error, term()}
+            {:ok, map()} | {:error, term()}
     defp verify_with_claim_release(opts, payment_id, payload, requirements) do
       case verify_payment(opts, payload, requirements) do
-        :ok ->
-          :ok
+        {:ok, verify_response} ->
+          {:ok, verify_response}
 
         {:error, reason} ->
           release_claim(opts.payment_identifier_cache, payment_id)
@@ -1188,12 +1200,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         exit(reason)
     end
 
-    @spec verify_payment(options(), map(), map()) :: :ok | {:error, term()}
+    @spec verify_payment(options(), map(), map()) :: {:ok, map()} | {:error, term()}
     defp verify_payment(opts, payment_payload, requirements) do
       with :ok <- run_local_verification(opts, payment_payload, requirements),
            {:ok, verify_response} <-
-             facilitator_verify(opts.facilitator, payment_payload, requirements, opts.hooks) do
-        ensure_verify_success(verify_response)
+             facilitator_verify(opts.facilitator, payment_payload, requirements, opts.hooks),
+           :ok <- ensure_verify_success(verify_response) do
+        {:ok, verify_response}
       end
     end
 
@@ -1633,6 +1646,23 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp decode_bare_payment_id(_value),
       do: {:error, {:invalid_payment_identifier, :invalid_payment_id}}
+
+    # The facilitator's EXTENSION-RESPONSES sidechannel is for the resource
+    # server only: it is exposed to the handler through assigns and never
+    # copied into the PAYMENT-RESPONSE header.
+    @spec maybe_assign_extension_responses(Plug.Conn.t(), map()) :: Plug.Conn.t()
+    defp maybe_assign_extension_responses(conn, verify_response) do
+      case extension_responses(verify_response) do
+        nil -> conn
+        responses -> assign(conn, :x402_extension_responses, responses)
+      end
+    end
+
+    @spec extension_responses(map()) :: map() | nil
+    defp extension_responses(%{extension_responses: responses}) when is_map(responses),
+      do: responses
+
+    defp extension_responses(_response), do: nil
 
     @spec maybe_assign_client_payment_id(Plug.Conn.t(), String.t() | nil) :: Plug.Conn.t()
     defp maybe_assign_client_payment_id(conn, nil), do: conn

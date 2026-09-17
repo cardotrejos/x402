@@ -2719,6 +2719,90 @@ defmodule X402.Plug.PaymentGateTest do
   # Payment identifier extension surfacing
   # ---------------------------------------------------------------------------
 
+  describe "extension responses sidechannel" do
+    test "assigns verify-time outcomes and tags settle telemetry without forwarding them" do
+      {:ok, verify_header} =
+        X402.ExtensionResponses.encode(%{"bazaar" => %{"status" => "processing"}})
+
+      {:ok, settle_header} =
+        X402.ExtensionResponses.encode(%{"bazaar" => %{"status" => "success"}})
+
+      {:ok, %{body: settle_body}} = @default_settle
+      bypass = Bypass.open()
+
+      Bypass.stub(bypass, "POST", "/verify", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("extension-responses", verify_header)
+        |> Plug.Conn.resp(200, Jason.encode!(%{"isValid" => true, "payer" => "0xpayer"}))
+      end)
+
+      Bypass.stub(bypass, "POST", "/settle", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("extension-responses", settle_header)
+        |> Plug.Conn.resp(200, Jason.encode!(settle_body))
+      end)
+
+      facilitator = start_facilitator(url: "http://localhost:#{bypass.port}")
+      handler_id = "extension-responses-#{System.unique_integer([:positive, :monotonic])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :plug, :payment_verified],
+          fn _event, _measurements, metadata, _config ->
+            send(parent, {:verified_metadata, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      assert conn.assigns[:x402_extension_responses] == %{"bazaar" => %{"status" => "processing"}}
+
+      assert_receive {:verified_metadata,
+                      %{extension_responses: %{"bazaar" => %{"status" => "success"}}}}
+
+      assert decode_payment_response!(conn) == settle_body
+      assert get_resp_header(conn, "extension-responses") == []
+    end
+
+    test "leaves the assign unset when the facilitator sends no sidechannel" do
+      facilitator = start_mock_facilitator()
+      handler_id = "extension-responses-#{System.unique_integer([:positive, :monotonic])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :plug, :payment_verified],
+          fn _event, _measurements, metadata, _config ->
+            send(parent, {:verified_metadata, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@route], facilitator: facilitator)
+
+      assert conn.status == 200
+      refute Map.has_key?(conn.assigns, :x402_extension_responses)
+
+      assert_receive {:verified_metadata, metadata}
+      refute Map.has_key?(metadata, :extension_responses)
+    end
+  end
+
   describe "payment identifier extension" do
     test "assigns x402_payment_id and tags telemetry for a well-formed extension" do
       facilitator = start_mock_facilitator()

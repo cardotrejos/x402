@@ -45,6 +45,26 @@ defmodule X402.Plug.FacilitatorTest do
     def read_req_body(_state, _opts), do: {:error, :timeout}
   end
 
+  defmodule SidechannelEngine do
+    @moduledoc false
+
+    # Canned engine whose verify/settle results are chosen by the test so
+    # the three-element {:ok, response, extension_responses} form can be
+    # exercised without a chain.
+    defstruct [:verify_result, :settle_result]
+
+    def verify(%__MODULE__{verify_result: result}, _payload, _requirements), do: result
+    def settle(%__MODULE__{settle_result: result}, _payload, _requirements), do: result
+
+    def supported(_engine) do
+      %{
+        "kinds" => [%{"x402Version" => 2, "scheme" => "exact", "network" => "eip155:84532"}],
+        "extensions" => [],
+        "signers" => %{}
+      }
+    end
+  end
+
   # -- Fixtures ---------------------------------------------------------------
 
   defp requirements(overrides \\ %{}) do
@@ -331,6 +351,85 @@ defmodule X402.Plug.FacilitatorTest do
 
       assert conn.status == 200
       assert %{"success" => false, "transaction" => ""} = json_response(conn)
+    end
+  end
+
+  # -- EXTENSION-RESPONSES sidechannel -----------------------------------------
+
+  describe "extension responses sidechannel" do
+    import ExUnit.CaptureLog
+
+    defp sidechannel_options(verify_result, settle_result) do
+      engine = %SidechannelEngine{verify_result: verify_result, settle_result: settle_result}
+      FacilitatorPlug.init(engines: [engine], auth_token: "secret")
+    end
+
+    defp sidechannel_post(options, path) do
+      requirements = requirements()
+
+      :post
+      |> conn(path, wire_body(signed_payload(requirements), requirements))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer secret")
+      |> FacilitatorPlug.call(options)
+    end
+
+    test "encodes a three-element engine result into the response header" do
+      verify =
+        {:ok, %{"isValid" => true, "payer" => @payer}, %{"bazaar" => %{"status" => "success"}}}
+
+      settle =
+        {:ok, %{"success" => true, "transaction" => @tx_hash, "network" => @network},
+         %{"bazaar" => %{"status" => "processing"}}}
+
+      options = sidechannel_options(verify, settle)
+
+      verify_conn = sidechannel_post(options, "/verify")
+      assert verify_conn.status == 200
+      assert json_response(verify_conn) == %{"isValid" => true, "payer" => @payer}
+
+      assert {:ok, %{"bazaar" => %{"status" => "success"}}} =
+               X402.ExtensionResponses.from_headers(verify_conn.resp_headers)
+
+      settle_conn = sidechannel_post(options, "/settle")
+      assert settle_conn.status == 200
+
+      assert {:ok, %{"bazaar" => %{"status" => "processing"}}} =
+               X402.ExtensionResponses.from_headers(settle_conn.resp_headers)
+    end
+
+    test "omits the header for empty or nil outcomes" do
+      options =
+        sidechannel_options(
+          {:ok, %{"isValid" => true}, %{}},
+          {:ok, %{"success" => true}, nil}
+        )
+
+      verify_conn = sidechannel_post(options, "/verify")
+      assert verify_conn.status == 200
+      assert get_resp_header(verify_conn, "extension-responses") == []
+
+      settle_conn = sidechannel_post(options, "/settle")
+      assert settle_conn.status == 200
+      assert get_resp_header(settle_conn, "extension-responses") == []
+    end
+
+    test "logs and drops outcomes that cannot be encoded" do
+      options =
+        sidechannel_options(
+          {:ok, %{"isValid" => true}, %{"bazaar" => "success"}},
+          {:ok, %{"success" => true}}
+        )
+
+      log =
+        capture_log(fn ->
+          conn = sidechannel_post(options, "/verify")
+          assert conn.status == 200
+          assert json_response(conn) == %{"isValid" => true}
+          assert get_resp_header(conn, "extension-responses") == []
+        end)
+
+      assert log =~ "unencodable extension responses"
     end
   end
 
