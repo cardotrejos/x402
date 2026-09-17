@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-16
+
 ### Fixed
 
 - Accept Solana signers in `X402.Client.Finch` and `X402.MCP.Client` option
