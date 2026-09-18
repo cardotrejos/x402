@@ -28,6 +28,7 @@ defmodule X402.Plug.PaymentGateSIWXTest do
   @address "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a"
   @evm_chain "eip155:8453"
   @resource "http://www.example.com/api/resource"
+  @access_resource "GET " <> @resource
 
   @route %{
     method: :get,
@@ -150,7 +151,7 @@ defmodule X402.Plug.PaymentGateSIWXTest do
     test "serves a recorded payer without payment", %{siwx: siwx, storage: storage} do
       facilitator = start_mock_facilitator()
       opts = gate_opts(siwx: siwx, facilitator: facilitator)
-      :ok = ETSStorage.put(storage, @address, @resource, :paid, 60_000)
+      :ok = ETSStorage.put(storage, @address, @access_resource, :paid, 60_000)
       attach_telemetry([:x402, :plug, :siwx_authenticated])
 
       conn =
@@ -187,7 +188,7 @@ defmodule X402.Plug.PaymentGateSIWXTest do
 
     test "a proof authenticates once with a nonce cache", %{siwx: siwx, storage: storage} do
       opts = gate_opts(siwx: siwx)
-      :ok = ETSStorage.put(storage, @address, @resource, :paid, 60_000)
+      :ok = ETSStorage.put(storage, @address, @access_resource, :paid, 60_000)
       header = proof(opts)
 
       first =
@@ -211,7 +212,7 @@ defmodule X402.Plug.PaymentGateSIWXTest do
       storage: storage
     } do
       opts = gate_opts(siwx: siwx)
-      :ok = ETSStorage.put(storage, @address, @resource, :paid, 60_000)
+      :ok = ETSStorage.put(storage, @address, @access_resource, :paid, 60_000)
       attach_telemetry([:x402, :plug, :payment_rejected])
 
       challenge = fetch_challenge(opts)
@@ -268,7 +269,7 @@ defmodule X402.Plug.PaymentGateSIWXTest do
       storage: storage
     } do
       opts = gate_opts(siwx: siwx)
-      :ok = ETSStorage.put(storage, @address, @resource, :paid, 60_000)
+      :ok = ETSStorage.put(storage, @address, @access_resource, :paid, 60_000)
       attach_telemetry([:x402, :siwx, :legacy])
       challenge = fetch_challenge(opts)
 
@@ -301,6 +302,146 @@ defmodule X402.Plug.PaymentGateSIWXTest do
   end
 
   describe "payer recording" do
+    test "checksummed settlement payers authenticate with lowercase proofs", %{siwx: siwx} do
+      {:ok, response} = @default_settle
+      mixed = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAfF2A"
+      settle = {:ok, %{response | body: Map.put(response.body, "payer", mixed)}}
+      facilitator = start_mock_facilitator(settle: settle)
+      opts = gate_opts(siwx: siwx, facilitator: facilitator)
+
+      paid =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(opts)
+
+      assert paid.status == 200
+
+      authenticated =
+        conn(:get, "/api/resource")
+        |> put_req_header("sign-in-with-x", proof(opts))
+        |> run_request(opts)
+
+      assert authenticated.status == 200
+      assert authenticated.assigns.x402_siwx_address == @address
+    end
+
+    test "a GET payment cannot authorize a differently priced POST", %{siwx: siwx} do
+      facilitator = start_mock_facilitator()
+      post_route = %{@route | method: :post, price: "50000"}
+      opts = gate_opts(siwx: siwx, facilitator: facilitator, routes: [@route, post_route])
+
+      paid =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(opts)
+
+      assert paid.status == 200
+
+      rejected =
+        conn(:post, "/api/resource")
+        |> put_req_header("sign-in-with-x", proof(opts))
+        |> run_request(opts)
+
+      assert rejected.status == 402
+      assert hd(decode_payment_required!(rejected)["accepts"])["amount"] == "50000"
+
+      allowed =
+        conn(:get, "/api/resource")
+        |> put_req_header("sign-in-with-x", proof(opts))
+        |> run_request(opts)
+
+      assert allowed.status == 200
+    end
+
+    test "any-method routes still scope grants by the actual request method",
+         %{siwx: siwx, storage: storage} do
+      facilitator = start_mock_facilitator()
+      opts = gate_opts(siwx: siwx, facilitator: facilitator, routes: [%{@route | method: :any}])
+
+      paid =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(opts)
+
+      assert paid.status == 200
+      assert {:ok, _record} = ETSStorage.get(storage, @address, @access_resource)
+      assert {:error, :not_found} = ETSStorage.get(storage, @address, "POST " <> @resource)
+
+      for method <- [:post, :delete, :head] do
+        rejected =
+          conn(method, "/api/resource")
+          |> put_req_header("sign-in-with-x", proof(opts))
+          |> run_request(opts)
+
+        assert rejected.status == 402
+      end
+    end
+
+    test "grants retain origin, port, query and raw-path boundaries", %{siwx: siwx} do
+      facilitator = start_mock_facilitator()
+      opts = gate_opts(siwx: siwx, facilitator: facilitator)
+
+      paid =
+        conn(:get, "/api/resource?item=1")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(opts)
+
+      assert paid.status == 200
+
+      for url <- [
+            @resource,
+            @resource <> "?item=2",
+            "http://other.example.com/api/resource?item=1",
+            "http://www.example.com:8080/api/resource?item=1",
+            "https://www.example.com/api/resource?item=1",
+            "http://www.example.com/api/%72esource?item=1"
+          ] do
+        rejected =
+          conn(:get, url)
+          |> put_req_header("sign-in-with-x", proof(opts))
+          |> run_request(opts)
+
+        assert rejected.status == 402
+      end
+
+      allowed =
+        conn(:get, @resource <> "?item=1")
+        |> put_req_header("sign-in-with-x", proof(opts))
+        |> run_request(opts)
+
+      assert allowed.status == 200
+    end
+
+    test "legacy URL-only grants cannot bypass method scoping", %{siwx: siwx, storage: storage} do
+      :ok = ETSStorage.put(storage, @address, @resource, :legacy, 60_000)
+      opts = gate_opts(siwx: siwx)
+
+      rejected =
+        conn(:get, "/api/resource")
+        |> put_req_header("sign-in-with-x", proof(opts))
+        |> run_request(opts)
+
+      assert rejected.status == 402
+    end
+
+    test "handler rewrites cannot change the resource recorded after settlement",
+         %{siwx: siwx, storage: storage} do
+      opts = gate_opts(siwx: siwx, facilitator: start_mock_facilitator())
+
+      prepared =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> PaymentGate.call(PaymentGate.init(opts))
+
+      assert send_resp(%{prepared | method: "POST", query_string: "item=other"}, 200, "ok").status ==
+               200
+
+      assert {:ok, _record} = ETSStorage.get(storage, @address, @access_resource)
+
+      assert {:error, :not_found} =
+               ETSStorage.get(storage, @address, "POST " <> @resource <> "?item=other")
+    end
+
     test "records the settle response payer so later proofs skip payment", %{
       siwx: siwx,
       storage: storage
@@ -317,7 +458,7 @@ defmodule X402.Plug.PaymentGateSIWXTest do
       assert_receive {:settle_called, _payload, _requirements}
 
       assert {:ok, %{payment_proof: %{"success" => true}}} =
-               ETSStorage.get(storage, @address, @resource)
+               ETSStorage.get(storage, @address, @access_resource)
 
       authenticated =
         conn(:get, "/api/resource")
@@ -342,8 +483,8 @@ defmodule X402.Plug.PaymentGateSIWXTest do
         |> run_request(gate_opts(siwx: siwx, facilitator: facilitator))
 
       assert paid.status == 200
-      assert {:ok, _record} = ETSStorage.get(storage, @receiver, @resource)
-      assert ETSStorage.get(storage, @address, @resource) == {:error, :not_found}
+      assert {:ok, _record} = ETSStorage.get(storage, @receiver, @access_resource)
+      assert ETSStorage.get(storage, @address, @access_resource) == {:error, :not_found}
     end
 
     test "records nothing when neither the response nor the payload names a payer", %{
@@ -363,7 +504,91 @@ defmodule X402.Plug.PaymentGateSIWXTest do
         |> run_request(gate_opts(siwx: siwx, facilitator: facilitator))
 
       assert paid.status == 200
-      assert ETSStorage.get(storage, @receiver, @resource) == {:error, :not_found}
+      assert ETSStorage.get(storage, @receiver, @access_resource) == {:error, :not_found}
+    end
+
+    for scheme <- ["exact", "upto"] do
+      test "#{scheme} Permit2 grants use only the verified authorization's from", %{
+        siwx: siwx,
+        storage: storage
+      } do
+        {:ok, %{body: body}} = @default_settle
+        settle = {:ok, %{status: 200, body: Map.delete(body, "payer")}}
+        facilitator = start_mock_facilitator(settle: settle)
+        scheme = unquote(scheme)
+        extra = %{"assetTransferMethod" => "permit2"}
+        route = Map.merge(@route, %{scheme: scheme, extra: extra})
+
+        payload =
+          valid_payment_payload()
+          |> put_in(["accepted", "scheme"], scheme)
+          |> put_in(["accepted", "extra"], extra)
+          |> put_in(["payload", "authorization", "from"], @address)
+          |> put_in(["payload", "permit2Authorization"], %{
+            "from" => @receiver,
+            "permitted" => %{"amount" => @amount}
+          })
+
+        for payload <- [
+              payload,
+              update_in(payload, ["payload"], &Map.delete(&1, "authorization"))
+            ] do
+          :ok = ETSStorage.delete(storage, @receiver, @access_resource)
+
+          paid =
+            conn(:get, "/api/resource")
+            |> put_req_header("payment-signature", encode_header(payload))
+            |> run_request(gate_opts(routes: [route], siwx: siwx, facilitator: facilitator))
+
+          assert paid.status == 200
+          assert {:ok, _record} = ETSStorage.get(storage, @receiver, @access_resource)
+          assert ETSStorage.get(storage, @address, @access_resource) == {:error, :not_found}
+        end
+      end
+    end
+
+    test "missing Permit2 from never falls back to an alternate EIP-3009 payer", %{
+      siwx: siwx,
+      storage: storage
+    } do
+      {:ok, %{body: body}} = @default_settle
+      settle = {:ok, %{status: 200, body: Map.delete(body, "payer")}}
+      facilitator = start_mock_facilitator(settle: settle)
+      extra = %{"assetTransferMethod" => "permit2"}
+      route = Map.put(@route, :extra, extra)
+
+      payload =
+        valid_payment_payload()
+        |> put_in(["accepted", "extra"], extra)
+        |> put_in(["payload", "permit2Authorization"], %{"permitted" => %{"amount" => @amount}})
+
+      paid =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", encode_header(payload))
+        |> run_request(gate_opts(routes: [route], siwx: siwx, facilitator: facilitator))
+
+      assert paid.status == 200
+      assert ETSStorage.get(storage, @receiver, @access_resource) == {:error, :not_found}
+    end
+
+    test "unknown transfer methods cannot provision a payload-derived grant", %{
+      siwx: siwx,
+      storage: storage
+    } do
+      {:ok, %{body: body}} = @default_settle
+      settle = {:ok, %{status: 200, body: Map.delete(body, "payer")}}
+      facilitator = start_mock_facilitator(settle: settle)
+      extra = %{"assetTransferMethod" => "custom"}
+      route = Map.put(@route, :extra, extra)
+      payload = put_in(valid_payment_payload(), ["accepted", "extra"], extra)
+
+      paid =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", encode_header(payload))
+        |> run_request(gate_opts(routes: [route], siwx: siwx, facilitator: facilitator))
+
+      assert paid.status == 200
+      assert ETSStorage.get(storage, @receiver, @access_resource) == {:error, :not_found}
     end
 
     test "logs and still serves the response when storage rejects the record", %{cache: cache} do
@@ -398,7 +623,7 @@ defmodule X402.Plug.PaymentGateSIWXTest do
 
       assert conn.status == 200
       assert_receive {:verify_called, _payload, _requirements}
-      assert {:ok, _record} = ETSStorage.get(storage, @address, @resource)
+      assert {:ok, _record} = ETSStorage.get(storage, @address, @access_resource)
     end
   end
 

@@ -250,7 +250,10 @@ A result that is not payment-required is returned with
 `siwx_authenticated: true`; another payment-required result continues
 with the payment flow, the paid call carrying a proof for the new
 challenge so the server records the payer. MCP resources have no HTTP
-origin, so pass `domain:` to pin the challenge to the server you expect:
+origin, so `domain:` is required to pin the challenge to the server you
+expect. Without it, an advertised challenge fails with
+`{:error, {:siwx, :domain_mismatch}}` before signing or retrying. Do not
+take this pin from the challenge or its advertised resource URL.
 
 ```elixir
 X402.MCP.Client.call(request, &MyMCP.call_tool/1,

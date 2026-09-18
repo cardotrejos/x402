@@ -18,6 +18,27 @@ defmodule X402.MCP.ClientTest do
   alias X402.Signer.SolanaKey
   alias X402.Solana.Transaction
 
+  defmodule RecordingSigner do
+    @moduledoc false
+    @behaviour X402.Signer
+    defstruct [:delegate, :owner]
+
+    @impl X402.Signer
+    def address(signer), do: LocalKey.address(signer.delegate)
+
+    @impl X402.Signer
+    def sign_eip712(signer, digest, typed_data) do
+      send(signer.owner, {:signer_called, :eip712})
+      LocalKey.sign_eip712(signer.delegate, digest, typed_data)
+    end
+
+    @impl X402.Signer
+    def sign_message(signer, message) do
+      send(signer.owner, {:signer_called, :message})
+      LocalKey.sign_message(signer.delegate, message)
+    end
+  end
+
   # A real caller-side X402.Facilitator over a Bypass HTTP stub (the
   # facilitator client executes verify/settle in the calling process).
   defp start_bypass_facilitator(opts) do
@@ -623,13 +644,6 @@ defmodule X402.MCP.ClientTest do
                siwx: [chain_id: @network, domain: "other.example.com"]
              ) == {:error, {:siwx, :domain_mismatch}}
 
-      # Without a domain there is no HTTP origin to fall back on, so the
-      # challenge is signed unchecked: the option is what binds it.
-      call_fun = tracking_fun([challenge_result(), @ok_result])
-
-      assert {:ok, %{siwx_authenticated: true}} =
-               Client.call(@request, call_fun, signer: signer(), siwx: [chain_id: @network])
-
       call_fun = tracking_fun([challenge_result(), {:error, :closed}])
 
       assert Client.call(@request, call_fun,
@@ -648,6 +662,30 @@ defmodule X402.MCP.ClientTest do
       assert_received {:tool_called, paying}
       assert MCP.fetch_siwx(paying) == :error
       assert {:ok, _payload} = MCP.fetch_payment(paying)
+    end
+
+    test "unpinned challenges never call the wallet, payment consent, or retry" do
+      signer = %RecordingSigner{delegate: signer(), owner: self()}
+      owner = self()
+
+      for domain <- [nil, ""] do
+        call_fun = tracking_fun([challenge_result()])
+
+        assert Client.call(@request, call_fun,
+                 signer: signer,
+                 max_amount: "10000",
+                 siwx: [chain_id: @network, domain: domain],
+                 on_payment_required: fn _challenge ->
+                   send(owner, :consent_called)
+                   :cancel
+                 end
+               ) == {:error, {:siwx, :domain_mismatch}}
+
+        assert_received {:tool_called, @request}
+        refute_received {:tool_called, _request}
+        refute_received {:signer_called, _method}
+        refute_received :consent_called
+      end
     end
 
     test "validates siwx options" do

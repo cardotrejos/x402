@@ -62,9 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same encoders verification simulates with), `supported/1` advertises
   `exact` and `upto` per network, and `upto` is routed only when
   `extra.facilitatorAddress` is the engine's signer. `X402.Plug.PaymentGate`
-  derives exact-Permit2 replay keys from the signed permit's `from` +
-  `nonce`; exact and upto share the `evm-permit2:` prefix because Permit2
-  nonces are per owner, not per spender
+  selects replay identity using the matched requirements' transfer method,
+  ignoring unsigned alternate authorization fields, and derives exact-Permit2
+  keys from the signed permit's `from` + `nonce`; exact and upto share the
+  `evm-permit2:` prefix because Permit2
+  nonces are per owner, not per spender. SIWX payer fallback uses that same
+  requirements-bound authorization when settlement omits `payer`
 - **Resource-server lifecycle hooks — `X402.Hooks`
   `on_protected_request/2` and `on_verified_payment_canceled/2`**: two
   optional callbacks invoked by `X402.Plug.PaymentGate` and
@@ -184,7 +187,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   latter required for MCP and defaulting to the resource URL's host on
   HTTP). When the 402 advertises a `sign-in-with-x` challenge the client
   signs it (`X402.Client.SIWX.authenticate/4`, refusing challenges not
-  bound to the expected origin) and retries with the proof and no
+  bound to the expected origin, or lacking a trusted domain/resource URL;
+  domain matching ignores case without dropping port boundaries)
+  and retries with the proof and no
   payment; a response that is not payment-required is returned with
   `siwx_authenticated: true`, otherwise the payment flow continues with
   the proof attached to the paid request too. MCP proofs travel in
@@ -225,12 +230,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which address paid for which resource after settlement, and
   `authenticate/3` combines verification with that history
   (`{:error, :not_authorized}` when the wallet has not paid). Usable from
-  any framework
+  any framework. EVM addresses are case-insensitive for payment records,
+  lookup and revocation; Solana public keys retain their case
 - **`X402.Plug.PaymentGate` `:siwx` option** (a keyword list of
   `X402.Extensions.SIWX.Server.new/1` options): every 402 advertises a
   fresh challenge (exempt from the extension echo check because it changes
   per response); a request carrying `SIGN-IN-WITH-X` is authenticated
-  against the resource URL the gate advertises — a previously paying
+  against the HTTP method and full resource URL — a previously paying
   address runs the handler without payment, with `:x402_siwx_address` and
   `:x402_siwx_chain_id` assigned and `[:x402, :plug, :siwx_authenticated]`
   emitted; an address with no record falls through to the normal payment

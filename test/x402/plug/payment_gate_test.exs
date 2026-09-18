@@ -2662,6 +2662,82 @@ defmodule X402.Plug.PaymentGateTest do
       assert decode_payment_required!(duplicate)["error"] == "payment already processed"
     end
 
+    test "unsigned EIP-3009 fields cannot change a Permit2 replay identity" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+
+      opts = [
+        routes: [@permit2_route],
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      payload = valid_exact_permit2_payment_payload()
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", encode_header(payload))
+        |> run_request(opts)
+
+      assert first.status == 200
+      assert_receive {:verify_called, _, _}
+      assert_receive {:settle_called, _, _}
+
+      for authorization <- [
+            %{},
+            %{"from" => @receiver, "nonce" => "unsigned-one"},
+            %{"from" => "0x" <> String.duplicate("ab", 20), "nonce" => "unsigned-two"}
+          ] do
+        header = payload |> put_in(["payload", "authorization"], authorization) |> encode_header()
+
+        duplicate =
+          conn(:get, "/api/resource")
+          |> put_req_header("payment-signature", header)
+          |> run_request(opts)
+
+        assert duplicate.status == 402
+        assert decode_payment_required!(duplicate)["error"] == "payment already processed"
+        refute_received {:verify_called, _, _}
+        refute_received {:settle_called, _, _}
+      end
+    end
+
+    test "EIP-3009 requirements never derive identity from an unsigned Permit2 authorization" do
+      facilitator = start_mock_facilitator()
+      cache = start_supervised!({ETSCache, name: unique_cache_name()})
+
+      opts = [
+        routes: [@route],
+        facilitator: facilitator,
+        payment_identifier_cache: cache,
+        claim_order: :before_verify
+      ]
+
+      # The stub accepts both payloads. EIP-3009 has no signed identity here,
+      # so its fallback must not claim the attacker-supplied Permit2 nonce.
+      payload =
+        valid_exact_permit2_payment_payload()
+        |> put_in(["accepted", "extra"], %{})
+
+      first =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", encode_header(payload))
+        |> run_request(opts)
+
+      assert first.status == 200
+
+      permit2 =
+        conn(:get, "/api/resource")
+        |> put_req_header(
+          "payment-signature",
+          encode_header(valid_exact_permit2_payment_payload())
+        )
+        |> run_request(Keyword.put(opts, :routes, [@permit2_route]))
+
+      assert permit2.status == 200
+    end
+
     test "svm replay keys derive from the signed message bytes" do
       facilitator = start_mock_facilitator()
       cache = start_supervised!({ETSCache, name: unique_cache_name()})

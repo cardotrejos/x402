@@ -196,9 +196,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       Because it changes per response it is exempt from the extension echo
       check.
     * A request carrying a `SIGN-IN-WITH-X` header is verified by
-      `X402.Extensions.SIWX.Server.authenticate/3` against the resource URL
-      the gate advertises. When the address has a payment record for that
-      URL the handler runs without payment, `:x402_siwx_address` and
+      `X402.Extensions.SIWX.Server.authenticate/3` against the HTTP method
+      and full resource URL. When the address has a payment record for that
+      request the handler runs without payment, `:x402_siwx_address` and
       `:x402_siwx_chain_id` are assigned, and
       `[:x402, :plug, :siwx_authenticated]` is emitted. When it has none,
       the request proceeds through the normal payment flow if it also
@@ -209,7 +209,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       **400** `invalid_siwx_header`.
     * After a successful settlement the payer (the settle response's
       `payer`, falling back to the authorization's `from`) is recorded for
-      the resource URL through the configured `:storage`, for `:ttl_ms`.
+      the method and resource URL through the configured `:storage`, for `:ttl_ms`.
+
+    Access keys have the form `"GET https://api.example.com/resource?item=1"`.
+    The full URL, including origin, port, raw path and query, remains part
+    of the key: those fields can identify different paid resources. A GET
+    payment never grants POST access, even when both match an `:any` route.
+    Configure trusted proxy URL rewriting before this gate. Old URL-only
+    records are not accepted as method-scoped grants.
 
     The deprecated pre-0.7.0 `{message, signature}` header format is still
     accepted; each one emits `[:x402, :siwx, :legacy]` and the first logs a
@@ -867,6 +874,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             context: RequestContext.t(),
             request_method: atom(),
             request_path: String.t(),
+            siwx_resource: String.t(),
             siwx: SIWXServer.t() | nil
           }
 
@@ -1556,7 +1564,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
       with {:ok, decoded} <- decode_siwx_header(header),
            {:ok, session} <-
-             authenticate_siwx(opts.siwx, decoded, resource_url(conn, request_path)) do
+             authenticate_siwx(opts.siwx, decoded, siwx_resource_key(conn)) do
         emit(
           :siwx_authenticated,
           Map.merge(metadata, %{address: session.address, chain_id: session.chain_id})
@@ -1704,6 +1712,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           context: %{context | payload: payment_payload, matched_requirements: requirements},
           request_method: request_method,
           request_path: request_path,
+          siwx_resource: siwx_resource_key(conn),
           siwx: opts.siwx
         }
 
@@ -1968,20 +1977,24 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     # The payer is taken from the settle response (the facilitator's
-    # authoritative view of who paid), falling back to the signed payload's
-    # `from`. A storage failure is logged and the settled response still
-    # served: the payment went through, the address merely has to pay again
-    # next time.
+    # authoritative view of who paid), falling back to the EVM authorization's
+    # `from` selected by the matched requirements. A storage failure is logged
+    # and the settled response still served: the payment went through, the
+    # address merely has to pay again next time.
     @spec record_siwx_payment(Plug.Conn.t(), map(), settlement_context()) :: :ok
     defp record_siwx_payment(_conn, _settle_response, %{siwx: nil}), do: :ok
 
-    defp record_siwx_payment(conn, settle_response, %{siwx: siwx} = settlement_context) do
-      case settlement_payer(settle_response, settlement_context.payment_payload) do
+    defp record_siwx_payment(_conn, settle_response, %{siwx: siwx} = settlement_context) do
+      case settlement_payer(
+             settle_response,
+             settlement_context.payment_payload,
+             settlement_context.requirements
+           ) do
         nil ->
           :ok
 
         payer ->
-          resource = resource_url(conn, settlement_context.request_path)
+          resource = settlement_context.siwx_resource
 
           case SIWXServer.record_payment(siwx, payer, resource, settle_response.body) do
             :ok ->
@@ -1996,18 +2009,19 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec settlement_payer(map(), map()) :: String.t() | nil
-    defp settlement_payer(%{body: body}, payment_payload) do
+    @spec settlement_payer(map(), map(), map()) :: String.t() | nil
+    defp settlement_payer(%{body: body}, payment_payload, requirements) do
       case Utils.map_value(body, {"payer", :payer}) do
         payer when is_binary(payer) and payer != "" -> payer
-        _absent -> payload_from(payment_payload)
+        _absent -> payload_from(payment_payload, requirements)
       end
     end
 
-    @spec payload_from(map()) :: String.t() | nil
-    defp payload_from(payment_payload) do
-      with %{} = payload <- Utils.map_value(payment_payload, {"payload", :payload}),
-           %{} = authorization <- Utils.map_value(payload, {"authorization", :authorization}),
+    @spec payload_from(map(), map()) :: String.t() | nil
+    defp payload_from(payment_payload, requirements) do
+      with {:ok, method} <- evm_transfer_method(requirements),
+           %{} = payload <- Utils.map_value(payment_payload, {"payload", :payload}),
+           %{} = authorization <- evm_authorization(payload, method),
            from when is_binary(from) and from != "" <-
              Utils.map_value(authorization, {"from", :from}) do
         from
@@ -2015,6 +2029,33 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         _other -> nil
       end
     end
+
+    @spec evm_transfer_method(map()) :: {:ok, Scheme.ExactEVM.transfer_method()} | :error
+    defp evm_transfer_method(requirements) do
+      scheme = Utils.map_value(requirements, {"scheme", :scheme})
+      network = Utils.map_value(requirements, {"network", :network})
+
+      case {scheme, network} do
+        {"exact", "eip155:" <> _reference} ->
+          case Scheme.ExactEVM.transfer_method(requirements) do
+            {:ok, method} -> {:ok, method}
+            {:error, _reason} -> :error
+          end
+
+        {"upto", "eip155:" <> _reference} ->
+          {:ok, :permit2}
+
+        _other ->
+          :error
+      end
+    end
+
+    @spec evm_authorization(map(), Scheme.ExactEVM.transfer_method()) :: term()
+    defp evm_authorization(payload, :eip3009),
+      do: Utils.map_value(payload, {"authorization", :authorization})
+
+    defp evm_authorization(payload, :permit2),
+      do: Utils.map_value(payload, {"permit2Authorization", :permit2Authorization})
 
     @spec reject_settlement(
             Plug.Conn.t(),
@@ -2761,7 +2802,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       network = Utils.map_value(requirements, {"network", :network})
       scheme_payload = Utils.map_value(payment_payload, {"payload", :payload})
 
-      case derive_replay_key(scheme, network, scheme_payload) do
+      case derive_replay_key(scheme, network, scheme_payload, requirements) do
         {:ok, key} -> key
         :error -> "hdr:" <> Base.encode16(:crypto.hash(:sha256, header), case: :lower)
       end
@@ -2770,20 +2811,35 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # EVM exact: an EIP-3009 payload carries `authorization`, whose from +
     # nonce are covered by the signature and uniquely identify the
     # authorization on its network; a Permit2 payload (assetTransferMethod
-    # "permit2") carries `permit2Authorization` instead.
-    @spec derive_replay_key(term(), term(), term()) :: {:ok, String.t()} | :error
-    defp derive_replay_key("exact", "eip155:" <> _reference = network, scheme_payload)
+    # "permit2") carries `permit2Authorization` instead. Select from the
+    # matched requirements, never from attacker-added unsigned payload fields.
+    @spec derive_replay_key(term(), term(), term(), map()) :: {:ok, String.t()} | :error
+    defp derive_replay_key(
+           "exact",
+           "eip155:" <> _reference = network,
+           scheme_payload,
+           requirements
+         )
          when is_map(scheme_payload) do
-      case Utils.map_value(scheme_payload, {"authorization", :authorization}) do
-        authorization when is_map(authorization) ->
+      case evm_transfer_method(requirements) do
+        {:ok, :eip3009} ->
+          authorization = evm_authorization(scheme_payload, :eip3009)
           signer_nonce_key(authorization, "evm:", network)
 
-        _absent ->
+        {:ok, :permit2} ->
           permit2_replay_key(scheme_payload, network)
+
+        :error ->
+          :error
       end
     end
 
-    defp derive_replay_key("upto", "eip155:" <> _reference = network, scheme_payload)
+    defp derive_replay_key(
+           "upto",
+           "eip155:" <> _reference = network,
+           scheme_payload,
+           _requirements
+         )
          when is_map(scheme_payload),
          do: permit2_replay_key(scheme_payload, network)
 
@@ -2791,7 +2847,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # fee-payer signature slot is mutable, so a facilitator co-signature
     # (or a stripped slot) would mint a fresh key for the same signed
     # message. Matches the reference SDKs' transactionMessageHash.
-    defp derive_replay_key("exact", "solana:" <> _reference = network, scheme_payload)
+    defp derive_replay_key(
+           "exact",
+           "solana:" <> _reference = network,
+           scheme_payload,
+           _requirements
+         )
          when is_map(scheme_payload) do
       with transaction when is_binary(transaction) <-
              Utils.map_value(scheme_payload, {"transaction", :transaction}),
@@ -2805,7 +2866,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    defp derive_replay_key(_scheme, _network, _scheme_payload), do: :error
+    defp derive_replay_key(_scheme, _network, _scheme_payload, _requirements), do: :error
 
     # Permit2: the permit's owner (from) + nonce are covered by the
     # PermitWitnessTransferFrom signature. Permit2's nonce bitmap is per
@@ -2817,8 +2878,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # sharing the same signature.
     @spec permit2_replay_key(map(), String.t()) :: {:ok, String.t()} | :error
     defp permit2_replay_key(scheme_payload, network) do
-      with authorization when is_map(authorization) <-
-             Utils.map_value(scheme_payload, {"permit2Authorization", :permit2Authorization}),
+      with authorization when is_map(authorization) <- evm_authorization(scheme_payload, :permit2),
            from when is_binary(from) and from != "" <-
              Utils.map_value(authorization, {"from", :from}),
            {:ok, nonce_word} <-
@@ -2833,8 +2893,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec signer_nonce_key(map(), String.t(), String.t()) :: {:ok, String.t()} | :error
-    defp signer_nonce_key(authorization, prefix, network) do
+    @spec signer_nonce_key(term(), String.t(), String.t()) :: {:ok, String.t()} | :error
+    defp signer_nonce_key(authorization, prefix, network) when is_map(authorization) do
       from = Utils.map_value(authorization, {"from", :from})
       nonce = Utils.map_value(authorization, {"nonce", :nonce})
 
@@ -2847,6 +2907,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           :error
       end
     end
+
+    defp signer_nonce_key(_authorization, _prefix, _network), do: :error
 
     # The echoed id is surfaced for correlation and bound to the request
     # fingerprint — never used as the replay key (see replay_key/3): it is
@@ -3064,6 +3126,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec resource_url(Plug.Conn.t(), String.t()) :: String.t()
     defp resource_url(conn, _request_path), do: Plug.Conn.request_url(conn)
+
+    @spec siwx_resource_key(Plug.Conn.t()) :: String.t()
+    defp siwx_resource_key(conn), do: conn.method <> " " <> Plug.Conn.request_url(conn)
 
     @spec payment_error_response(
             Plug.Conn.t(),
