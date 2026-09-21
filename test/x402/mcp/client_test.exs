@@ -518,6 +518,23 @@ defmodule X402.MCP.ClientTest do
       supported_chains: [%{chain_id: @network}]
     ]
 
+    setup do
+      owner = self()
+      handler_id = "mcp-siwx-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:x402, :client, :siwx],
+        fn _event, _measurements, metadata, _config ->
+          if self() == owner, do: send(owner, {:siwx, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+      :ok
+    end
+
     defp challenge_result do
       payment_required =
         Map.put(@payment_required, "extensions", %{
@@ -553,6 +570,50 @@ defmodule X402.MCP.ClientTest do
       assert {:ok, %{address: address, chain_id: @network}} = verify_proof(proving)
       assert address == signer.address
       assert proving["arguments"] == @request["arguments"]
+
+      assert_received {:siwx,
+                       %{
+                         status: :ok,
+                         transport: :mcp,
+                         chain_id: @network,
+                         outcome: :authenticated
+                       }}
+
+      refute_received {:siwx, _metadata}
+    end
+
+    test "automatic Solana selection reports the proof chain" do
+      chain = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+      {:ok, signer} = SolanaKey.new(:binary.copy(<<1>>, 32))
+      server_opts = Keyword.put(@siwx_server, :supported_chains, [%{chain_id: chain}])
+
+      payment_required =
+        Map.put(@payment_required, "extensions", %{
+          "sign-in-with-x" => SIWX.challenge(server_opts)
+        })
+
+      {:ok, challenge} = MCP.payment_required_result(payment_required)
+
+      assert {:ok, %{siwx_authenticated: true}} =
+               Client.call(@request, tracking_fun([challenge, @ok_result]),
+                 signer: signer,
+                 siwx: [chain_id: :auto, domain: @domain]
+               )
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, proving}
+      assert {:ok, header} = MCP.fetch_siwx(proving)
+      assert {:ok, %{chain_id: ^chain}} = SIWX.verify(header, server_opts)
+
+      assert_received {:siwx,
+                       %{
+                         status: :ok,
+                         transport: :mcp,
+                         chain_id: ^chain,
+                         outcome: :authenticated
+                       }}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "falls back to payment with a fresh proof when the address is unknown" do
@@ -598,6 +659,16 @@ defmodule X402.MCP.ClientTest do
       assert_received {:consent, %{"extensions" => %{"sign-in-with-x" => %{"info" => info}}}}
       assert info["nonce"] == second.fields["nonce"]
       refute_received {:consent, _payment_required}
+
+      assert_received {:siwx,
+                       %{
+                         status: :ok,
+                         transport: :mcp,
+                         chain_id: @network,
+                         outcome: :payment_required
+                       }}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "pays without a proof when the second challenge is gone" do
@@ -637,6 +708,14 @@ defmodule X402.MCP.ClientTest do
                siwx: [chain_id: "eip155:1", domain: @domain]
              ) == {:error, {:siwx, :unsupported_chain}}
 
+      assert_received {:siwx,
+                       %{
+                         status: :error,
+                         transport: :mcp,
+                         chain_id: "eip155:1",
+                         reason: :unsupported_chain
+                       }}
+
       call_fun = tracking_fun([challenge_result()])
 
       assert Client.call(@request, call_fun,
@@ -644,12 +723,22 @@ defmodule X402.MCP.ClientTest do
                siwx: [chain_id: @network, domain: "other.example.com"]
              ) == {:error, {:siwx, :domain_mismatch}}
 
+      assert_received {:siwx,
+                       %{
+                         status: :error,
+                         transport: :mcp,
+                         chain_id: nil,
+                         reason: :domain_mismatch
+                       }}
+
       call_fun = tracking_fun([challenge_result(), {:error, :closed}])
 
       assert Client.call(@request, call_fun,
                signer: signer(),
                siwx: [chain_id: @network, domain: @domain]
              ) == {:error, {:transport_error, :closed}}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "siwx: false and requests already carrying a proof are left alone" do
@@ -662,6 +751,7 @@ defmodule X402.MCP.ClientTest do
       assert_received {:tool_called, paying}
       assert MCP.fetch_siwx(paying) == :error
       assert {:ok, _payload} = MCP.fetch_payment(paying)
+      refute_received {:siwx, _metadata}
     end
 
     test "unpinned challenges never call the wallet, payment consent, or retry" do

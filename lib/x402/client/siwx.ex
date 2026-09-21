@@ -29,6 +29,11 @@ defmodule X402.Client.SIWX do
     ]
   ]
 
+  @context_schema [
+    resource_url: [type: {:or, [:string, nil]}, default: nil],
+    transport: [type: :atom, default: nil]
+  ]
+
   @moduledoc """
   Client side of the `sign-in-with-x` extension: answering a challenge.
 
@@ -158,12 +163,17 @@ defmodule X402.Client.SIWX do
   `:unsupported_chain`. Signing errors from `X402.Extensions.SIWX.sign/3`
   are returned as they are.
 
-  Emits `[:x402, :client, :siwx]` with `status: :error` on failure; the
-  drivers emit the `:ok` event once they know the outcome.
+  Emits `[:x402, :client, :siwx]` with `status: :error`, `:reason`,
+  `:transport`, and `:chain_id` on failure; the drivers emit the `:ok` event
+  once they know the outcome. The chain is the selected signing chain, or
+  `nil` if origin validation or automatic selection failed before selecting
+  one. It is never `:auto`.
 
   ## Options
 
   * `:resource_url` — the URL that returned the 402, for the origin check.
+  * `:transport` — atom identifying the caller in telemetry (`:http` or
+    `:mcp` for the built-in drivers); defaults to `nil` for direct calls.
 
   ## Examples
 
@@ -189,25 +199,39 @@ defmodule X402.Client.SIWX do
           {:ok, proof()} | :none | {:error, {:siwx, reason()}}
   def authenticate(payment_required, signer, siwx_opts, opts \\ [])
       when is_map(payment_required) and is_list(siwx_opts) and is_list(opts) do
+    opts = NimbleOptions.validate!(opts, @context_schema)
+
     case fetch_challenge(payment_required) do
       {:ok, challenge} ->
-        challenge
-        |> sign_challenge(signer, siwx_opts, Keyword.get(opts, :resource_url))
-        |> emit_error()
+        sign_challenge(challenge, signer, siwx_opts, opts)
 
       :error ->
         :none
     end
   end
 
-  @spec sign_challenge(map(), Signer.t(), keyword(), String.t() | nil) ::
+  @spec sign_challenge(map(), Signer.t(), keyword(), keyword()) ::
           {:ok, proof()} | {:error, {:siwx, reason()}}
-  defp sign_challenge(challenge, signer, siwx_opts, resource_url) do
+  defp sign_challenge(challenge, signer, siwx_opts, opts) do
+    resource_url = Keyword.fetch!(opts, :resource_url)
+    transport = Keyword.fetch!(opts, :transport)
+
     with {:ok, info} <- fetch_info(challenge),
          :ok <- check_domain(info, Keyword.get(siwx_opts, :domain), resource_url),
          :ok <- check_uri(info, resource_url),
-         {:ok, chain_id} <- resolve_chain(challenge, Keyword.fetch!(siwx_opts, :chain_id), signer),
-         {:ok, fields} <- sign(challenge, signer, chain_id, siwx_opts),
+         {:ok, chain_id} <- resolve_chain(challenge, Keyword.fetch!(siwx_opts, :chain_id), signer) do
+      challenge
+      |> sign_proof(signer, chain_id, siwx_opts)
+      |> emit_error(transport, chain_id)
+    else
+      error -> emit_error(error, transport, nil)
+    end
+  end
+
+  @spec sign_proof(map(), Signer.t(), String.t(), keyword()) ::
+          {:ok, proof()} | {:error, {:siwx, reason()}}
+  defp sign_proof(challenge, signer, chain_id, siwx_opts) do
+    with {:ok, fields} <- sign(challenge, signer, chain_id, siwx_opts),
          {:ok, header} <- encode(fields) do
       {:ok, %{header: header, chain_id: chain_id, address: fields["address"]}}
     end
@@ -357,12 +381,17 @@ defmodule X402.Client.SIWX do
     end
   end
 
-  @spec emit_error({:ok, proof()} | {:error, {:siwx, reason()}}) ::
+  @spec emit_error({:ok, proof()} | {:error, {:siwx, reason()}}, atom(), String.t() | nil) ::
           {:ok, proof()} | {:error, {:siwx, reason()}}
-  defp emit_error({:error, {:siwx, reason}} = error) do
-    Telemetry.emit(:client, :siwx, :error, %{reason: reason})
+  defp emit_error({:error, {:siwx, reason}} = error, transport, chain_id) do
+    Telemetry.emit(:client, :siwx, :error, %{
+      reason: reason,
+      transport: transport,
+      chain_id: chain_id
+    })
+
     error
   end
 
-  defp emit_error(ok), do: ok
+  defp emit_error(ok, _transport, _chain_id), do: ok
 end

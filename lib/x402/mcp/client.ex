@@ -313,40 +313,38 @@ defmodule X402.MCP.Client do
         {:ok, {:pay, payment_required, request}}
 
       siwx_opts ->
-        case sign_siwx(request, opts, payment_required, siwx_opts) do
+        case sign_siwx(opts, payment_required, siwx_opts) do
           :none -> {:ok, {:pay, payment_required, request}}
-          {:ok, proving} -> authenticate_siwx(request, proving, call_fun, opts, siwx_opts)
+          {:ok, proof} -> authenticate_siwx(request, proof, call_fun, opts, siwx_opts)
           {:error, _reason} = error -> error
         end
     end
   end
 
-  # Returns the request carrying a proof for the advertised challenge, or
+  # Returns a proof for the advertised challenge, or
   # `:none` when the server advertised no challenge.
-  @spec sign_siwx(map(), keyword(), map(), keyword()) ::
-          {:ok, map()} | :none | {:error, {:siwx, ClientSIWX.reason()}}
-  defp sign_siwx(request, opts, payment_required, siwx_opts) do
-    case ClientSIWX.authenticate(payment_required, opts[:signer], siwx_opts) do
-      {:ok, proof} -> {:ok, MCP.put_siwx(request, proof.header)}
-      :none -> :none
-      {:error, _reason} = error -> error
-    end
+  @spec sign_siwx(keyword(), map(), keyword()) ::
+          {:ok, ClientSIWX.proof()} | :none | {:error, {:siwx, ClientSIWX.reason()}}
+  defp sign_siwx(opts, payment_required, siwx_opts) do
+    ClientSIWX.authenticate(payment_required, opts[:signer], siwx_opts, transport: :mcp)
   end
 
   # A second challenge gets a fresh proof (its nonce differs from the one
   # just used); without one the paid call goes out with no proof at all
   # rather than a stale one.
-  @spec authenticate_siwx(map(), map(), call_fun(), keyword(), keyword()) ::
+  @spec authenticate_siwx(map(), ClientSIWX.proof(), call_fun(), keyword(), keyword()) ::
           {:ok, {:done, response()} | {:pay, map(), map()}} | {:error, call_error()}
-  defp authenticate_siwx(request, proving, call_fun, opts, siwx_opts) do
+  defp authenticate_siwx(request, proof, call_fun, opts, siwx_opts) do
+    proving = MCP.put_siwx(request, proof.header)
+
     with {:ok, result} <- retry(call_fun, proving) do
       case MCP.fetch_payment_required(result) do
         {:ok, payment_required} ->
-          emit_siwx(:payment_required)
+          emit_siwx(:payment_required, proof.chain_id)
           pay_with_fresh_proof(request, opts, payment_required, siwx_opts)
 
         :error ->
-          emit_siwx(:authenticated)
+          emit_siwx(:authenticated, proof.chain_id)
           {:ok, {:done, finalize(result, false, true)}}
       end
     end
@@ -355,16 +353,17 @@ defmodule X402.MCP.Client do
   @spec pay_with_fresh_proof(map(), keyword(), map(), keyword()) ::
           {:ok, {:pay, map(), map()}} | {:error, {:siwx, ClientSIWX.reason()}}
   defp pay_with_fresh_proof(request, opts, payment_required, siwx_opts) do
-    case sign_siwx(request, opts, payment_required, siwx_opts) do
-      {:ok, proving} -> {:ok, {:pay, payment_required, proving}}
+    case sign_siwx(opts, payment_required, siwx_opts) do
+      {:ok, proof} -> {:ok, {:pay, payment_required, MCP.put_siwx(request, proof.header)}}
       :none -> {:ok, {:pay, payment_required, request}}
       {:error, _reason} = error -> error
     end
   end
 
-  @spec emit_siwx(:authenticated | :payment_required) :: :ok
-  defp emit_siwx(outcome),
-    do: Telemetry.emit(:client, :siwx, :ok, %{transport: :mcp, outcome: outcome})
+  @spec emit_siwx(:authenticated | :payment_required, String.t()) :: :ok
+  defp emit_siwx(outcome, chain_id),
+    do:
+      Telemetry.emit(:client, :siwx, :ok, %{transport: :mcp, chain_id: chain_id, outcome: outcome})
 
   # -- Budget -----------------------------------------------------------------
 

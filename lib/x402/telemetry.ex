@@ -25,7 +25,10 @@ defmodule X402.Telemetry do
   - `[:x402, :client, :request]`
   - `[:x402, :client, :siwx]` — a payer client answered a Sign-In-With-X
     challenge (metadata `:transport`, `:chain_id`, and `:outcome` —
-    `:authenticated` or `:payment_required` — or `:reason` on error)
+    `:authenticated` or `:payment_required` — or `:reason` on error).
+    `:chain_id` is the selected signing chain, never `:auto`, and is `nil`
+    on errors before chain selection. Direct `X402.Client.SIWX` calls
+    default `:transport` to `nil`; HTTP/MCP drivers always identify it.
   - `[:x402, :rpc, :request]`
   - `[:x402, :verify, :evm]`
   - `[:x402, :verify, :svm]`
