@@ -86,11 +86,14 @@ been released. Tier C is in progress. ERC-7710 remains unsupported.
 ### 0.9.0 — advanced schemes, extensions, and operations
 
 - [ ] EVM bindings for the `batch-settlement` and `auth-capture` schemes
-- [ ] `auth-hints` and `http-message-signatures` extensions
+- [x] `auth-hints` and `http-message-signatures` extensions (unreleased)
 - [ ] `upto` on Solana
-- [ ] Metrics for LiveDashboard's Metrics page, without a Phoenix dependency
-- [ ] Per-wallet rate limiting in the gate
-- [ ] Multi-facilitator failover for `X402.Facilitator`
+- [x] Metrics for LiveDashboard's Metrics page, without a Phoenix dependency (unreleased)
+- [x] Per-wallet rate limiting in the gate (unreleased)
+- [x] Multi-facilitator failover for `X402.Facilitator` (unreleased)
+
+The advanced-scheme milestone remains open pending combined integration and
+validation. Separate local implementations are not integrated support or a release.
 
 ### 1.0.0 — stable API
 

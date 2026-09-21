@@ -27,12 +27,18 @@ defmodule X402.Facilitator.PendingSettlementStore.ETSTest do
       assert {:error, %NimbleOptions.ValidationError{}} = ETSStore.start_link(ttl_ms: -1)
     end
 
-    test "supports unnamed (pid-addressed) stores" do
-      assert {:ok, pid} = ETSStore.start_link(name: nil)
-      assert ETSStore.get(pid, "key") == :miss
-      assert ETSStore.put(pid, "key", entry()) == :ok
-      assert ETSStore.get(pid, "key") == {:hit, entry()}
-      GenServer.stop(pid)
+    test "supports independent unnamed (pid-addressed) stores" do
+      first = start_supervised!(%{ETSStore.child_spec(name: nil) | id: :first})
+      second = start_supervised!(%{ETSStore.child_spec(name: nil) | id: :second})
+      replacement = entry(provenance: :local_hash, raw_transaction: <<1, 2, 3>>)
+
+      assert ETSStore.put(first, "key", entry()) == :ok
+      assert ETSStore.get(second, "key") == :miss
+      assert ETSStore.put(second, "key", replacement) == :ok
+      assert ETSStore.get(first, "key") == {:hit, entry()}
+      assert ETSStore.get(second, "key") == {:hit, replacement}
+      assert ETSStore.delete(first, "key") == :ok
+      assert ETSStore.get(second, "key") == {:hit, replacement}
     end
   end
 
