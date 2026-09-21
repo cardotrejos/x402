@@ -174,7 +174,7 @@ defmodule X402.Facilitator.PendingSettlementStore.ETS do
     table_opts = [:set, :protected, read_concurrency: true]
 
     table =
-      if is_atom(name) do
+      if is_atom(name) and not is_nil(name) do
         :ets.new(name, [:named_table | table_opts])
       else
         :ets.new(__MODULE__, table_opts)
