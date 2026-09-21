@@ -81,6 +81,57 @@ defmodule X402.Client.BudgetTest do
       assert Budget.reserve(budget, @usdc, 100) == :ok
     end
 
+    test "oversized, repeated and unknown-asset releases preserve other reservations" do
+      budget = start_supervised!({Budget, limit: 100})
+
+      assert Budget.reserve(budget, @usdc, 60) == :ok
+      assert Budget.reserve(budget, @dai, 40) == :ok
+
+      for {asset, amount} <- [
+            {String.downcase(@usdc), "100"},
+            {@usdc, 100},
+            {"unknown", 100},
+            {@dai, 0}
+          ] do
+        assert Budget.release(budget, asset, amount) == :ok
+        assert %{total: 40, per_asset: per_asset} = Budget.spent(budget)
+        assert per_asset[String.downcase(@dai)] == 40
+        assert per_asset[String.downcase(@usdc)] == 0
+        assert Enum.sum(Map.values(per_asset)) == 40
+      end
+
+      assert {:error, {:budget_exceeded, %{scope: :total, spent: 40}}} =
+               Budget.reserve(budget, @usdc, 61)
+
+      assert Budget.reserve(budget, @usdc, 60) == :ok
+      assert Budget.spent(budget).total == 100
+    end
+
+    test "concurrent over-releases cannot free another asset's budget" do
+      budget = start_supervised!({Budget, limit: 100})
+      assert Budget.reserve(budget, @usdc, 60) == :ok
+      assert Budget.reserve(budget, @dai, 40) == :ok
+
+      results =
+        1..50
+        |> Task.async_stream(
+          fn _index ->
+            :ok = Budget.release(budget, @usdc, 100)
+            Budget.reserve(budget, @dai, 10)
+          end,
+          max_concurrency: 50
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert Enum.count(results, &(&1 == :ok)) == 6
+      assert Enum.count(results, &match?({:error, {:budget_exceeded, _}}, &1)) == 44
+
+      assert Budget.spent(budget) == %{
+               total: 100,
+               per_asset: %{String.downcase(@usdc) => 0, String.downcase(@dai) => 100}
+             }
+    end
+
     test "rejects invalid amounts without touching the budget" do
       budget = start_supervised!({Budget, limit: 100})
 

@@ -26,7 +26,22 @@ defmodule X402.Client.SIWX do
       Expected challenge `domain`. Required for transports without a
       resource URL (MCP); for HTTP it defaults to the resource URL's host.
       """
+    ],
+    uri: [
+      type: {:or, [:string, nil]},
+      default: nil,
+      doc: """
+      Exact expected challenge URI, including path and query. Required for
+      automatic MCP proofs, alongside `:domain`. Configure it independently
+      of the challenge and bind the transport to that trusted server.
+      """
     ]
+  ]
+
+  @context_schema [
+    resource_url: [type: {:or, [:string, nil]}, default: nil],
+    transport: [type: :atom, default: nil],
+    before_sign: [type: {:or, [{:fun, 0}, nil]}, default: nil]
   ]
 
   @moduledoc """
@@ -60,7 +75,8 @@ defmodule X402.Client.SIWX do
           chain_id: String.t() | :auto,
           address: String.t() | nil,
           signature_scheme: String.t() | nil,
-          domain: String.t() | nil
+          domain: String.t() | nil,
+          uri: String.t() | nil
         ]
 
   @typedoc "A signed challenge, ready to send."
@@ -72,6 +88,7 @@ defmodule X402.Client.SIWX do
           | :domain_mismatch
           | :uri_mismatch
           | :unsupported_chain
+          | :payment_cancelled
           | SIWX.sign_error()
           | SIWX.signed_encode_error()
 
@@ -90,7 +107,7 @@ defmodule X402.Client.SIWX do
 
       iex> {:ok, opts} = X402.Client.SIWX.validate_opts(chain_id: :auto)
       iex> Enum.sort(opts)
-      [address: nil, chain_id: :auto, domain: nil, signature_scheme: nil]
+      [address: nil, chain_id: :auto, domain: nil, signature_scheme: nil, uri: nil]
 
       iex> {:error, message} = X402.Client.SIWX.validate_opts(address: "0xabc")
       iex> message =~ ":chain_id"
@@ -152,18 +169,32 @@ defmodule X402.Client.SIWX do
   trusted domain nor a resource URL, signing fails with `:domain_mismatch`.
   Never derive the expected domain from the untrusted challenge.
 
+  `siwx_opts[:uri]` additionally requires an exact URI match, including path
+  and query, and a domain consistent with its host/port. The pin must be an
+  absolute HTTP(S) URL without userinfo or fragment. It is mandatory for
+  `transport: :mcp`; a domain alone is insufficient for automatic MCP proofs.
+
   With `chain_id: :auto` the first entry of `supportedChains` whose family
   the signer can sign is used (`eip155:*` needs `c:X402.Signer.sign_message/2`,
   `solana:*` needs `c:X402.Signer.sign_ed25519/2`); no match yields
   `:unsupported_chain`. Signing errors from `X402.Extensions.SIWX.sign/3`
   are returned as they are.
 
-  Emits `[:x402, :client, :siwx]` with `status: :error` on failure; the
-  drivers emit the `:ok` event once they know the outcome.
+  Emits `[:x402, :client, :siwx]` with `status: :error`, `:reason`,
+  `:transport`, and `:chain_id` on failure; the drivers emit the `:ok` event
+  once they know the outcome. The chain is the selected signing chain, or
+  `nil` if origin validation or automatic selection failed before selecting
+  one. It is never `:auto`.
 
   ## Options
 
   * `:resource_url` — the URL that returned the 402, for the origin check.
+  * `:transport` — atom identifying the caller in telemetry (`:http` or
+    `:mcp` for the built-in drivers); defaults to `nil` for direct calls.
+  * `:before_sign` — optional zero-arity consent callback, invoked after
+    origin/URI checks and chain selection but before wallet signing. Only
+    `:ok` allows signing; other returns yield `{:siwx, :payment_cancelled}`.
+    It is not called when no challenge is present.
 
   ## Examples
 
@@ -189,25 +220,43 @@ defmodule X402.Client.SIWX do
           {:ok, proof()} | :none | {:error, {:siwx, reason()}}
   def authenticate(payment_required, signer, siwx_opts, opts \\ [])
       when is_map(payment_required) and is_list(siwx_opts) and is_list(opts) do
+    opts = NimbleOptions.validate!(opts, @context_schema)
+
     case fetch_challenge(payment_required) do
       {:ok, challenge} ->
-        challenge
-        |> sign_challenge(signer, siwx_opts, Keyword.get(opts, :resource_url))
-        |> emit_error()
+        sign_challenge(challenge, signer, siwx_opts, opts)
 
       :error ->
         :none
     end
   end
 
-  @spec sign_challenge(map(), Signer.t(), keyword(), String.t() | nil) ::
+  @spec sign_challenge(map(), Signer.t(), keyword(), keyword()) ::
           {:ok, proof()} | {:error, {:siwx, reason()}}
-  defp sign_challenge(challenge, signer, siwx_opts, resource_url) do
+  defp sign_challenge(challenge, signer, siwx_opts, opts) do
+    resource_url = Keyword.fetch!(opts, :resource_url)
+    transport = Keyword.fetch!(opts, :transport)
+
     with {:ok, info} <- fetch_info(challenge),
          :ok <- check_domain(info, Keyword.get(siwx_opts, :domain), resource_url),
          :ok <- check_uri(info, resource_url),
-         {:ok, chain_id} <- resolve_chain(challenge, Keyword.fetch!(siwx_opts, :chain_id), signer),
-         {:ok, fields} <- sign(challenge, signer, chain_id, siwx_opts),
+         :ok <- check_pinned_uri(info, Keyword.get(siwx_opts, :uri), transport),
+         {:ok, chain_id} <- resolve_chain(challenge, Keyword.fetch!(siwx_opts, :chain_id), signer) do
+      result =
+        with :ok <- approve_signing(Keyword.fetch!(opts, :before_sign)) do
+          sign_proof(challenge, signer, chain_id, siwx_opts)
+        end
+
+      emit_error(result, transport, chain_id)
+    else
+      error -> emit_error(error, transport, nil)
+    end
+  end
+
+  @spec sign_proof(map(), Signer.t(), String.t(), keyword()) ::
+          {:ok, proof()} | {:error, {:siwx, reason()}}
+  defp sign_proof(challenge, signer, chain_id, siwx_opts) do
+    with {:ok, fields} <- sign(challenge, signer, chain_id, siwx_opts),
          {:ok, header} <- encode(fields) do
       {:ok, %{header: header, chain_id: chain_id, address: fields["address"]}}
     end
@@ -263,6 +312,34 @@ defmodule X402.Client.SIWX do
     case is_binary(uri) and origin(uri) == origin(resource_url) and origin(uri) != nil do
       true -> :ok
       false -> {:error, {:siwx, :uri_mismatch}}
+    end
+  end
+
+  @spec check_pinned_uri(map(), String.t() | nil, atom() | nil) ::
+          :ok | {:error, {:siwx, :uri_mismatch | :domain_mismatch}}
+  defp check_pinned_uri(_info, nil, :mcp), do: {:error, {:siwx, :uri_mismatch}}
+  defp check_pinned_uri(_info, nil, _transport), do: :ok
+
+  defp check_pinned_uri(info, expected, _transport) do
+    case URI.parse(expected) do
+      %URI{scheme: scheme, host: host, userinfo: nil, fragment: nil}
+      when scheme in ["http", "https"] and is_binary(host) and host != "" ->
+        if Utils.map_value(info, {"uri", :uri}) == expected,
+          do: check_domain(info, nil, expected),
+          else: {:error, {:siwx, :uri_mismatch}}
+
+      _invalid ->
+        {:error, {:siwx, :uri_mismatch}}
+    end
+  end
+
+  @spec approve_signing(nil | (-> term())) :: :ok | {:error, {:siwx, :payment_cancelled}}
+  defp approve_signing(nil), do: :ok
+
+  defp approve_signing(callback) do
+    case callback.() do
+      :ok -> :ok
+      _rejected -> {:error, {:siwx, :payment_cancelled}}
     end
   end
 
@@ -357,12 +434,17 @@ defmodule X402.Client.SIWX do
     end
   end
 
-  @spec emit_error({:ok, proof()} | {:error, {:siwx, reason()}}) ::
+  @spec emit_error({:ok, proof()} | {:error, {:siwx, reason()}}, atom(), String.t() | nil) ::
           {:ok, proof()} | {:error, {:siwx, reason()}}
-  defp emit_error({:error, {:siwx, reason}} = error) do
-    Telemetry.emit(:client, :siwx, :error, %{reason: reason})
+  defp emit_error({:error, {:siwx, reason}} = error, transport, chain_id) do
+    Telemetry.emit(:client, :siwx, :error, %{
+      reason: reason,
+      transport: transport,
+      chain_id: chain_id
+    })
+
     error
   end
 
-  defp emit_error(ok), do: ok
+  defp emit_error(ok, _transport, _chain_id), do: ok
 end

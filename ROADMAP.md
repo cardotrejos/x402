@@ -24,9 +24,10 @@ The latest release is `0.6.1`. It supports the primary v2 authorization-flow rol
 - Quality: 95 % coverage floor, dialyzer/credo clean, optional-dependency
   build, downstream consumer check, live CDP smoke tests.
 
-The 0.7 and 0.8 changes are implemented in [PR #85](https://github.com/cardotrejos/x402/pull/85)
-and [PR #86](https://github.com/cardotrejos/x402/pull/86), respectively. They have not
-been released. Tier C is in progress.
+As of 2026-09-21, the 0.7 and 0.8 changes are merged through
+[PR #85](https://github.com/cardotrejos/x402/pull/85) and
+[PR #86](https://github.com/cardotrejos/x402/pull/86), respectively. They have not
+been released. Tier C is in progress. ERC-7710 remains unsupported.
 
 ## Gap analysis from the 0.6.1 baseline
 
@@ -40,6 +41,7 @@ been released. Tier C is in progress.
 | Client `paymentFlow` rule | only `authorization` (or absent) is payable | any value accepted | **0.7.0** |
 | Supply chain | pinned actions, least-privilege tokens | floating action tags | **0.7.0** |
 | `exact` on EVM via Permit2 (`permit2Authorization` payload variant) | shipped | EIP-3009 only | 0.8.0 |
+| Delegated EVM payments via ERC-7710 | delegated transfer method | unsupported | Deferred; no target release |
 | Client default spend controls (per-request / session ceilings) | shipped | none by default | 0.8.0 |
 | Dynamic price / `payTo`, `routeTemplate` + `pathParams` | shipped | static route maps | 0.8.0 |
 | `builder-code` extension | shipped | missing | 0.8.0 |
@@ -110,6 +112,13 @@ publication are complete; local implementation is not a release.
 - [ ] Guides ("Build a paid API in 5 minutes", "x402 for AI agents", deployment),
   example Phoenix app, `mix x402.gen.paywall`
 - [ ] Hex 1.0.0 publish
+
+## Deferred support
+
+- [ ] ERC-7710 delegated EVM payments remain unsupported. No target release is
+  assigned. Add client signing, local verification, facilitator settlement, and
+  end-to-end coverage before advertising support; unsupported transfer methods
+  must continue to fail closed.
 
 ## Compatibility policy
 

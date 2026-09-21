@@ -3,8 +3,11 @@ defmodule X402.Facilitator.EngineTest do
 
   alias X402.EIP3009
   alias X402.ERC6492
+  alias X402.Extensions.PaymentIdentifier.ETSCache
+  alias X402.Facilitator
   alias X402.Facilitator.Engine
   alias X402.Facilitator.PendingSettlementStore
+  alias X402.Plug.PaymentGate
   alias X402.RPC
   alias X402.Signer.LocalKey
   alias X402.TestRLPDecoder
@@ -1622,6 +1625,251 @@ defmodule X402.Facilitator.EngineTest do
     end
 
     defp proxy_bytes("0x" <> hex), do: Base.decode16!(hex, case: :mixed)
+
+    test "Permit2 verification and settlement ignore unsigned alternate authorizations",
+         context do
+      forged =
+        signed_payload(requirements())["payload"]["authorization"]
+        |> Map.merge(%{"from" => @factory, "to" => @factory, "value" => "1"})
+
+      for {requirements, proxy} <- [
+            {permit2_requirements(), @exact_proxy},
+            {upto_requirements(), @upto_proxy}
+          ],
+          {key, alternate} <- [
+            {"authorization", %{}},
+            {"authorization", forged},
+            {:authorization, forged}
+          ] do
+        engine = engine(context)
+        payload = permit2_payload(requirements)
+        injected = put_in(payload, ["payload", key], alternate)
+
+        assert {:ok, %{"isValid" => true, "payer" => @payer}} =
+                 Engine.verify(engine, injected, requirements)
+
+        assert {:ok, %{"success" => true, "transaction" => @tx_hash, "payer" => @payer}} =
+                 Engine.settle(engine, injected, requirements)
+
+        assert_received {:rpc, "eth_sendRawTransaction", [raw_hex]}
+        raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+
+        [_chain, _nonce, _prio, _fee, _gas, to, _value, data | _rest] =
+          TestRLPDecoder.decode_eip1559(raw)
+
+        assert to == proxy_bytes(proxy)
+        authorization = payload["payload"]["permit2Authorization"]
+
+        expected =
+          case requirements["scheme"] do
+            "exact" ->
+              X402.Permit2.exact_settle_calldata(authorization, signature_bytes(payload))
+
+            "upto" ->
+              X402.Permit2.upto_settle_calldata(
+                authorization,
+                requirements["amount"],
+                signature_bytes(payload)
+              )
+          end
+
+        assert {:ok, data} == expected
+      end
+    end
+
+    test "Permit2 pending reconciliation ignores changes to the unsigned alternate object",
+         context do
+      store = pending_store(__MODULE__.DualAuthorizationStore)
+
+      for requirements <- [permit2_requirements(), upto_requirements()] do
+        {:ok, queue} = Agent.start_link(fn -> [] end)
+
+        engine =
+          engine(context,
+            pending_settlement_store: store,
+            receipt_timeout_ms: 20,
+            receipt_interval_ms: 10,
+            stub: %{receipt_queue: queue}
+          )
+
+        payload = permit2_payload(requirements)
+        injected = put_in(payload, ["payload", "authorization"], %{})
+
+        assert {:ok, %{"errorReason" => "settlement_pending", "payer" => @payer}} =
+                 Engine.settle(engine, injected, requirements)
+
+        key = permit2_pending_key(payload, requirements)
+        assert {:hit, %{transaction: @tx_hash}} = PendingSettlementStore.get(store, key)
+        assert_received {:rpc, "eth_sendRawTransaction", [_raw_hex]}
+
+        Agent.update(queue, fn _ -> [%{"status" => "0x1"}] end)
+
+        retry =
+          put_in(payload, ["payload", "authorization"], %{"from" => @factory, "value" => "1"})
+
+        assert {:ok, %{"success" => true, "transaction" => @tx_hash, "payer" => @payer}} =
+                 Engine.settle(engine, retry, requirements)
+
+        assert PendingSettlementStore.get(store, key) == :miss
+        refute_received {:rpc, "eth_sendRawTransaction", _params}
+      end
+    end
+
+    test "missing selected authorizations never fall back to the other payment method", context do
+      engine = engine(context)
+
+      for {requirements, payload, field} <- [
+            {permit2_requirements(), signed_payload(requirements()), "permit2Authorization"},
+            {upto_requirements(), signed_payload(requirements()), "permit2Authorization"},
+            {requirements(), permit2_payload(permit2_requirements()), "authorization"}
+          ] do
+        payload = Map.put(payload, "accepted", requirements)
+
+        for absent <- [payload, put_in(payload, ["payload", field], nil)] do
+          assert {:ok, %{"isValid" => false} = verify} =
+                   Engine.verify(engine, absent, requirements)
+
+          refute Map.has_key?(verify, "payer")
+
+          assert {:ok, %{"success" => false} = settle} =
+                   Engine.settle(engine, absent, requirements)
+
+          refute Map.has_key?(settle, "payer")
+        end
+      end
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+
+    test "Permit2 rejection payer comes from the selected authorization", context do
+      engine = engine(context, stub: %{balance: 0})
+
+      for requirements <- [permit2_requirements(), upto_requirements()] do
+        payload =
+          requirements
+          |> permit2_payload()
+          |> put_in(["payload", "authorization"], %{"from" => @factory})
+
+        assert {:ok, %{"isValid" => false, "payer" => @payer}} =
+                 Engine.verify(engine, payload, requirements)
+
+        assert {:ok, %{"success" => false, "payer" => @payer}} =
+                 Engine.settle(engine, payload, requirements)
+      end
+
+      refute_received {:rpc, "eth_sendRawTransaction", _params}
+    end
+
+    test "EIP-3009 ignores an unsigned Permit2 object during settlement", context do
+      engine = engine(context)
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      injected =
+        put_in(payload, ["payload", "permit2Authorization"], %{"from" => @factory})
+
+      assert {:ok, %{"isValid" => true, "payer" => @payer}} =
+               Engine.verify(engine, injected, requirements)
+
+      assert {:ok, %{"success" => true, "payer" => @payer}} =
+               Engine.settle(engine, injected, requirements)
+
+      assert_received {:rpc, "eth_sendRawTransaction", [raw_hex]}
+      raw = Base.decode16!(String.trim_leading(raw_hex, "0x"), case: :mixed)
+
+      [_chain, _nonce, _prio, _fee, _gas, to, _value, data | _rest] =
+        TestRLPDecoder.decode_eip1559(raw)
+
+      assert to == @asset_bytes
+
+      assert {:ok, data} ==
+               EIP3009.transfer_calldata(
+                 payload["payload"]["authorization"],
+                 signature_bytes(payload),
+                 :eoa
+               )
+    end
+
+    test "the gate settles an injected Permit2 proof once and retains its replay claim",
+         context do
+      engine = engine(context)
+      facilitator_node = Bypass.open()
+
+      for {path, operation} <- [{"/verify", :verify}, {"/settle", :settle}] do
+        Bypass.stub(facilitator_node, "POST", path, fn conn ->
+          {:ok, body, conn} = Plug.Conn.read_body(conn)
+          request = Jason.decode!(body)
+
+          {:ok, result} =
+            apply(Engine, operation, [
+              engine,
+              request["paymentPayload"],
+              request["paymentRequirements"]
+            ])
+
+          Plug.Conn.resp(conn, 200, Jason.encode!(result))
+        end)
+      end
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           finch: context.finch, url: "http://localhost:#{facilitator_node.port}", max_retries: 0}
+        )
+
+      cache = start_supervised!({ETSCache, name: __MODULE__.EngineReplayCache})
+      requirements = permit2_requirements()
+
+      opts =
+        PaymentGate.init(
+          routes: [
+            %{
+              method: :get,
+              path: "/premium",
+              price: requirements["amount"],
+              asset: @asset,
+              network: @network,
+              pay_to: @pay_to,
+              max_timeout_seconds: 600,
+              extra: requirements["extra"]
+            }
+          ],
+          facilitator: facilitator,
+          payment_identifier_cache: cache
+        )
+
+      payload = permit2_payload(requirements)
+      injected = put_in(payload, ["payload", "authorization"], %{})
+      header = injected |> Jason.encode!() |> Base.encode64()
+
+      conn =
+        Plug.Test.conn(:get, "/premium")
+        |> Plug.Conn.put_req_header("payment-signature", header)
+        |> PaymentGate.call(opts)
+
+      refute conn.halted
+      conn = Plug.Conn.send_resp(conn, 200, "paid handler output")
+      assert conn.status == 200
+      assert conn.resp_body == "paid handler output"
+      assert_received {:rpc, "eth_sendRawTransaction", [_raw_hex]}
+
+      for alternate <- [%{"from" => @factory, "nonce" => "changed"}, nil] do
+        header =
+          payload
+          |> put_in(["payload", "authorization"], alternate)
+          |> Jason.encode!()
+          |> Base.encode64()
+
+        duplicate =
+          Plug.Test.conn(:get, "/premium")
+          |> Plug.Conn.put_req_header("payment-signature", header)
+          |> PaymentGate.call(opts)
+
+        assert duplicate.halted
+        assert duplicate.status == 402
+        refute_received {:rpc, "eth_sendRawTransaction", _params}
+      end
+    end
 
     test "exact-permit2 sends the exact proxy's settle and confirms the Transfer", context do
       engine = engine(context)

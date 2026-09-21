@@ -512,16 +512,34 @@ defmodule X402.MCP.ClientTest do
 
   describe "call/3 sign-in-with-x" do
     @domain "mcp.example.com"
+    @uri "https://mcp.example.com"
     @siwx_server [
       domain: @domain,
-      uri: "https://mcp.example.com",
+      uri: @uri,
       supported_chains: [%{chain_id: @network}]
     ]
 
-    defp challenge_result do
+    setup do
+      owner = self()
+      handler_id = "mcp-siwx-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:x402, :client, :siwx],
+        fn _event, _measurements, metadata, _config ->
+          if self() == owner, do: send(owner, {:siwx, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+      :ok
+    end
+
+    defp challenge_result(server_opts \\ @siwx_server) do
       payment_required =
         Map.put(@payment_required, "extensions", %{
-          "sign-in-with-x" => SIWX.challenge(@siwx_server)
+          "sign-in-with-x" => SIWX.challenge(server_opts)
         })
 
       {:ok, result} = MCP.payment_required_result(payment_required)
@@ -541,7 +559,7 @@ defmodule X402.MCP.ClientTest do
                Client.call(@request, call_fun,
                  signer: signer,
                  max_amount: "10000",
-                 siwx: [chain_id: @network, domain: @domain]
+                 siwx: [chain_id: @network, domain: @domain, uri: @uri]
                )
 
       assert %{result: @ok_result, paid: false, siwx_authenticated: true, payment_response: nil} =
@@ -553,6 +571,44 @@ defmodule X402.MCP.ClientTest do
       assert {:ok, %{address: address, chain_id: @network}} = verify_proof(proving)
       assert address == signer.address
       assert proving["arguments"] == @request["arguments"]
+
+      assert_received {:siwx,
+                       %{
+                         status: :ok,
+                         transport: :mcp,
+                         chain_id: @network,
+                         outcome: :authenticated
+                       }}
+
+      refute_received {:siwx, _metadata}
+    end
+
+    test "automatic Solana selection reports the proof chain" do
+      chain = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+      {:ok, signer} = SolanaKey.new(:binary.copy(<<1>>, 32))
+      server_opts = Keyword.put(@siwx_server, :supported_chains, [%{chain_id: chain}])
+      challenge = challenge_result(server_opts)
+
+      assert {:ok, %{siwx_authenticated: true}} =
+               Client.call(@request, tracking_fun([challenge, @ok_result]),
+                 signer: signer,
+                 siwx: [chain_id: :auto, domain: @domain, uri: @uri]
+               )
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, proving}
+      assert {:ok, header} = MCP.fetch_siwx(proving)
+      assert {:ok, %{chain_id: ^chain}} = SIWX.verify(header, server_opts)
+
+      assert_received {:siwx,
+                       %{
+                         status: :ok,
+                         transport: :mcp,
+                         chain_id: ^chain,
+                         outcome: :authenticated
+                       }}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "falls back to payment with a fresh proof when the address is unknown" do
@@ -572,7 +628,7 @@ defmodule X402.MCP.ClientTest do
                Client.call(@request, call_fun,
                  signer: signer,
                  max_amount: "10000",
-                 siwx: [chain_id: :auto, domain: @domain],
+                 siwx: [chain_id: :auto, domain: @domain, uri: @uri],
                  on_payment_required: fn payment_required ->
                    send(test_pid, {:consent, payment_required})
                    :ok
@@ -596,8 +652,20 @@ defmodule X402.MCP.ClientTest do
       assert payload["payload"]["authorization"]["from"] == signer.address
 
       assert_received {:consent, %{"extensions" => %{"sign-in-with-x" => %{"info" => info}}}}
+      assert info["nonce"] == first.fields["nonce"]
+      assert_received {:consent, %{"extensions" => %{"sign-in-with-x" => %{"info" => info}}}}
       assert info["nonce"] == second.fields["nonce"]
       refute_received {:consent, _payment_required}
+
+      assert_received {:siwx,
+                       %{
+                         status: :ok,
+                         transport: :mcp,
+                         chain_id: @network,
+                         outcome: :payment_required
+                       }}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "pays without a proof when the second challenge is gone" do
@@ -607,7 +675,7 @@ defmodule X402.MCP.ClientTest do
                Client.call(@request, call_fun,
                  signer: signer(),
                  max_amount: "10000",
-                 siwx: [chain_id: @network, domain: @domain]
+                 siwx: [chain_id: @network, domain: @domain, uri: @uri]
                )
 
       assert_received {:tool_called, @request}
@@ -625,7 +693,7 @@ defmodule X402.MCP.ClientTest do
                Client.call(@request, call_fun,
                  signer: signer(),
                  max_amount: "10000",
-                 siwx: [chain_id: @network, domain: @domain]
+                 siwx: [chain_id: @network, domain: @domain, uri: @uri]
                )
     end
 
@@ -634,22 +702,40 @@ defmodule X402.MCP.ClientTest do
 
       assert Client.call(@request, call_fun,
                signer: signer(),
-               siwx: [chain_id: "eip155:1", domain: @domain]
+               siwx: [chain_id: "eip155:1", domain: @domain, uri: @uri]
              ) == {:error, {:siwx, :unsupported_chain}}
+
+      assert_received {:siwx,
+                       %{
+                         status: :error,
+                         transport: :mcp,
+                         chain_id: "eip155:1",
+                         reason: :unsupported_chain
+                       }}
 
       call_fun = tracking_fun([challenge_result()])
 
       assert Client.call(@request, call_fun,
                signer: signer(),
-               siwx: [chain_id: @network, domain: "other.example.com"]
+               siwx: [chain_id: @network, domain: "other.example.com", uri: @uri]
              ) == {:error, {:siwx, :domain_mismatch}}
+
+      assert_received {:siwx,
+                       %{
+                         status: :error,
+                         transport: :mcp,
+                         chain_id: nil,
+                         reason: :domain_mismatch
+                       }}
 
       call_fun = tracking_fun([challenge_result(), {:error, :closed}])
 
       assert Client.call(@request, call_fun,
                signer: signer(),
-               siwx: [chain_id: @network, domain: @domain]
+               siwx: [chain_id: @network, domain: @domain, uri: @uri]
              ) == {:error, {:transport_error, :closed}}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "siwx: false and requests already carrying a proof are left alone" do
@@ -662,6 +748,7 @@ defmodule X402.MCP.ClientTest do
       assert_received {:tool_called, paying}
       assert MCP.fetch_siwx(paying) == :error
       assert {:ok, _payload} = MCP.fetch_payment(paying)
+      refute_received {:siwx, _metadata}
     end
 
     test "unpinned challenges never call the wallet, payment consent, or retry" do
@@ -686,6 +773,148 @@ defmodule X402.MCP.ClientTest do
         refute_received {:signer_called, _method}
         refute_received :consent_called
       end
+    end
+
+    test "a domain pin alone cannot authorize an MCP wallet proof" do
+      recording = %RecordingSigner{delegate: signer(), owner: self()}
+
+      assert Client.call(@request, tracking_fun([challenge_result(), @ok_result]),
+               signer: recording,
+               max_amount: "10000",
+               siwx: [chain_id: @network, domain: @domain]
+             ) == {:error, {:siwx, :uri_mismatch}}
+
+      assert_received {:tool_called, @request}
+      refute_received {:tool_called, _request}
+      refute_received {:signer_called, _method}
+    end
+
+    test "consent can cancel the first SIWX signature" do
+      recording = %RecordingSigner{delegate: signer(), owner: self()}
+      owner = self()
+
+      assert Client.call(@request, tracking_fun([challenge_result(), @ok_result]),
+               signer: recording,
+               max_amount: "10000",
+               siwx: [chain_id: @network, domain: @domain, uri: @uri],
+               on_payment_required: fn _payment_required ->
+                 send(owner, :consent_called)
+                 :cancel
+               end
+             ) == {:error, :payment_cancelled}
+
+      assert_received :consent_called
+      assert_received {:tool_called, @request}
+      refute_received {:tool_called, _request}
+      refute_received {:signer_called, _method}
+    end
+
+    test "challenge URI changes fail before consent, signing, or retry" do
+      recording = %RecordingSigner{delegate: signer(), owner: self()}
+      owner = self()
+
+      for uri <- [
+            "https://mcp.example.com/other-tool",
+            "https://mcp.example.com?account=other",
+            "https://mcp.example.com:8443",
+            "http://mcp.example.com",
+            "https://other.example.com"
+          ] do
+        challenge = challenge_result(Keyword.put(@siwx_server, :uri, uri))
+
+        assert Client.call(@request, tracking_fun([challenge, @ok_result]),
+                 signer: recording,
+                 max_amount: "10000",
+                 siwx: [chain_id: @network, domain: @domain, uri: @uri],
+                 on_payment_required: fn _required ->
+                   send(owner, :consent_called)
+                   :ok
+                 end
+               ) == {:error, {:siwx, :uri_mismatch}}
+
+        assert_received {:tool_called, @request}
+        refute_received {:tool_called, _request}
+        refute_received {:signer_called, _method}
+        refute_received :consent_called
+      end
+    end
+
+    test "malformed URI pins and pins inconsistent with the domain fail closed" do
+      recording = %RecordingSigner{delegate: signer(), owner: self()}
+
+      for uri <- ["", "relative", "https://user@mcp.example.com", @uri <> "#fragment"] do
+        assert Client.call(@request, tracking_fun([challenge_result(), @ok_result]),
+                 signer: recording,
+                 max_amount: "10000",
+                 siwx: [chain_id: @network, domain: @domain, uri: uri]
+               ) == {:error, {:siwx, :uri_mismatch}}
+
+        assert_received {:tool_called, @request}
+        refute_received {:tool_called, _request}
+        refute_received {:signer_called, _method}
+      end
+
+      uri = "https://other.example.com"
+      challenge = challenge_result(Keyword.put(@siwx_server, :uri, uri))
+
+      assert Client.call(@request, tracking_fun([challenge, @ok_result]),
+               signer: recording,
+               max_amount: "10000",
+               siwx: [chain_id: @network, domain: @domain, uri: uri]
+             ) == {:error, {:siwx, :domain_mismatch}}
+
+      assert_received {:tool_called, @request}
+      refute_received {:tool_called, _request}
+      refute_received {:signer_called, _method}
+    end
+
+    test "consent can cancel a fresh proof before signing it or its payment" do
+      recording = %RecordingSigner{delegate: signer(), owner: self()}
+      owner = self()
+      first = challenge_result()
+      second = challenge_result()
+      {:ok, second_required} = MCP.fetch_payment_required(second)
+      budget = start_supervised!({Budget, limit: 100_000})
+
+      assert Client.call(@request, tracking_fun([first, second, @ok_result]),
+               signer: recording,
+               budget: budget,
+               siwx: [chain_id: @network, domain: @domain, uri: @uri],
+               on_payment_required: fn required ->
+                 send(owner, {:consent, required})
+                 if required == second_required, do: :cancel, else: :ok
+               end
+             ) == {:error, :payment_cancelled}
+
+      assert_received {:tool_called, @request}
+      assert_received {:consent, _first_required}
+      assert_received {:signer_called, :message}
+      assert_received {:tool_called, proving}
+      assert {:ok, _identity} = verify_proof(proving)
+      assert_received {:consent, ^second_required}
+      refute_received {:consent, _required}
+      refute_received {:signer_called, _method}
+      refute_received {:tool_called, _request}
+      assert Budget.spent(budget).total == 0
+    end
+
+    test "a changed URI in a fresh challenge cannot harvest a second proof" do
+      recording = %RecordingSigner{delegate: signer(), owner: self()}
+      first = challenge_result()
+      second = challenge_result(Keyword.put(@siwx_server, :uri, @uri <> "/elsewhere"))
+
+      assert Client.call(@request, tracking_fun([first, second, @ok_result]),
+               signer: recording,
+               max_amount: "10000",
+               siwx: [chain_id: @network, domain: @domain, uri: @uri]
+             ) == {:error, {:siwx, :uri_mismatch}}
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, proving}
+      assert {:ok, _identity} = verify_proof(proving)
+      assert_received {:signer_called, :message}
+      refute_received {:signer_called, _method}
+      refute_received {:tool_called, _request}
     end
 
     test "validates siwx options" do

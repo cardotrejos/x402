@@ -58,6 +58,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       assigned as `:x402_path_params` (`%{"id" => "42"}`) on every gated
       request, paid or not.
 
+    Parameter matching preserves Plug's `script_name ++ path_info` segment
+    boundaries while decoding each segment once. An encoded slash such as
+    `r%2F1` remains one captured value (`"r/1"`), not an extra path component.
+
     The advertised `resource.url` is always the concrete request URL. With
     a `:bazaar` route option (a keyword list of
     `X402.Extensions.Bazaar.build_extension/1` options), the 402 response
@@ -861,6 +865,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             path: String.t(),
             glob_regex: Regex.t() | nil,
             param_names: [String.t()],
+            path_segments: [String.t()],
             accepts: dynamic([payment_accept()]),
             dynamic: boolean(),
             description: dynamic(String.t()),
@@ -1235,10 +1240,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     def call(%Plug.Conn{} = conn, %{routes: routes} = opts) do
       if is_nil(opts.payment_identifier_cache), do: warn_no_idempotency_cache_once()
 
-      request_path = decoded_request_path(conn)
+      request_segments = decoded_request_segments(conn)
+      request_path = "/" <> Enum.join(request_segments, "/")
       request_method = normalize_method(conn.method)
 
-      case match_route(routes, request_method, request_path) do
+      case match_route(routes, request_method, request_path, request_segments) do
         nil ->
           emit(:pass_through, %{method: request_method, path: request_path})
           conn
@@ -2647,6 +2653,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         path: normalized_path,
         glob_regex: glob_regex(matcher, normalized_path),
         param_names: path_param_names(normalized_path),
+        path_segments: String.split(String.trim_leading(normalized_path, "/"), "/"),
         accepts: accepts,
         dynamic: dynamic,
         requirements: static_requirements(accepts),
@@ -2700,32 +2707,19 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     @spec glob_regex(:exact | :glob | :params, String.t()) :: Regex.t() | nil
-    defp glob_regex(:exact, _path), do: nil
+    defp glob_regex(matcher, _path) when matcher in [:exact, :params], do: nil
 
     defp glob_regex(:glob, path) do
       ("^" <> (path |> Regex.escape() |> String.replace("\\*", ".*")) <> "$")
       |> Regex.compile!()
     end
 
-    # Each :param segment captures exactly one non-empty path segment, as
-    # in the reference middlewares' route patterns.
-    defp glob_regex(:params, path) do
-      pattern =
-        path
-        |> String.split("/")
-        |> Enum.map_join("/", fn
-          ":" <> name -> "(?<#{name}>[^/]+)"
-          segment -> Regex.escape(segment)
-        end)
-
-      Regex.compile!("^" <> pattern <> "$")
-    end
-
-    @spec match_route([compiled_route()], atom(), String.t()) :: {compiled_route(), map()} | nil
-    defp match_route(routes, request_method, request_path) do
+    @spec match_route([compiled_route()], atom(), String.t(), [String.t()]) ::
+            {compiled_route(), map()} | nil
+    defp match_route(routes, request_method, request_path, request_segments) do
       Enum.find_value(routes, fn route ->
         with true <- method_matches?(route.method, request_method),
-             {:ok, params} <- match_path(route, request_path) do
+             {:ok, params} <- match_path(route, request_path, request_segments) do
           {route, params}
         else
           _no_match -> nil
@@ -2737,27 +2731,37 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp method_matches?(:any, _request_method), do: true
     defp method_matches?(method, request_method), do: method == request_method
 
-    @spec match_path(compiled_route(), String.t()) :: {:ok, map()} | :error
-    defp match_path(%{matcher: :exact, path: path}, request_path) do
+    @spec match_path(compiled_route(), String.t(), [String.t()]) :: {:ok, map()} | :error
+    defp match_path(%{matcher: :exact, path: path}, request_path, _segments) do
       case path == request_path do
         true -> {:ok, %{}}
         false -> :error
       end
     end
 
-    defp match_path(%{matcher: :glob, glob_regex: regex}, request_path) do
+    defp match_path(%{matcher: :glob, glob_regex: regex}, request_path, _segments) do
       case Regex.match?(regex, request_path) do
         true -> {:ok, %{}}
         false -> :error
       end
     end
 
-    defp match_path(%{matcher: :params, glob_regex: regex}, request_path) do
-      case Regex.named_captures(regex, request_path) do
-        nil -> :error
-        params -> {:ok, params}
-      end
+    defp match_path(%{matcher: :params, path_segments: pattern}, _path, segments) do
+      match_param_segments(pattern, segments, %{})
     end
+
+    # A decoded slash is part of one capture, not a new routing boundary.
+    @spec match_param_segments([String.t()], [String.t()], map()) :: {:ok, map()} | :error
+    defp match_param_segments([], [], params), do: {:ok, params}
+
+    defp match_param_segments([":" <> name | pattern], [value | segments], params)
+         when value != "",
+         do: match_param_segments(pattern, segments, Map.put(params, name, value))
+
+    defp match_param_segments([literal | pattern], [literal | segments], params),
+      do: match_param_segments(pattern, segments, params)
+
+    defp match_param_segments(_pattern, _segments, _params), do: :error
 
     @spec payment_header(Plug.Conn.t()) ::
             :missing | {:ok, String.t()} | {:error, :invalid_payment_header}
@@ -3491,15 +3495,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # paths. Segments are additionally percent-decoded so the gate also covers
     # routers that decode; when the router does not, a decoded match merely
     # 402s a request the router would 404 — over-matching is the fail-safe
-    # direction for a paywall. Malformed percent sequences are matched
-    # verbatim.
-    @spec decoded_request_path(Plug.Conn.t()) :: String.t()
-    defp decoded_request_path(%Plug.Conn{script_name: script_name, path_info: path_info}) do
-      case script_name ++ path_info do
-        [] -> "/"
-        segments -> "/" <> Enum.map_join(segments, "/", &decode_segment/1)
-      end
-    end
+    # direction for a paywall. Parameter routes retain the adapter's segment
+    # boundaries: decoded slashes belong to the capture, not the path structure.
+    # Exact/glob aliases still use the joined decoded path. Malformed percent
+    # sequences are matched verbatim.
+    @spec decoded_request_segments(Plug.Conn.t()) :: [String.t()]
+    defp decoded_request_segments(%Plug.Conn{script_name: script_name, path_info: path_info}),
+      do: Enum.map(script_name ++ path_info, &decode_segment/1)
 
     @spec decode_segment(String.t()) :: String.t()
     defp decode_segment(segment) do

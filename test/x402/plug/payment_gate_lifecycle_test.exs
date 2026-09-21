@@ -67,6 +67,21 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
 
   @param_route %{@route | path: "/api/users/:id/reports/:report_id"}
 
+  defmodule ParamRouter do
+    use Plug.Router
+
+    plug(:match)
+    plug(:dispatch)
+
+    get "/api/users/:id/reports/:report_id" do
+      send_resp(conn, 200, Jason.encode!(%{"id" => id, "report_id" => report_id}))
+    end
+
+    match _ do
+      send_resp(conn, 404, "not found")
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Hook modules
   # ---------------------------------------------------------------------------
@@ -238,15 +253,78 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
       assert conn.status == 402
       assert conn.assigns.x402_path_params == %{"id" => "a b", "report_id" => "r:1"}
 
-      # An encoded slash decodes to a segment separator before matching, so
-      # it can never smuggle a slash into a single parameter.
       slash =
         run_request(conn(:get, "/api/users/42/reports/r%2F1"),
           routes: [@param_route],
           facilitator: facilitator
         )
 
-      assert slash.status == 200
+      assert slash.status == 402
+      assert slash.assigns.x402_path_params == %{"id" => "42", "report_id" => "r/1"}
+    end
+
+    test "encoded separators retain Plug segment boundaries and cannot bypass payment" do
+      opts = PaymentGate.init(routes: [@param_route], facilitator: self())
+
+      for {encoded, decoded} <- [
+            {"r%2F1", "r/1"},
+            {"r%2f1", "r/1"},
+            {"%2F", "/"},
+            {"%252F", "%2F"},
+            {"r%0A1", "r\n1"}
+          ] do
+        request = conn(:get, "/api/users/42/reports/#{encoded}")
+        assert request.path_info == ["api", "users", "42", "reports", encoded]
+        assert ParamRouter.call(request, []).status == 200
+
+        gated = PaymentGate.call(request, opts)
+        assert gated.status == 402
+        assert gated.halted
+        assert gated.assigns.x402_path_params == %{"id" => "42", "report_id" => decoded}
+        assert get_resp_header(gated, "payment-required") != []
+      end
+    end
+
+    test "forwarded parameter routes retain encoded captures for pricing and Bazaar" do
+      route =
+        @param_route
+        |> Map.put(:price, fn conn ->
+          assert conn.assigns.x402_path_params == %{"id" => "a/b", "report_id" => "/"}
+          @premium_amount
+        end)
+        |> Map.put(:bazaar, method: :get)
+
+      request = %{
+        conn(:get, "/api/users/a%2Fb/reports/%2f")
+        | script_name: ["api"],
+          path_info: ["users", "a%2Fb", "reports", "%2f"]
+      }
+
+      gated = PaymentGate.call(request, PaymentGate.init(routes: [route], facilitator: self()))
+      assert gated.halted
+      assert gated.status == 402
+      required = decode_payment_required!(gated)
+      assert [%{"amount" => @premium_amount}] = required["accepts"]
+
+      assert required["extensions"]["bazaar"]["info"]["input"]["pathParams"] ==
+               %{"id" => "a/b", "report_id" => "/"}
+
+      assert required["resource"]["url"] ==
+               "http://www.example.com/api/users/a%2Fb/reports/%2f"
+    end
+
+    test "paid encoded-slash captures still verify and settle before returning content" do
+      facilitator = start_mock_facilitator()
+
+      paid =
+        conn(:get, "/api/users/42/reports/r%2F1")
+        |> put_req_header("payment-signature", valid_payment_header())
+        |> run_request(routes: [@param_route], facilitator: facilitator)
+
+      assert paid.status == 200
+      assert paid.assigns.x402_path_params == %{"id" => "42", "report_id" => "r/1"}
+      assert_receive {:verify_called, _payload, %{"amount" => @amount}}
+      assert_receive {:settle_called, _payload, _requirements}
     end
 
     test "exact and glob routes never assign path params" do

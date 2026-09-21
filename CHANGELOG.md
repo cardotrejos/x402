@@ -193,9 +193,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `siwx:` option of `X402.Client.Finch.request/3` and
   `X402.MCP.Client.call/3` (`chain_id:` — a CAIP-2 chain or `:auto` to
   pick the first advertised `supportedChains` entry the signer can sign
-  — plus optional `address:`, `signature_scheme:`, and `domain:`, the
-  latter required for MCP and defaulting to the resource URL's host on
-  HTTP). When the 402 advertises a `sign-in-with-x` challenge the client
+  — plus optional `address:`, `signature_scheme:`, `domain:`, and `uri:`.
+  MCP requires independent domain and exact URI pins; HTTP defaults its domain
+  to the resource URL's host). MCP consent runs before signing initial or
+  refreshed proofs, once per challenge. When the 402 advertises a
+  `sign-in-with-x` challenge the client
   signs it (`X402.Client.SIWX.authenticate/4`, refusing challenges not
   bound to the expected origin, or lacking a trusted domain/resource URL;
   domain matching ignores case without dropping port boundaries)

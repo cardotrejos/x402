@@ -234,7 +234,9 @@ Guardrails, matching `X402.Client.Finch` (the
   receipt; a reservation that does not fit fails the call with
   `{:error, {:budget_exceeded, details}}`.
 - **`on_payment_required:`** — a veto hook invoked with the decoded
-  `PaymentRequired` before anything is signed. Return `:cancel` to abort with
+  `PaymentRequired` before either a SIWX proof or a payment is signed.
+  Each fresh challenge requires new consent, without duplicate calls for a
+  proof and payment sharing that challenge. Return `:cancel` to abort with
   `{:error, :payment_cancelled}`.
 - **`hooks:`** — an `X402.Client.Hooks` module run around payment creation
   (`before_payment/2`, `after_payment/2`, `on_payment_failure/2`).
@@ -254,19 +256,30 @@ retried with the proof in `_meta["x402/sign-in-with-x"]` and no payment.
 A result that is not payment-required is returned with
 `siwx_authenticated: true`; another payment-required result continues
 with the payment flow, the paid call carrying a proof for the new
-challenge so the server records the payer. MCP resources have no HTTP
-origin, so `domain:` is required to pin the challenge to the server you
-expect. Without it, an advertised challenge fails with
-`{:error, {:siwx, :domain_mismatch}}` before signing or retrying. Do not
-take this pin from the challenge or its advertised resource URL.
+challenge so the server records the payer. The callback exposes no verifiable
+transport origin, so both `domain:` and an exact HTTP(S) `uri:` are required.
+The URI must include the expected path and query, with no userinfo or fragment.
+Missing or mismatched pins fail with `{:error, {:siwx, :domain_mismatch}}` or
+`{:error, {:siwx, :uri_mismatch}}` before consent, signing, or retrying.
+Do not take either pin from the challenge or its advertised resource URL.
 
 ```elixir
 X402.MCP.Client.call(request, &MyMCP.call_tool/1,
   signer: signer,
   max_amount: "10000",
-  siwx: [chain_id: :auto, domain: "mcp.example.com"]
+  siwx: [
+    chain_id: :auto,
+    domain: "mcp.example.com",
+    uri: "https://mcp.example.com/tools/premium_search"
+  ]
 )
 ```
+
+Bind `MyMCP.call_tool/1` to an independently trusted endpoint or local process.
+These pins constrain the signed audience; they do not authenticate an arbitrary
+callback. A malicious transport can still relay a challenge for that exact
+audience. The consent hook can reject both initial and refreshed proofs before
+the wallet signs.
 
 `chain_id:` is a CAIP-2 chain or `:auto` (the first advertised chain the
 signer can sign); `address:` and `signature_scheme:` are optional. If you
