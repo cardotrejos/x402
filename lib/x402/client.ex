@@ -139,6 +139,11 @@ defmodule X402.Client do
 
   @type select_error :: :no_acceptable_requirements | :invalid_payment_required
 
+  # Payment flows (spec §6.1) this client knows how to run. Only the default
+  # verify → resource → settle ordering is implemented; `upfront` and
+  # `escrow` commit funds before the resource executes and are skipped.
+  @recognized_payment_flows ["authorization"]
+
   @type build_error ::
           select_error()
           | {:unsupported_kind, term(), term()}
@@ -160,6 +165,12 @@ defmodule X402.Client do
   `extra.version`) and `upto` on an `eip155:*` network via
   `X402.Scheme.UptoEVM` (which requires `extra.facilitatorAddress`). Pass
   additional schemes with the `:schemes` option.
+
+  Entries whose `extra.paymentFlow` names a flow this client does not
+  recognize are skipped: the protocol requires clients never to construct
+  a payment for an unknown flow (spec §6.1). Only the default
+  `"authorization"` flow (explicit or omitted) is recognized; `upfront` and
+  `escrow` entries settle before the resource executes and are not selected.
 
   The selected entry is returned exactly as the server sent it, so it can be
   echoed verbatim as the payload's `accepted` value.
@@ -358,11 +369,26 @@ defmodule X402.Client do
 
   @spec supported?(map(), [module()]) :: boolean()
   defp supported?(requirements, schemes) do
-    PaymentRequirements.validate(requirements) == :ok and
+    recognized_payment_flow?(requirements) and
+      PaymentRequirements.validate(requirements) == :ok and
       case resolve_scheme(requirements, schemes) do
         {:ok, module} -> Scheme.signs?(module) and Scheme.signable?(module, requirements)
         :error -> false
       end
+  end
+
+  @spec recognized_payment_flow?(map()) :: boolean()
+  defp recognized_payment_flow?(requirements) do
+    case Utils.map_value(requirements, {"extra", :extra}) do
+      extra when is_map(extra) ->
+        case Utils.map_value(extra, {"paymentFlow", :paymentFlow}) do
+          nil -> true
+          flow -> flow in @recognized_payment_flows
+        end
+
+      _extra ->
+        true
+    end
   end
 
   @spec resolve_scheme(map(), [module()]) :: {:ok, module()} | :error

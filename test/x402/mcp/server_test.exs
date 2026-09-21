@@ -18,6 +18,7 @@ defmodule X402.MCP.ServerTest do
 
   doctest X402.MCP.Server
 
+  alias X402.Extensions.PaymentIdentifier
   alias X402.Extensions.PaymentIdentifier.ETSCache
   alias X402.MCP.Server
 
@@ -194,6 +195,21 @@ defmodule X402.MCP.ServerTest do
       },
       overrides
     )
+  end
+
+  # A payment echoing the server's `payment-identifier` declaration plus
+  # `info.id`. `:signature` swaps the signed payload so the proof mints a
+  # different replay key.
+  defp spec_id_payment(payment_id, opts \\ []) do
+    advertised = Keyword.get(opts, :advertised, PaymentIdentifier.extension())
+    extensions = %{"payment-identifier" => put_in(advertised, ["info", "id"], payment_id)}
+
+    payment = Map.put(payment(), "extensions", extensions)
+
+    case Keyword.get(opts, :signature) do
+      nil -> payment
+      signature -> put_in(payment, ["payload", "signature"], signature)
+    end
   end
 
   defp request(payment_payload) do
@@ -895,6 +911,210 @@ defmodule X402.MCP.ServerTest do
       assert_received {:settle_called, _payload, _requirements, _hooks}
       assert_received {:settle_called, _payload, _requirements, _hooks}
       assert second["structuredContent"]["error"] =~ "settlement failed"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # payment-identifier extension
+  # ---------------------------------------------------------------------------
+
+  describe "payment-identifier extension" do
+    @spec_id "abcdefghijklmnopqrstuvwxyz012345"
+    @advertised %{"payment-identifier" => PaymentIdentifier.extension()}
+    @advertised_required %{"payment-identifier" => PaymentIdentifier.extension(required: true)}
+
+    setup do
+      cache =
+        start_supervised!({ETSCache, name: :"mcp_pid_#{System.unique_integer([:positive])}"})
+
+      %{cache: cache}
+    end
+
+    test "accepts a spec-format id and forwards the echo to the facilitator", %{cache: cache} do
+      config =
+        config(start_facilitator(), extensions: @advertised, payment_identifier_cache: cache)
+
+      result = Server.call(request(spec_id_payment(@spec_id)), config, ok_handler())
+
+      assert result["_meta"]["x402/payment-response"]["success"] == true
+      assert_received {:verify_called, payload, _requirements, _hooks}
+      assert payload["extensions"]["payment-identifier"]["info"]["id"] == @spec_id
+    end
+
+    test "rejects a missing id when the advertisement requires one" do
+      config = config(start_facilitator(), extensions: @advertised_required)
+
+      for extensions <- [%{}, @advertised_required] do
+        payment = Map.put(payment(), "extensions", extensions)
+        result = Server.call(request(payment), config, refute_handler())
+
+        assert result["isError"] == true
+        assert result["structuredContent"]["error"] == "payment_identifier_required"
+      end
+
+      refute_received {:verify_called, _payload, _requirements, _hooks}
+      refute_received :handler_called
+    end
+
+    test "rejects malformed spec ids with invalid_payload" do
+      config = config(start_facilitator(), extensions: @advertised)
+
+      for invalid <- [String.duplicate("a", 15), String.duplicate("a", 129), "bad id!", 42] do
+        result = Server.call(request(spec_id_payment(invalid)), config, refute_handler())
+
+        assert result["isError"] == true
+        assert result["structuredContent"]["error"] == "invalid_payload"
+      end
+
+      refute_received {:verify_called, _payload, _requirements, _hooks}
+    end
+
+    test "rejects a reused id bound to a different request", %{cache: cache} do
+      facilitator = start_facilitator()
+
+      search =
+        config(facilitator,
+          tool: "search",
+          extensions: @advertised,
+          payment_identifier_cache: cache
+        )
+
+      other =
+        config(facilitator,
+          tool: "other",
+          extensions: @advertised,
+          payment_identifier_cache: cache
+        )
+
+      first = Server.call(request(spec_id_payment(@spec_id)), search, ok_handler())
+      assert first["_meta"]["x402/payment-response"]["success"] == true
+
+      second =
+        Server.call(
+          request(spec_id_payment(@spec_id, signature: "0xother")),
+          other,
+          refute_handler()
+        )
+
+      assert second["isError"] == true
+      assert second["structuredContent"]["error"] == "payment_identifier_conflict"
+      refute_received :handler_called
+    end
+
+    test "the same id with the same request proceeds normally", %{cache: cache} do
+      config =
+        config(start_facilitator(), extensions: @advertised, payment_identifier_cache: cache)
+
+      first = Server.call(request(spec_id_payment(@spec_id)), config, ok_handler())
+
+      second =
+        Server.call(
+          request(spec_id_payment(@spec_id, signature: "0xother")),
+          config,
+          ok_handler()
+        )
+
+      assert first["_meta"]["x402/payment-response"]["success"] == true
+      assert second["_meta"]["x402/payment-response"]["success"] == true
+    end
+
+    test "releases the binding when the handler fails or settlement fails", %{cache: cache} do
+      facilitator = start_facilitator()
+
+      search =
+        config(facilitator,
+          tool: "search",
+          extensions: @advertised,
+          payment_identifier_cache: cache
+        )
+
+      other =
+        config(facilitator,
+          tool: "other",
+          extensions: @advertised,
+          payment_identifier_cache: cache
+        )
+
+      error_result = %{"isError" => true, "content" => []}
+
+      assert Server.call(request(spec_id_payment(@spec_id)), search, fn _ -> error_result end) ==
+               error_result
+
+      retry =
+        Server.call(request(spec_id_payment(@spec_id, signature: "0xother")), other, ok_handler())
+
+      assert retry["_meta"]["x402/payment-response"]["success"] == true
+    end
+
+    test "releases the binding when verification fails", %{cache: cache} do
+      rejecting =
+        start_facilitator(
+          verify: {:ok, %{status: 200, body: %{"isValid" => false, "invalidReason" => "nope"}}}
+        )
+
+      search =
+        config(rejecting,
+          tool: "search",
+          extensions: @advertised,
+          payment_identifier_cache: cache
+        )
+
+      rejected = Server.call(request(spec_id_payment(@spec_id)), search, refute_handler())
+      assert rejected["structuredContent"]["error"] == "nope"
+
+      other =
+        config(start_facilitator(),
+          tool: "other",
+          extensions: @advertised,
+          payment_identifier_cache: cache
+        )
+
+      retry = Server.call(request(spec_id_payment(@spec_id)), other, ok_handler())
+      assert retry["_meta"]["x402/payment-response"]["success"] == true
+    end
+
+    test "a binding failure other than a duplicate fails closed as an internal error" do
+      config =
+        config(start_facilitator(),
+          extensions: @advertised,
+          payment_identifier_cache: {FailingCache, :backend}
+        )
+
+      assert Server.call(request(spec_id_payment(@spec_id)), config, refute_handler()) ==
+               @internal_error
+
+      refute_received {:verify_called, _payload, _requirements, _hooks}
+    end
+
+    test "legacy ids still work and emit the deprecation telemetry event", %{cache: cache} do
+      handler_id = "mcp-legacy-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :payment_identifier, :legacy],
+          fn _event, measurements, metadata, _config ->
+            send(parent, {:legacy_event, measurements, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      config = config(start_facilitator(), payment_identifier_cache: cache)
+
+      payment =
+        Map.put(payment(), "extensions", %{"paymentIdentifier" => %{"paymentId" => "pay-1"}})
+
+      result = Server.call(request(payment), config, ok_handler())
+
+      assert result["_meta"]["x402/payment-response"]["success"] == true
+      assert_receive {:legacy_event, %{count: 1}, %{source: :mcp}}
+
+      malformed = Map.put(payment(), "extensions", %{"paymentIdentifier" => %{}})
+      rejected = Server.call(request(malformed), config, refute_handler())
+      assert rejected["structuredContent"]["error"] == "invalid payment identifier extension"
     end
   end
 

@@ -242,6 +242,23 @@ defmodule X402.FacilitatorTest do
     def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
   end
 
+  defmodule ExtensionResponsesHooks do
+    @moduledoc false
+    @behaviour X402.Hooks
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+
+    def after_verify(%Context{} = context, _metadata) do
+      body = Map.put(context.result.body, "hookSaw", context.result.extension_responses)
+      {:cont, %Context{context | result: %{context.result | body: body}}}
+    end
+
+    def on_verify_failure(%Context{} = context, _metadata), do: {:cont, context}
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
   defmodule RaisingFailureHooks do
     @moduledoc false
     @behaviour X402.Hooks
@@ -328,6 +345,133 @@ defmodule X402.FacilitatorTest do
 
     assert {:ok, %{status: 200, body: %{"settled" => true}}} =
              Facilitator.settle(facilitator, payment_payload, requirements)
+  end
+
+  describe "EXTENSION-RESPONSES sidechannel" do
+    test "verify/3 and settle/3 surface decoded extension responses", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      {:ok, verify_header} =
+        X402.ExtensionResponses.encode(%{"bazaar" => %{"status" => "processing"}})
+
+      {:ok, settle_header} =
+        X402.ExtensionResponses.encode(%{"bazaar" => %{"status" => "success"}})
+
+      Bypass.expect(bypass, "POST", "/verify", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("extension-responses", verify_header)
+        |> Plug.Conn.resp(200, Jason.encode!(%{"isValid" => true, "payer" => "0xabc"}))
+      end)
+
+      Bypass.expect(bypass, "POST", "/settle", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("Extension-Responses", settle_header)
+        |> Plug.Conn.resp(200, Jason.encode!(%{"success" => true}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok,
+              %{
+                status: 200,
+                body: %{"isValid" => true},
+                extension_responses: %{"bazaar" => %{"status" => "processing"}}
+              }} = Facilitator.verify(facilitator, %{"a" => 1}, %{"scheme" => "exact"})
+
+      assert {:ok,
+              %{
+                status: 200,
+                body: %{"success" => true},
+                extension_responses: %{"bazaar" => %{"status" => "success"}}
+              }} = Facilitator.settle(facilitator, %{"a" => 1}, %{"scheme" => "exact"})
+    end
+
+    test "results carry extension_responses: nil when the header is absent", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      Bypass.expect(bypass, "POST", "/verify", fn conn ->
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"isValid" => true}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok, %{status: 200, extension_responses: nil}} =
+               Facilitator.verify(facilitator, %{"a" => 1}, %{"scheme" => "exact"})
+    end
+
+    test "a malformed header is dropped without failing the operation", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      handler_id = "facilitator-extension-responses-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :extension_responses, :decode],
+          fn _event, _measurements, metadata, _config ->
+            send(parent, {:decode_event, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Bypass.expect(bypass, "POST", "/verify", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("extension-responses", Base.encode64("[1,2,3]"))
+        |> Plug.Conn.resp(200, Jason.encode!(%{"isValid" => true}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator, name: unique_name("facilitator"), finch: finch, url: facilitator_url}
+        )
+
+      assert {:ok, %{status: 200, body: %{"isValid" => true}, extension_responses: nil}} =
+               Facilitator.verify(facilitator, %{"a" => 1}, %{"scheme" => "exact"})
+
+      assert_receive {:decode_event, %{status: :error, reason: :invalid_responses}}
+    end
+
+    test "after_verify hooks observe the decoded extension responses", %{
+      bypass: bypass,
+      finch: finch,
+      facilitator_url: facilitator_url
+    } do
+      {:ok, header} = X402.ExtensionResponses.encode(%{"bazaar" => %{"status" => "success"}})
+
+      Bypass.expect(bypass, "POST", "/verify", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("extension-responses", header)
+        |> Plug.Conn.resp(200, Jason.encode!(%{"isValid" => true}))
+      end)
+
+      facilitator =
+        start_supervised!(
+          {Facilitator,
+           name: unique_name("facilitator"),
+           finch: finch,
+           url: facilitator_url,
+           hooks: ExtensionResponsesHooks}
+        )
+
+      assert {:ok,
+              %{body: %{"isValid" => true, "hookSaw" => %{"bazaar" => %{"status" => "success"}}}}} =
+               Facilitator.verify(facilitator, %{"a" => 1}, %{"scheme" => "exact"})
+    end
   end
 
   test "before_verify and after_verify hooks can mutate verify flow", %{

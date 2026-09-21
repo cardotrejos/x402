@@ -99,8 +99,17 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   @typedoc "Payment identifier cache key."
   @type key :: PaymentIdentifier.payment_id()
 
-  @typedoc "Value stored for a given payment identifier."
-  @type value :: :verified | {:rejected, term()}
+  @typedoc """
+  Value stored for a given key.
+
+  `:verified` and `{:rejected, reason}` mark replay claims;
+  `{:bound, fingerprint}` binds a client payment id (stored under a
+  `"pid:"`-prefixed key) to the request fingerprint it was first used with;
+  `{:siwx_nonce, :issued | :used}` tracks Sign-In-With-X challenge nonces
+  (stored under `"siwx:issued:"` / `"siwx:used:"`-prefixed keys).
+  """
+  @type value ::
+          :verified | {:rejected, term()} | {:bound, String.t()} | {:siwx_nonce, :issued | :used}
 
   @typedoc "Adapter tuple accepted by `X402.Plug.PaymentGate`."
   @type adapter :: {module(), term()}

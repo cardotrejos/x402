@@ -7,6 +7,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Sign-In-With-X spec format — `X402.Extensions.SIWX`**: the
+  [sign-in-with-x extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/sign-in-with-x.md)
+  as the spec defines it, for EVM and Solana wallets. Servers advertise a
+  CAIP-122 challenge under `PaymentRequired.extensions["sign-in-with-x"]`
+  (`challenge/1` / `X402.Extensions.SIWX.Challenge`: fresh nonce and
+  timestamps per 402, `supportedChains` with `eip191` / `ed25519` types,
+  and the proof JSON schema); clients sign it with any `X402.Signer`
+  (`sign/3` — EIP-4361 text signed with EIP-191 `personal_sign` on
+  `eip155:*`, Sign-In-With-Solana text signed with Ed25519 on `solana:*`,
+  message construction in `X402.Extensions.SIWX.Message`) and send the
+  proof fields Base64-encoded in `SIGN-IN-WITH-X` (`encode_signed/1`);
+  servers decode (`decode_signed/1`) and verify (`verify/2`) them in the
+  spec's check order, each failure carrying one of the spec's
+  machine-readable codes (`invalid_siwx_domain_mismatch`,
+  `invalid_siwx_uri_mismatch`, `invalid_siwx_issued_at_too_old`,
+  `invalid_siwx_expired`, `invalid_siwx_nonce`,
+  `invalid_siwx_unsupported_chain`, `invalid_siwx_signature`, ...).
+  Nonces are tracked through any `X402.Extensions.PaymentIdentifier.Cache`
+  adapter (`:nonce_cache`): a proof verifies only against a nonce the
+  server issued and is consumed atomically, so it authenticates at most
+  once. `X402.Extensions.SIWX.Verifier.Ed25519` verifies Solana proofs over
+  OTP `:crypto` (small-order public keys refused); the existing
+  `X402.Extensions.SIWX.Verifier.Default` covers EVM
+- **`X402.Extensions.SIWX.Server`**: the server side in one struct —
+  `new/1` validates `:domain`, `:uri`, `:supported_chains`, `:statement`,
+  `:resources`, `:expiration_seconds`, `:max_age_seconds`,
+  `:clock_skew_seconds`, `:nonce_cache`, `:storage`, `:ttl_ms`,
+  `:verifier`, and `:ed25519_verifier`; `challenge/1` issues (and records)
+  a challenge, `verify/2` checks a proof, `record_payment/4` remembers
+  which address paid for which resource after settlement, and
+  `authenticate/3` combines verification with that history
+  (`{:error, :not_authorized}` when the wallet has not paid). Usable from
+  any framework. EVM addresses are case-insensitive for payment records,
+  lookup and revocation; Solana public keys retain their case
+- **`X402.Plug.PaymentGate` `:siwx` option** (a keyword list of
+  `X402.Extensions.SIWX.Server.new/1` options): every 402 advertises a
+  fresh challenge (exempt from the extension echo check because it changes
+  per response); a request carrying `SIGN-IN-WITH-X` is authenticated
+  against the HTTP method and full resource URL — a previously paying
+  address runs the handler without payment, with `:x402_siwx_address` and
+  `:x402_siwx_chain_id` assigned and `[:x402, :plug, :siwx_authenticated]`
+  emitted; an address with no record falls through to the normal payment
+  flow when `PAYMENT-SIGNATURE` is also present and otherwise receives
+  **402** with a fresh challenge; a proof that fails verification receives
+  **402** with the `invalid_siwx_*` code as the `error` string (telemetry
+  `reason: {:siwx, code}`); an undecodable header receives **400**
+  `invalid_siwx_header`. After a successful settlement the payer (the
+  settle response's `payer`, falling back to the authorization's `from`)
+  is recorded for the resource URL through `:storage` for `:ttl_ms`
+- **`X402.Signer.sign_message/2`** and the optional
+  `c:X402.Signer.sign_message/2` signer callback: EIP-191 `personal_sign` over an arbitrary message,
+  returning the `0x`-prefixed 65-byte `r || s || v` hex signature (`v`
+  normalized to 27/28). `X402.Signer.LocalKey` implements it; signers
+  without it return `{:error, :unsupported_signer}`
+- **Payment-identifier spec format — `X402.Extensions.PaymentIdentifier`**:
+  the [payment-identifier extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/payment_identifier.md)
+  under its spec key `"payment-identifier"`. Servers advertise it with
+  `extension/1` (`info.required` plus the JSON `schema/0`); clients echo the
+  advertisement and add `info.id` through the new `enricher/1` for
+  `X402.Client.build_payment/3`'s `:extensions` option (fresh
+  `generate_id/0` per payment, or an explicit `:id`; `always: true` attaches
+  it even when not advertised). Ids are 16–128 characters of
+  `[A-Za-z0-9_-]` (`valid_id?/1`); servers read them with `extract_id/1`
+  (tagged `{:spec, id}` or `{:legacy, id}`), check `required?/1`, and bind
+  them to a request through `fingerprint/2` (SHA-256 over scheme, network,
+  asset, amount, `payTo`, HTTP method, path, and MCP tool name)
+- **Payment-identifier enforcement in `X402.Plug.PaymentGate` and
+  `X402.MCP.Server`**: a malformed spec id is rejected with **400**
+  `invalid_payload`; a missing id under `required: true` with **400**
+  `payment_identifier_required`. With a `:payment_identifier_cache`, each id
+  is bound to its request fingerprint under a `"pid:"`-prefixed key: reusing
+  it for a different request is rejected with **409**
+  `payment_identifier_conflict`, while the same request proceeds and stays
+  subject to the signature-derived replay key. A binding is released
+  together with the replay claim (handler status >= 400, verification or
+  settlement failure), so the id may be retried. The MCP server reports the
+  same three reasons in its payment-required result and fingerprints the
+  tool name instead of method/path
+- **`EXTENSION-RESPONSES` sidechannel — `X402.ExtensionResponses`**:
+  encode/decode of the facilitator's per-extension outcome header (x402 v2
+  §7.2.1; `encode/1`, `decode/1`, `from_headers/1`,
+  `from_headers_lenient/1`, 8 KB cap). `X402.Facilitator.verify/2` and
+  `settle/2` results now carry the response `:headers` and the decoded
+  sidechannel as `:extension_responses` (`nil` when absent or malformed — a
+  bad header is dropped with a `[:x402, :extension_responses, :decode]`
+  telemetry event rather than failing the payment). `X402.Plug.PaymentGate`
+  assigns the verify-time outcomes as `:x402_extension_responses` and adds
+  the settle-time outcomes as `:extension_responses` to the
+  `[:x402, :plug, :payment_verified]` metadata; the sidechannel is never
+  forwarded to the buyer. Engines behind `X402.Plug.Facilitator` may return
+  `{:ok, wire_response, extension_responses}` from `verify/3` / `settle/3`
+  and the plug emits the header (an unencodable map is logged and dropped)
+- **Bazaar service metadata — `X402.Extensions.Bazaar.Metadata`**: the
+  bazaar spec's validation and soft-drop rules for provider metadata
+  (`valid_service_name?/1`, `sanitize_tags/1`, `valid_icon_url?/1`,
+  `sanitize_resource/1`) and dynamic-route templates
+  (`valid_route_template?/1`, `extract_route_template/1`), mirroring the
+  reference SDKs. `X402.Extensions.Bazaar.build_extension/1` gains
+  `:route_template`, published as the extension's top-level
+  `routeTemplate` catalog key. `X402.Plug.PaymentGate` now validates
+  `:service_name` (non-empty printable ASCII, at most 32 characters),
+  `:tags` (at most 5 unique case-insensitive entries under the same rule),
+  and `:icon_url` (absolute http(s), no userinfo, no IP literal or loopback
+  host, at most 2048 characters) at init and rejects invalid values
+
+### Changed
+
+- `X402.Client` no longer selects requirements whose `extra.paymentFlow`
+  names a flow it cannot run: only the default `"authorization"` flow
+  (explicit or omitted) is recognized, so `upfront` and `escrow` entries —
+  which commit funds before the resource executes — are skipped, per spec
+  §6.1. A `PAYMENT-REQUIRED` offering only such entries yields
+  `{:error, :no_acceptable_requirements}`
+- **Upgrading.** Custom `X402.Extensions.PaymentIdentifier.Cache` adapters
+  must accept two new `value` forms in `put_new/3` and `put/3`:
+  `{:bound, fingerprint}` (payment-id bindings, stored under `"pid:"`
+  keys) and `{:siwx_nonce, :issued | :used}` (Sign-In-With-X nonces, under
+  `"siwx:issued:"` / `"siwx:used:"` keys). Adapters that serialize values
+  by pattern-matching on `:verified` / `{:rejected, reason}` need updating;
+  the bundled ETS and Redis adapters already do. `X402.Facilitator.verify/2`
+  and `settle/2` results gain `:headers` and `:extension_responses` keys
+  (previously `%{status: ..., body: ...}`); code that pattern-matches the
+  whole map must allow them, and hooks see them in `context.result`
+
+### Deprecated
+
+- The pre-0.7.0 `"paymentIdentifier"` extension format (a Base64 JSON
+  `{"paymentId": ...}` string or a `%{"paymentId" => ...}` map, optionally
+  wrapped in `%{"info" => ...}`). It is still accepted by the gate and the
+  MCP server with the same assign, telemetry, and fingerprint binding —
+  each one emits `[:x402, :payment_identifier, :legacy]` and the first logs
+  a warning — and will be removed in 1.0.0. Legacy ids satisfy
+  `required: true` and are exempt from the spec's length and character
+  rules. `X402.Extensions.PaymentIdentifier.encode/1`, `decode/1`, and
+  `fetch_payment_id/1` are deprecated with it
+- The pre-0.7.0 `SIGN-IN-WITH-X` header format (a Base64 JSON
+  `{"message", "signature"}` object carrying the signed EIP-4361 text).
+  `X402.Extensions.SIWX.decode_signed/1` still reports it as
+  `{:legacy, proof}` and `verify/2` applies the same checks to the exact
+  text that was signed; the gate emits `[:x402, :siwx, :legacy]` per proof
+  and logs a one-time warning. Removed in 1.0.0 together with
+  `X402.Extensions.SIWX.encode_header/1` and `decode_header/1`
+  (`encode/1` and `decode/1` remain as the EIP-4361 text codec)
+
+### Security
+
+- Pin every GitHub Actions step in `.github/workflows/ci.yml` to a commit
+  SHA (with the tag recorded in a comment) and grant the workflow
+  least-privilege `permissions: contents: read`
+
 ## [0.6.1] - 2026-09-16
 
 ### Fixed

@@ -81,11 +81,24 @@ defmodule X402.Signer do
   @callback sign_ed25519(signer :: t(), message :: binary()) ::
               {:ok, ed25519_signature()} | {:error, term()}
 
+  @doc """
+  Signs an arbitrary message with EIP-191 `personal_sign` and returns the
+  `0x`-prefixed hex encoding of the 65-byte `r || s || v` signature.
+
+  The signer hashes `keccak256("\\x19Ethereum Signed Message:\\n" <>
+  byte_size(message) <> message)` and signs the digest with its secp256k1
+  key. Used by the Sign-In-With-X extension (`X402.Extensions.SIWX.sign/3`)
+  for `eip155:*` chains. Optional — implement it for EVM signers that
+  support wallet authentication.
+  """
+  @callback sign_message(signer :: t(), message :: binary()) ::
+              {:ok, String.t()} | {:error, term()}
+
   # Chain-family callbacks are optional: a signer implements the ones for
   # the families it supports (EVM signers omit sign_ed25519, Solana signers
   # omit sign_eip712), and the dispatchers report the gap as
   # {:error, :unsupported_signer}.
-  @optional_callbacks sign_eip712: 3, sign_ed25519: 2
+  @optional_callbacks sign_eip712: 3, sign_ed25519: 2, sign_message: 2
 
   @doc since: "0.6.0"
   @doc """
@@ -160,6 +173,54 @@ defmodule X402.Signer do
   end
 
   def sign_ed25519(_signer, _message), do: {:error, :invalid_signer}
+
+  @doc since: "0.7.0"
+  @doc """
+  Signs a message with EIP-191 `personal_sign`, dispatching on the signer's
+  struct module.
+
+  Returns the lowercase `0x`-prefixed hex encoding of the 65-byte
+  `r || s || v` signature with `v` normalized to `27`/`28`. Returns
+  `{:error, :unsupported_signer}` when the signer module does not implement
+  the optional `c:sign_message/2` callback and
+  `{:error, :invalid_signature_format}` when the callback returns anything
+  other than a 65-byte hex signature.
+
+  ## Examples
+
+      iex> X402.Signer.sign_message(:not_a_signer, "message")
+      {:error, :invalid_signer}
+
+      iex> {:ok, solana_signer} = X402.Signer.SolanaKey.new(:binary.copy(<<1>>, 32))
+      iex> X402.Signer.sign_message(solana_signer, "message")
+      {:error, :unsupported_signer}
+  """
+  @spec sign_message(t(), binary()) :: {:ok, String.t()} | {:error, term()}
+  def sign_message(%module{} = signer, message) when is_binary(message) do
+    case Code.ensure_loaded?(module) and function_exported?(module, :sign_message, 2) do
+      true ->
+        with {:ok, signature} <- module.sign_message(signer, message) do
+          normalize_hex_signature(signature)
+        end
+
+      false ->
+        {:error, :unsupported_signer}
+    end
+  end
+
+  def sign_message(_signer, _message), do: {:error, :invalid_signer}
+
+  @spec normalize_hex_signature(term()) :: {:ok, String.t()} | {:error, :invalid_signature_format}
+  defp normalize_hex_signature("0x" <> hex) when byte_size(hex) == 130 do
+    with {:ok, raw} <- Base.decode16(hex, case: :mixed),
+         {:ok, normalized} <- normalize_signature(raw) do
+      {:ok, "0x" <> Base.encode16(normalized, case: :lower)}
+    else
+      _other -> {:error, :invalid_signature_format}
+    end
+  end
+
+  defp normalize_hex_signature(_signature), do: {:error, :invalid_signature_format}
 
   @spec normalize_signature(term()) :: {:ok, signature()} | {:error, :invalid_signature_format}
   defp normalize_signature(<<compact::binary-size(64), v>>) when v in [0, 1],

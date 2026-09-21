@@ -26,11 +26,18 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
        can reconcile — mirroring the reference resource servers. Successful
        settlements attach a `PAYMENT-RESPONSE` header and assign
        `:x402_payment_payload` / `:x402_payment_requirements` on the conn.
+       When the facilitator reports extension outcomes through the
+       `EXTENSION-RESPONSES` sidechannel (see `X402.ExtensionResponses`),
+       the verify-time outcomes are assigned as `:x402_extension_responses`
+       and settle-time outcomes are attached to the
+       `[:x402, :plug, :payment_verified]` telemetry metadata; the
+       sidechannel is never forwarded to the buyer.
 
     HTTP status mapping (HTTP transport v2):
 
     - **402** — payment required, no matching requirements, or payment failed
     - **400** — malformed / invalid payment payload (including wrong `x402Version`)
+    - **409** — a `payment-identifier` id reused for a different request
     - **500** — facilitator transport failures or malformed facilitator responses
 
     See the official
@@ -47,6 +54,55 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     human-usable HTML page instead of the `{}` JSON body. The
     `PAYMENT-REQUIRED` header is identical on both forms and all other
     responses are unchanged. See the "Browser Paywall" guide.
+
+    ## Sign-In-With-X
+
+    With `:siwx` configured (a keyword list of
+    `X402.Extensions.SIWX.Server.new/1` options), the gate implements the
+    [sign-in-with-x extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/sign-in-with-x.md)
+    so a wallet that already paid can skip payment:
+
+        plug X402.Plug.PaymentGate,
+          routes: [...],
+          siwx: [
+            domain: "api.example.com",
+            uri: "https://api.example.com",
+            supported_chains: [%{chain_id: "eip155:8453"}],
+            nonce_cache: MyApp.SIWXNonces,
+            storage: {X402.Extensions.SIWX.ETSStorage, MyApp.SIWXStorage}
+          ]
+
+    * Every 402 response advertises a fresh challenge under
+      `extensions["sign-in-with-x"]` (new nonce and timestamps each time).
+      Because it changes per response it is exempt from the extension echo
+      check.
+    * A request carrying a `SIGN-IN-WITH-X` header is verified by
+      `X402.Extensions.SIWX.Server.authenticate/3` against the HTTP method
+      and full resource URL. When the address has a payment record for that
+      request the handler runs without payment, `:x402_siwx_address` and
+      `:x402_siwx_chain_id` are assigned, and
+      `[:x402, :plug, :siwx_authenticated]` is emitted. When it has none,
+      the request proceeds through the normal payment flow if it also
+      carries `PAYMENT-SIGNATURE`, and otherwise receives **402** with a
+      fresh challenge. A proof that fails verification receives **402** with
+      the spec's `invalid_siwx_*` code as the `error` string (telemetry
+      `reason: {:siwx, code}`); a header that cannot be decoded receives
+      **400** `invalid_siwx_header`.
+    * After a successful settlement the payer (the settle response's
+      `payer`, falling back to the authorization's `from`) is recorded for
+      the method and resource URL through the configured `:storage`, for `:ttl_ms`.
+
+    Access keys have the form `"GET https://api.example.com/resource?item=1"`.
+    The full URL, including origin, port, raw path and query, remains part
+    of the key: those fields can identify different paid resources. A GET
+    payment never grants POST access, even when both match an `:any` route.
+    Configure trusted proxy URL rewriting before this gate. Old URL-only
+    records are not accepted as method-scoped grants.
+
+    The deprecated pre-0.7.0 `{message, signature}` header format is still
+    accepted; each one emits `[:x402, :siwx, :legacy]` and the first logs a
+    warning. Configure a `:nonce_cache` in production: without it a proof
+    can be replayed within its `issuedAt` window.
 
     ## Replay protection
 
@@ -66,12 +122,48 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       proof are distinct keys here, exactly as before canonical keys existed.
 
     The key is **never** derived from client-controlled unsigned fields — in
-    particular not from the payment identifier extension's `paymentId`: a
-    replayer could vary it to mint a fresh key and bypass deduplication, or
-    squat another payment's id to deny it service. Duplicate proofs are
-    rejected with **402** and the claim is released when the protected
-    handler responds with a status >= 400 or settlement fails, so clients may
-    retry a payment whose resource was never delivered.
+    particular not from the payment identifier extension's id: a replayer
+    could vary it to mint a fresh key and bypass deduplication, or squat
+    another payment's id to deny it service. Duplicate proofs are rejected
+    with **402** and the claim is released when the protected handler
+    responds with a status >= 400 or settlement fails, so clients may retry
+    a payment whose resource was never delivered.
+
+    ### Payment identifier
+
+    Routes may advertise the
+    [`payment-identifier` extension](https://github.com/x402-foundation/x402/blob/main/specs/extensions/payment_identifier.md)
+    through `X402.Extensions.PaymentIdentifier.extension/1`:
+
+        extensions: %{"payment-identifier" => X402.Extensions.PaymentIdentifier.extension(required: true)}
+
+    The id the client echoes under `extensions["payment-identifier"]["info"]["id"]`
+    is validated (16–128 characters of `[A-Za-z0-9_-]`, otherwise **400**
+    `invalid_payload`), assigned as `:x402_payment_id`, and attached as
+    `:payment_id` to the `[:x402, :plug, :payment_verified]` telemetry
+    metadata. When the advertisement sets `required: true` and no id is
+    echoed, the request is rejected with **400** `payment_identifier_required`.
+
+    With `:payment_identifier_cache` configured, the id is additionally
+    bound to a request fingerprint
+    (`X402.Extensions.PaymentIdentifier.fingerprint/2` over the matched
+    scheme, network, asset, amount, payTo, HTTP method, and path) under a
+    `"pid:"`-prefixed cache key. Reusing an id for a request with a
+    different fingerprint is rejected with **409**
+    `payment_identifier_conflict`; the same id with the same fingerprint
+    proceeds normally and remains subject to the signature-derived replay
+    key above. A binding this request created is released together with the
+    replay claim (handler status >= 400, settlement failure, verification
+    failure), so the id may be retried. Without a cache the binding is
+    skipped and only the validity and `required` checks apply.
+
+    The pre-0.7.0 `"paymentIdentifier"` format (a Base64 JSON
+    `{"paymentId": ...}` string or a `%{"paymentId" => ...}` map, optionally
+    wrapped in `%{"info" => ...}`) is still accepted, with the same assign,
+    telemetry, and fingerprint binding, but is **deprecated** and removed in
+    1.0.0: each legacy id emits `[:x402, :payment_identifier, :legacy]` and
+    the first one logs a warning. Legacy ids satisfy `required: true` and are
+    not subject to the spec's length and character rules.
 
     The `:claim_order` option controls when the claim is taken relative to
     facilitator verification:
@@ -107,9 +199,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @behaviour Plug
 
     alias X402.EIP712
+    alias X402.Extensions.Bazaar
     alias X402.Extensions.PaymentIdentifier
     alias X402.Extensions.PaymentIdentifier.Cache
     alias X402.Extensions.PaymentIdentifier.ETSCache
+    alias X402.Extensions.SIWX
+    alias X402.Extensions.SIWX.Server, as: SIWXServer
     alias X402.Facilitator
     alias X402.Facilitator.Error
     alias X402.Hooks
@@ -149,7 +244,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @precheck_time_buffer_seconds Scheme.EVM.time_buffer_seconds()
     @default_description "Payment required"
     @default_mime_type "application/json"
-    @payment_identifier_extension "paymentIdentifier"
+    @payment_id_binding_prefix "pid:"
     @settlement_pending_reason "settlement_pending"
     @local_verification_levels [:structural, :signature, :full]
 
@@ -160,7 +255,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       :invalid_json,
       :payload_too_large,
       :invalid_payload,
-      :invalid_x402_version
+      :invalid_x402_version,
+      :invalid_payment_identifier,
+      :payment_identifier_required
     ]
 
     @accept_option_schema [
@@ -264,19 +361,30 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         doc: "ResourceInfo.mimeType."
       ],
       service_name: [
-        type: {:or, [:string, nil]},
+        type: {:custom, __MODULE__, :validate_service_name, []},
         default: nil,
-        doc: "ResourceInfo.serviceName (printable ASCII, max 32 characters recommended)."
+        doc: """
+        ResourceInfo.serviceName: non-empty printable ASCII, at most 32
+        characters (`X402.Extensions.Bazaar.Metadata.valid_service_name?/1`).
+        """
       ],
       tags: [
-        type: {:list, :string},
+        type: {:custom, __MODULE__, :validate_tags, []},
         default: [],
-        doc: "ResourceInfo.tags (max 5 recommended)."
+        doc: """
+        ResourceInfo.tags: at most 5 unique (case-insensitive) entries, each
+        non-empty printable ASCII of at most 32 characters
+        (`X402.Extensions.Bazaar.Metadata.sanitize_tags/1`).
+        """
       ],
       icon_url: [
-        type: {:or, [:string, nil]},
+        type: {:custom, __MODULE__, :validate_icon_url, []},
         default: nil,
-        doc: "ResourceInfo.iconUrl (absolute http(s) URL)."
+        doc: """
+        ResourceInfo.iconUrl: absolute http(s) URL, no userinfo, not an IP
+        literal or loopback host, at most 2048 characters
+        (`X402.Extensions.Bazaar.Metadata.valid_icon_url?/1`).
+        """
       ],
       max_timeout_seconds: [
         type: :pos_integer,
@@ -368,9 +476,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         callbacks (for example `{MyApp.RedisPaymentCache, MyApp.Redis}`).
         When set, the plug performs an atomic claim (via the adapter's
         `put_new/3`) on the payment proof hash before settling, preventing
-        concurrent requests from double-settling the same payment. The default
-        ETS adapter is per-node — see the "Replay protection" section above
-        for the clustering hazard.
+        concurrent requests from double-settling the same payment, and binds
+        each echoed `payment-identifier` id to its request fingerprint (see
+        "Payment identifier" above). The default ETS adapter is per-node —
+        see the "Replay protection" section above for the clustering hazard.
         """
       ],
       claim_order: [
@@ -456,6 +565,20 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         headers, 400/500 statuses, post-handler settlement failures) is
         byte-identical to running without `:paywall`.
         """
+      ],
+      siwx: [
+        type: {:or, [nil, {:custom, SIWXServer, :validate_options, []}]},
+        default: nil,
+        doc: """
+        Optional Sign-In-With-X configuration, a keyword list of
+        `X402.Extensions.SIWX.Server.new/1` options (`:domain`, `:uri`, and
+        `:supported_chains` are required). When set, every 402 response
+        advertises a fresh challenge under
+        `extensions["sign-in-with-x"]`, requests carrying a `SIGN-IN-WITH-X`
+        header are authenticated against it, and successful settlements
+        record the payer so later proofs from that address skip payment —
+        see "Sign-In-With-X" above.
+        """
       ]
     ]
 
@@ -472,7 +595,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             schemes: [module()],
             local_prechecks: boolean(),
             local_verification: keyword() | nil,
-            paywall: module() | nil
+            paywall: module() | nil,
+            siwx: SIWXServer.t() | nil
           }
 
     @typedoc false
@@ -508,17 +632,63 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             payment_identifier_cache: Cache.adapter() | nil,
             payment_id: String.t(),
             client_payment_id: String.t() | nil,
+            payment_id_binding: String.t() | nil,
             payment_payload: map(),
             requirements: map(),
             route: compiled_route(),
             request_method: atom(),
-            request_path: String.t()
+            request_path: String.t(),
+            siwx_resource: String.t(),
+            siwx: SIWXServer.t() | nil
           }
 
     @doc false
     @spec validate_extra_map(term()) :: {:ok, map()} | {:error, String.t()}
     def validate_extra_map(value) when is_map(value), do: {:ok, value}
     def validate_extra_map(_value), do: {:error, "expected a map"}
+
+    # Service metadata is validated up front rather than soft-dropped: an
+    # invalid value here is a configuration mistake, and silently omitting
+    # the field from every 402 would hide it.
+    @doc false
+    @spec validate_service_name(term()) :: {:ok, String.t() | nil} | {:error, String.t()}
+    def validate_service_name(empty) when empty in [nil, ""], do: {:ok, nil}
+
+    def validate_service_name(value) do
+      if Bazaar.Metadata.valid_service_name?(value) do
+        {:ok, value}
+      else
+        {:error, "expected non-empty printable ASCII of at most 32 characters"}
+      end
+    end
+
+    @doc false
+    @spec validate_tags(term()) :: {:ok, [String.t()]} | {:error, String.t()}
+    def validate_tags(value) when is_list(value) do
+      if Bazaar.Metadata.sanitize_tags(value) == value do
+        {:ok, value}
+      else
+        {:error,
+         "expected at most 5 unique (case-insensitive) tags, each non-empty " <>
+           "printable ASCII of at most 32 characters"}
+      end
+    end
+
+    def validate_tags(_value), do: {:error, "expected a list of strings"}
+
+    @doc false
+    @spec validate_icon_url(term()) :: {:ok, String.t() | nil} | {:error, String.t()}
+    def validate_icon_url(empty) when empty in [nil, ""], do: {:ok, nil}
+
+    def validate_icon_url(value) do
+      if Bazaar.Metadata.valid_icon_url?(value) do
+        {:ok, value}
+      else
+        {:error,
+         "expected an absolute http(s) URL of at most 2048 characters without " <>
+           "userinfo, IP-literal or loopback host"}
+      end
+    end
 
     @doc false
     @spec validate_atomic_amount(term()) :: {:ok, String.t()} | {:error, String.t()}
@@ -653,7 +823,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         schemes: schemes,
         local_prechecks: Keyword.fetch!(validated_opts, :local_prechecks),
         local_verification: Keyword.fetch!(validated_opts, :local_verification),
-        paywall: Keyword.fetch!(validated_opts, :paywall)
+        paywall: Keyword.fetch!(validated_opts, :paywall),
+        siwx: Keyword.fetch!(validated_opts, :siwx)
       }
     end
 
@@ -733,6 +904,15 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec handle_payment_gate(Plug.Conn.t(), options(), compiled_route(), atom(), String.t()) ::
             Plug.Conn.t()
     defp handle_payment_gate(conn, opts, route, request_method, request_path) do
+      case siwx_header(conn, opts.siwx) do
+        :none -> handle_payment(conn, opts, route, request_method, request_path)
+        {:ok, header} -> handle_siwx(conn, opts, route, request_method, request_path, header)
+      end
+    end
+
+    @spec handle_payment(Plug.Conn.t(), options(), compiled_route(), atom(), String.t()) ::
+            Plug.Conn.t()
+    defp handle_payment(conn, opts, route, request_method, request_path) do
       case payment_header(conn) do
         :missing ->
           emit(:payment_required, %{method: request_method, path: request_path, route: route.path})
@@ -743,7 +923,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             request_path,
             "PAYMENT-SIGNATURE header is required",
             status: 402,
-            paywall: opts.paywall
+            paywall: opts.paywall,
+            siwx: opts.siwx
           )
 
         {:ok, header} ->
@@ -764,8 +945,118 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             rejection_error(reason),
             status: status_for_reason(reason),
             reason: reason,
-            paywall: opts.paywall
+            paywall: opts.paywall,
+            siwx: opts.siwx
           )
+      end
+    end
+
+    @spec siwx_header(Plug.Conn.t(), SIWXServer.t() | nil) :: :none | {:ok, String.t()}
+    defp siwx_header(_conn, nil), do: :none
+
+    defp siwx_header(conn, _siwx) do
+      case get_req_header(conn, "sign-in-with-x") do
+        [header | _rest] when is_binary(header) and header != "" -> {:ok, header}
+        _missing -> :none
+      end
+    end
+
+    # A proof whose address has no payment record falls through to the
+    # payment flow when a PAYMENT-SIGNATURE is also present, so a client can
+    # present its identity and pay in one request (the settlement then
+    # records the payer). Without a payment the response is a 402 carrying a
+    # fresh challenge, exactly like a request with no headers at all.
+    @spec handle_siwx(
+            Plug.Conn.t(),
+            options(),
+            compiled_route(),
+            atom(),
+            String.t(),
+            String.t()
+          ) :: Plug.Conn.t()
+    defp handle_siwx(conn, opts, route, request_method, request_path, header) do
+      metadata = %{method: request_method, path: request_path, route: route.path}
+
+      with {:ok, decoded} <- decode_siwx_header(header),
+           {:ok, session} <-
+             authenticate_siwx(opts.siwx, decoded, siwx_resource_key(conn)) do
+        emit(
+          :siwx_authenticated,
+          Map.merge(metadata, %{address: session.address, chain_id: session.chain_id})
+        )
+
+        conn
+        |> assign(:x402_siwx_address, session.address)
+        |> assign(:x402_siwx_chain_id, session.chain_id)
+      else
+        {:error, :not_authorized} ->
+          case payment_header(conn) do
+            {:ok, _header} ->
+              handle_payment(conn, opts, route, request_method, request_path)
+
+            _missing_or_invalid ->
+              emit(:payment_required, Map.put(metadata, :siwx, :not_authorized))
+
+              payment_error_response(
+                conn,
+                route,
+                request_path,
+                "no payment recorded for the sign-in-with-x address; " <>
+                  "PAYMENT-SIGNATURE header is required",
+                status: 402,
+                paywall: opts.paywall,
+                siwx: opts.siwx
+              )
+          end
+
+        {:error, reason} ->
+          emit(:payment_rejected, Map.put(metadata, :reason, reason))
+
+          payment_error_response(
+            conn,
+            route,
+            request_path,
+            rejection_error(reason),
+            status: status_for_reason(reason),
+            reason: reason,
+            paywall: opts.paywall,
+            siwx: opts.siwx
+          )
+      end
+    end
+
+    @spec decode_siwx_header(String.t()) ::
+            {:ok, SIWX.decoded()} | {:error, {:siwx_header, SIWX.signed_decode_error()}}
+    defp decode_siwx_header(header) do
+      case SIWX.decode_signed(header) do
+        {:ok, {:legacy, _proof} = decoded} ->
+          SIWX.legacy_notice(:gate)
+          {:ok, decoded}
+
+        {:ok, decoded} ->
+          {:ok, decoded}
+
+        {:error, reason} ->
+          {:error, {:siwx_header, reason}}
+      end
+    end
+
+    @spec authenticate_siwx(SIWXServer.t(), SIWX.decoded(), String.t()) ::
+            {:ok, SIWXServer.session()}
+            | {:error, :not_authorized | {:siwx, SIWX.verify_code()} | {:siwx_header, term()}}
+    defp authenticate_siwx(siwx, decoded, resource) do
+      case SIWXServer.authenticate(siwx, decoded, resource) do
+        {:ok, session} -> {:ok, session}
+        {:error, :not_authorized} -> {:error, :not_authorized}
+        {:error, reason} when is_atom(reason) -> {:error, classify_siwx_error(reason)}
+      end
+    end
+
+    @spec classify_siwx_error(atom()) :: {:siwx, SIWX.verify_code()} | {:siwx_header, atom()}
+    defp classify_siwx_error(reason) do
+      case String.starts_with?(Atom.to_string(reason), "invalid_siwx_") do
+        true -> {:siwx, reason}
+        false -> {:siwx_header, reason}
       end
     end
 
@@ -782,27 +1073,41 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
       with {:ok, payment_payload, requirements} <-
              decode_and_validate_payment(header, accepts, route.extensions, opts.schemes),
-           {:ok, client_payment_id} <- extract_client_payment_id(payment_payload),
+           {:ok, client_payment_id} <- client_payment_id(payment_payload, route),
            payment_id = replay_key(header, payment_payload, requirements),
            :ok <- run_local_prechecks(opts, payment_payload, requirements),
-           :ok <- claim_and_verify(opts, payment_id, payment_payload, requirements) do
+           {:ok, binding} <-
+             bind_payment_id(
+               opts.payment_identifier_cache,
+               client_payment_id,
+               PaymentIdentifier.fingerprint(requirements, %{
+                 method: request_method,
+                 path: request_path
+               })
+             ),
+           {:ok, verify_response} <-
+             claim_and_verify_bound(opts, payment_id, binding, payment_payload, requirements) do
         settlement_context = %{
           facilitator: opts.facilitator,
           hooks: opts.hooks,
           payment_identifier_cache: opts.payment_identifier_cache,
           payment_id: payment_id,
           client_payment_id: client_payment_id,
+          payment_id_binding: binding,
           payment_payload: payment_payload,
           requirements: requirements,
           route: route,
           request_method: request_method,
-          request_path: request_path
+          request_path: request_path,
+          siwx_resource: siwx_resource_key(conn),
+          siwx: opts.siwx
         }
 
         conn
         |> assign(:x402_payment_payload, payment_payload)
         |> assign(:x402_payment_requirements, requirements)
         |> maybe_assign_client_payment_id(client_payment_id)
+        |> maybe_assign_extension_responses(verify_response)
         |> register_before_send(fn response_conn ->
           settle_after_resource(response_conn, settlement_context)
         end)
@@ -822,7 +1127,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             rejection_error(reason),
             status: status_for_reason(reason),
             reason: reason,
-            paywall: opts.paywall
+            paywall: opts.paywall,
+            siwx: opts.siwx
           )
       end
     end
@@ -834,13 +1140,24 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           settle_successful_resource(conn, settlement_context)
 
         false ->
-          release_claim(
-            settlement_context.payment_identifier_cache,
-            settlement_context.payment_id
-          )
-
+          release_claims(settlement_context)
           conn
       end
+    end
+
+    @spec release_claims(settlement_context()) :: :ok
+    defp release_claims(settlement_context) do
+      release_claim(
+        settlement_context.payment_identifier_cache,
+        settlement_context.payment_id
+      )
+
+      release_binding(
+        settlement_context.payment_identifier_cache,
+        settlement_context.payment_id_binding
+      )
+
+      :ok
     end
 
     @spec successful_resource_response?(Plug.Conn.t()) :: boolean()
@@ -881,10 +1198,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @spec fail_settlement(Plug.Conn.t(), settlement_context(), term(), term()) :: Plug.Conn.t()
     defp fail_settlement(conn, settlement_context, reason, response_reason) do
-      release_claim(
-        settlement_context.payment_identifier_cache,
-        settlement_context.payment_id
-      )
+      release_claims(settlement_context)
 
       reject_settlement(
         conn,
@@ -892,7 +1206,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         settlement_context.request_method,
         settlement_context.request_path,
         reason,
-        response_reason
+        response_reason,
+        settlement_context.siwx
       )
     end
 
@@ -909,9 +1224,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
           emit(
             :payment_verified,
-            maybe_put(metadata, :payment_id, settlement_context.client_payment_id)
+            metadata
+            |> maybe_put(:payment_id, settlement_context.client_payment_id)
+            |> maybe_put(:extension_responses, extension_responses(settle_response))
           )
 
+          record_siwx_payment(response_conn, settle_response, settlement_context)
           response_conn
 
         {:error, reason} ->
@@ -926,13 +1244,63 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    # The payer is taken from the settle response (the facilitator's
+    # authoritative view of who paid), falling back to the signed payload's
+    # `from`. A storage failure is logged and the settled response still
+    # served: the payment went through, the address merely has to pay again
+    # next time.
+    @spec record_siwx_payment(Plug.Conn.t(), map(), settlement_context()) :: :ok
+    defp record_siwx_payment(_conn, _settle_response, %{siwx: nil}), do: :ok
+
+    defp record_siwx_payment(_conn, settle_response, %{siwx: siwx} = settlement_context) do
+      case settlement_payer(settle_response, settlement_context.payment_payload) do
+        nil ->
+          :ok
+
+        payer ->
+          resource = settlement_context.siwx_resource
+
+          case SIWXServer.record_payment(siwx, payer, resource, settle_response.body) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              Logger.warning(
+                "[X402.Plug.PaymentGate] could not record sign-in-with-x payer " <>
+                  "#{payer} for #{resource}: #{inspect(reason)}"
+              )
+          end
+      end
+    end
+
+    @spec settlement_payer(map(), map()) :: String.t() | nil
+    defp settlement_payer(%{body: body}, payment_payload) do
+      case Utils.map_value(body, {"payer", :payer}) do
+        payer when is_binary(payer) and payer != "" -> payer
+        _absent -> payload_from(payment_payload)
+      end
+    end
+
+    @spec payload_from(map()) :: String.t() | nil
+    defp payload_from(payment_payload) do
+      with %{} = payload <- Utils.map_value(payment_payload, {"payload", :payload}),
+           %{} = authorization <- Utils.map_value(payload, {"authorization", :authorization}),
+           from when is_binary(from) and from != "" <-
+             Utils.map_value(authorization, {"from", :from}) do
+        from
+      else
+        _other -> nil
+      end
+    end
+
     @spec reject_settlement(
             Plug.Conn.t(),
             compiled_route(),
             atom(),
             String.t(),
             term(),
-            term()
+            term(),
+            SIWXServer.t() | nil
           ) :: Plug.Conn.t()
     defp reject_settlement(
            conn,
@@ -940,7 +1308,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
            request_method,
            request_path,
            reason,
-           response_reason
+           response_reason,
+           siwx
          ) do
       emit(:payment_rejected, %{
         method: request_method,
@@ -955,7 +1324,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         request_path,
         rejection_error(reason),
         status: status_for_reason(reason),
-        reason: response_reason
+        reason: response_reason,
+        siwx: siwx
       )
     end
 
@@ -1085,6 +1455,30 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp retryable_settlement_pending?(_settle_body), do: false
 
+    # A binding this request created is released on every failure below —
+    # including a facilitator exit, which under :after_verify propagates
+    # before any replay claim exists — so a failed attempt never strands the
+    # client's id until the cache TTL expires.
+    @spec claim_and_verify_bound(options(), String.t(), String.t() | nil, map(), map()) ::
+            {:ok, map()} | {:error, term()}
+    defp claim_and_verify_bound(opts, payment_id, nil, payload, requirements),
+      do: claim_and_verify(opts, payment_id, payload, requirements)
+
+    defp claim_and_verify_bound(opts, payment_id, binding, payload, requirements) do
+      case claim_and_verify(opts, payment_id, payload, requirements) do
+        {:ok, verify_response} ->
+          {:ok, verify_response}
+
+        {:error, reason} ->
+          release_binding(opts.payment_identifier_cache, binding)
+          {:error, reason}
+      end
+    catch
+      :exit, reason ->
+        release_binding(opts.payment_identifier_cache, binding)
+        exit(reason)
+    end
+
     # Orders the replay claim relative to facilitator verification.
     #
     # :after_verify — verify first, then claim. Verification failures never
@@ -1093,10 +1487,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # :before_verify — claim first, rejecting duplicates without contacting
     # the facilitator; release the claim when verification fails for any
     # reason so the payer can retry.
-    @spec claim_and_verify(options(), String.t(), map(), map()) :: :ok | {:error, term()}
+    @spec claim_and_verify(options(), String.t(), map(), map()) ::
+            {:ok, map()} | {:error, term()}
     defp claim_and_verify(%{claim_order: :after_verify} = opts, payment_id, payload, requirements) do
-      with :ok <- verify_payment(opts, payload, requirements) do
-        claim_payment(opts.payment_identifier_cache, payment_id)
+      with {:ok, verify_response} <- verify_payment(opts, payload, requirements),
+           :ok <- claim_payment(opts.payment_identifier_cache, payment_id) do
+        {:ok, verify_response}
       end
     end
 
@@ -1117,11 +1513,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # before letting the exit propagate, or the payer's legitimate retry is
     # rejected as a duplicate until the cache TTL expires.
     @spec verify_with_claim_release(options(), String.t(), map(), map()) ::
-            :ok | {:error, term()}
+            {:ok, map()} | {:error, term()}
     defp verify_with_claim_release(opts, payment_id, payload, requirements) do
       case verify_payment(opts, payload, requirements) do
-        :ok ->
-          :ok
+        {:ok, verify_response} ->
+          {:ok, verify_response}
 
         {:error, reason} ->
           release_claim(opts.payment_identifier_cache, payment_id)
@@ -1133,12 +1529,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         exit(reason)
     end
 
-    @spec verify_payment(options(), map(), map()) :: :ok | {:error, term()}
+    @spec verify_payment(options(), map(), map()) :: {:ok, map()} | {:error, term()}
     defp verify_payment(opts, payment_payload, requirements) do
       with :ok <- run_local_verification(opts, payment_payload, requirements),
            {:ok, verify_response} <-
-             facilitator_verify(opts.facilitator, payment_payload, requirements, opts.hooks) do
-        ensure_verify_success(verify_response)
+             facilitator_verify(opts.facilitator, payment_payload, requirements, opts.hooks),
+           :ok <- ensure_verify_success(verify_response) do
+        {:ok, verify_response}
       end
     end
 
@@ -1190,6 +1587,41 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec release_claim(Cache.adapter() | nil, String.t()) :: Cache.write_result()
     defp release_claim(nil, _payment_id), do: :ok
     defp release_claim(adapter, payment_id), do: Cache.delete(adapter, payment_id)
+
+    # Binds the client's payment id to the request fingerprint. Returns the
+    # binding key when this request created the binding (and therefore owns
+    # its release), nil when no id / no cache / an identical binding already
+    # exists, and :payment_identifier_conflict when the id was first used for
+    # a different request.
+    @spec bind_payment_id(Cache.adapter() | nil, String.t() | nil, String.t()) ::
+            {:ok, String.t() | nil} | {:error, term()}
+    defp bind_payment_id(nil, _client_payment_id, _fingerprint), do: {:ok, nil}
+    defp bind_payment_id(_adapter, nil, _fingerprint), do: {:ok, nil}
+
+    defp bind_payment_id(adapter, client_payment_id, fingerprint) do
+      key = @payment_id_binding_prefix <> client_payment_id
+
+      case Cache.put_new(adapter, key, {:bound, fingerprint}) do
+        :ok -> {:ok, key}
+        {:error, :already_exists} -> compare_binding(adapter, key, fingerprint)
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    @spec compare_binding(Cache.adapter(), String.t(), String.t()) ::
+            {:ok, nil} | {:error, term()}
+    defp compare_binding(adapter, key, fingerprint) do
+      case Cache.get(adapter, key) do
+        {:hit, {:bound, ^fingerprint}} -> {:ok, nil}
+        {:hit, _other} -> {:error, :payment_identifier_conflict}
+        :miss -> {:ok, nil}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    @spec release_binding(Cache.adapter() | nil, String.t() | nil) :: Cache.write_result()
+    defp release_binding(_adapter, nil), do: :ok
+    defp release_binding(adapter, key), do: Cache.delete(adapter, key)
 
     @spec facilitator_verify(Facilitator.server(), map(), map(), module()) ::
             Facilitator.response()
@@ -1431,9 +1863,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp requirements_match?(requirement, accepted),
       do: PaymentRequirements.match?(requirement, accepted)
 
+    # The sign-in-with-x advertisement is a per-response challenge (fresh
+    # nonce and timestamps every 402), so a client can never echo the value
+    # the current response would carry; it is exempt from the echo check.
     @spec validate_extensions(map(), map()) :: :ok | {:error, :extension_echo_mismatch}
     defp validate_extensions(payload, advertised_extensions) do
       client_extensions = Utils.map_value(payload, {"extensions", :extensions})
+      advertised_extensions = Map.delete(advertised_extensions, SIWX.extension_key())
 
       case PaymentRequirements.extensions_match?(advertised_extensions, client_extensions) do
         true -> :ok
@@ -1533,51 +1969,57 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp signer_nonce_key(_authorization, _prefix, _network), do: :error
 
-    # The echoed paymentId is surfaced for correlation only — never used as
-    # the replay key (see replay_key/3): it is client-controlled and not
-    # covered by any signature.
-    @spec extract_client_payment_id(map()) ::
-            {:ok, String.t() | nil} | {:error, {:invalid_payment_identifier, term()}}
-    defp extract_client_payment_id(payment_payload) do
-      with extensions when is_map(extensions) <-
-             Utils.map_value(payment_payload, {"extensions", :extensions}),
-           {:ok, value} <- Map.fetch(extensions, @payment_identifier_extension) do
-        decode_client_payment_id(value)
-      else
-        _absent -> {:ok, nil}
+    # The echoed id is surfaced for correlation and bound to the request
+    # fingerprint — never used as the replay key (see replay_key/3): it is
+    # client-controlled and not covered by any signature.
+    @spec client_payment_id(map(), compiled_route()) ::
+            {:ok, String.t() | nil}
+            | {:error,
+               :invalid_payment_identifier
+               | :payment_identifier_required
+               | {:invalid_payment_identifier, term()}}
+    defp client_payment_id(payment_payload, route) do
+      payment_payload
+      |> Utils.map_value({"extensions", :extensions})
+      |> PaymentIdentifier.extract_id()
+      |> case do
+        {:ok, {:spec, payment_id}} ->
+          {:ok, payment_id}
+
+        {:ok, {:legacy, payment_id}} ->
+          PaymentIdentifier.legacy_notice(:gate)
+          {:ok, payment_id}
+
+        {:ok, nil} ->
+          case PaymentIdentifier.required?(route.extensions) do
+            true -> {:error, :payment_identifier_required}
+            false -> {:ok, nil}
+          end
+
+        {:error, :invalid_payment_id} ->
+          {:error, :invalid_payment_identifier}
+
+        {:error, {:legacy, reason}} ->
+          {:error, {:invalid_payment_identifier, reason}}
       end
     end
 
-    # The extension value may arrive in the generic `%{"info" => ...,
-    # "schema" => ...}` envelope form — the same envelope
-    # `X402.PaymentRequirements.extensions_match?/2` unwraps when validating
-    # the client's echo — so an echo that passes extension validation must
-    # not then be rejected as malformed. Mirror that unwrapping here before
-    # decoding; malformed content inside a present envelope is still a hard
-    # 400.
-    @spec decode_client_payment_id(term()) ::
-            {:ok, String.t()} | {:error, {:invalid_payment_identifier, term()}}
-    defp decode_client_payment_id(%{"info" => info}), do: decode_bare_payment_id(info)
-    defp decode_client_payment_id(value), do: decode_bare_payment_id(value)
-
-    @spec decode_bare_payment_id(term()) ::
-            {:ok, String.t()} | {:error, {:invalid_payment_identifier, term()}}
-    defp decode_bare_payment_id(value) when is_binary(value) do
-      case PaymentIdentifier.decode(value) do
-        {:ok, payment_id} -> {:ok, payment_id}
-        {:error, reason} -> {:error, {:invalid_payment_identifier, reason}}
+    # The facilitator's EXTENSION-RESPONSES sidechannel is for the resource
+    # server only: it is exposed to the handler through assigns and never
+    # copied into the PAYMENT-RESPONSE header.
+    @spec maybe_assign_extension_responses(Plug.Conn.t(), map()) :: Plug.Conn.t()
+    defp maybe_assign_extension_responses(conn, verify_response) do
+      case extension_responses(verify_response) do
+        nil -> conn
+        responses -> assign(conn, :x402_extension_responses, responses)
       end
     end
 
-    defp decode_bare_payment_id(value) when is_map(value) do
-      case PaymentIdentifier.fetch_payment_id(value) do
-        {:ok, payment_id} -> {:ok, payment_id}
-        {:error, reason} -> {:error, {:invalid_payment_identifier, reason}}
-      end
-    end
+    @spec extension_responses(map()) :: map() | nil
+    defp extension_responses(%{extension_responses: responses}) when is_map(responses),
+      do: responses
 
-    defp decode_bare_payment_id(_value),
-      do: {:error, {:invalid_payment_identifier, :invalid_payment_id}}
+    defp extension_responses(_response), do: nil
 
     @spec maybe_assign_client_payment_id(Plug.Conn.t(), String.t() | nil) :: Plug.Conn.t()
     defp maybe_assign_client_payment_id(conn, nil), do: conn
@@ -1746,6 +2188,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec resource_url(Plug.Conn.t(), String.t()) :: String.t()
     defp resource_url(conn, _request_path), do: Plug.Conn.request_url(conn)
 
+    @spec siwx_resource_key(Plug.Conn.t()) :: String.t()
+    defp siwx_resource_key(conn), do: conn.method <> " " <> Plug.Conn.request_url(conn)
+
     @spec payment_error_response(
             Plug.Conn.t(),
             compiled_route(),
@@ -1771,7 +2216,10 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       status = Keyword.get(opts, :status, 402)
       reason = Keyword.get(opts, :reason)
       paywall = Keyword.get(opts, :paywall)
-      required_payload = payment_required_payload(conn, route, request_path, error_message)
+      siwx = if status == 402, do: Keyword.get(opts, :siwx)
+
+      required_payload =
+        payment_required_payload(conn, route, request_path, error_message, siwx)
 
       with {:ok, encoded_required} <- PaymentRequired.encode(required_payload),
            {:ok, response_conn} <- maybe_put_payment_response_header(conn, reason) do
@@ -1862,16 +2310,42 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    @spec payment_required_payload(Plug.Conn.t(), compiled_route(), String.t(), String.t()) ::
-            map()
-    defp payment_required_payload(conn, route, request_path, error_message) do
+    @spec payment_required_payload(
+            Plug.Conn.t(),
+            compiled_route(),
+            String.t(),
+            String.t(),
+            SIWXServer.t() | nil
+          ) :: map()
+    defp payment_required_payload(conn, route, request_path, error_message, siwx) do
       %{
         "x402Version" => @x402_version,
         "error" => error_message,
         "resource" => resource_info(conn, route, request_path),
         "accepts" => route_accepts(route),
-        "extensions" => route.extensions
+        "extensions" => advertised_extensions(route, siwx)
       }
+    end
+
+    # A challenge whose nonce could not be recorded would never verify, so
+    # the advertisement is dropped for that response rather than misleading
+    # the client into signing it.
+    @spec advertised_extensions(compiled_route(), SIWXServer.t() | nil) :: map()
+    defp advertised_extensions(route, nil), do: route.extensions
+
+    defp advertised_extensions(route, siwx) do
+      case SIWXServer.challenge(siwx) do
+        {:ok, challenge} ->
+          Map.put(route.extensions, SIWX.extension_key(), challenge)
+
+        {:error, reason} ->
+          Logger.warning(
+            "[X402.Plug.PaymentGate] could not record the sign-in-with-x challenge " <>
+              "nonce (#{inspect(reason)}); omitting the challenge from this response"
+          )
+
+          route.extensions
+      end
     end
 
     @spec put_payment_response_header(Plug.Conn.t(), map()) ::
@@ -1926,8 +2400,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp payment_response_from_reason(_reason), do: nil
 
-    @spec status_for_reason(term()) :: 400 | 402 | 500
+    @spec status_for_reason(term()) :: 400 | 402 | 409 | 500
     defp status_for_reason(reason) when reason in @invalid_request_reasons, do: 400
+    defp status_for_reason(:payment_identifier_conflict), do: 409
     defp status_for_reason({:unsupported_x402_version, _version}), do: 400
     defp status_for_reason({:missing_fields, _fields}), do: 400
     defp status_for_reason({:precheck_failed, _reason}), do: 402
@@ -1936,6 +2411,8 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp status_for_reason({:invalid_fields, _fields}), do: 400
     defp status_for_reason(:invalid_payment_requirements), do: 400
     defp status_for_reason(:extension_echo_mismatch), do: 400
+    defp status_for_reason({:siwx_header, _reason}), do: 400
+    defp status_for_reason({:siwx, _code}), do: 402
     defp status_for_reason({:invalid_payment_identifier, _reason}), do: 400
     defp status_for_reason(:no_matching_requirements), do: 402
     defp status_for_reason(:already_exists), do: 402
@@ -2035,9 +2512,15 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp rejection_error({:invalid_fields, _fields}), do: "invalid_payload"
     defp rejection_error(:invalid_payment_requirements), do: "invalid_payload"
     defp rejection_error(:extension_echo_mismatch), do: "invalid_payload"
+    defp rejection_error({:siwx_header, _reason}), do: "invalid_siwx_header"
+    defp rejection_error({:siwx, code}), do: Atom.to_string(code)
 
     defp rejection_error({:invalid_payment_identifier, _reason}),
       do: "invalid payment identifier extension"
+
+    defp rejection_error(:invalid_payment_identifier), do: "invalid_payload"
+    defp rejection_error(:payment_identifier_required), do: "payment_identifier_required"
+    defp rejection_error(:payment_identifier_conflict), do: "payment_identifier_conflict"
 
     defp rejection_error({:verification_failed, _reason}), do: "facilitator rejected payment"
     defp rejection_error({:settlement_failed, _reason}), do: "facilitator rejected payment"
@@ -2057,8 +2540,14 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp rejection_error(_reason), do: "payment processing failed"
 
-    @spec emit(:pass_through | :payment_required | :payment_verified | :payment_rejected, map()) ::
-            :ok
+    @spec emit(
+            :pass_through
+            | :payment_required
+            | :payment_verified
+            | :payment_rejected
+            | :siwx_authenticated,
+            map()
+          ) :: :ok
     defp emit(event, metadata) do
       :telemetry.execute([:x402, :plug, event], %{count: 1}, metadata)
     end

@@ -1,91 +1,111 @@
 # x402 Elixir SDK — Roadmap
 
-> Internal roadmap. Living document — update as priorities shift.
-> Priorities and effort estimates come from the ecosystem gap analysis in
-> [docs/ecosystem-comparison.md](docs/ecosystem-comparison.md) (§8); item tags
-> (P0.1, P1.4, …) reference its numbering.
+> Living document. Last refreshed 2026-09-16 from a comparison of this SDK
+> against upstream [x402-foundation/x402](https://github.com/x402-foundation/x402)
+> (v2 specification, HTTP/MCP transports, extension specs, and the SDK
+> feature matrix at that date).
 
-## Current State (v0.6.x)
+## Where we are
 
-✅ x402 v2 protocol primitives (PaymentRequired / PaymentSignature / PaymentResponse, 8KB header caps)
-✅ Plug middleware (PaymentGate): verify-before-handler, settle-after-response, replay claim, extension echo
-✅ Facilitator client (verify/settle) with CDP JWT auth and Ecto-style runtime config
-✅ Extensions: payment_identifier (ETS cache), SIWX (local EIP-191 recovery), bazaar builder
-✅ Lifecycle hooks, telemetry spans, wallet validation (EVM + Solana)
-✅ 95% coverage floor, dialyzer-clean, live CDP smoke tests, published on Hex.pm
+`0.6.1` ships the complete v2 protocol surface for every role:
 
-## Gap-closure sprint — all P0/P1/P2 items shipped
+- Protocol primitives: `PAYMENT-REQUIRED` / `PAYMENT-SIGNATURE` /
+  `PAYMENT-RESPONSE` codecs with 8 KB header caps, CAIP-2 networks.
+- Payer client: `X402.Client` (+ Finch and MCP drivers), signers for EVM and
+  Solana keys, `exact` (EIP-3009, SVM) and `upto` (Permit2) signing.
+- Resource server: `X402.Plug.PaymentGate` (verify-before-handler,
+  settle-after-response, canonical replay keys, ETS/Redis claim caches,
+  local EVM verification, browser paywall) and `X402.MCP.Server`.
+- Facilitator: `X402.Facilitator` client (CDP auth, hooks, `/supported`,
+  discovery) and on-chain engines (`Engine` for EVM, `SVMEngine` for
+  Solana) behind `X402.Plug.Facilitator`.
+- Extensions: payment-identifier, sign-in-with-x, bazaar, gas sponsoring
+  (EIP-2612 / ERC-20 approval), offer-receipt.
+- Quality: 95 % coverage floor, dialyzer/credo clean, optional-dependency
+  build, downstream consumer check, live CDP smoke tests.
 
-The full ecosystem gap list from [docs/ecosystem-comparison.md](docs/ecosystem-comparison.md) §8 is
-now merged to `main` across 24 PRs. The SDK is role-complete (payer client, resource-server
-middleware, facilitator client, **and** a facilitator engine), speaks HTTP and MCP transports, and
-covers EVM (`exact`/`upto`) and Solana (`exact`) schemes.
+## Gap analysis against upstream (2026-09-16)
 
-### P0 — correctness and table stakes
+| Area | Upstream x402 | This SDK | Plan |
+|------|---------------|----------|------|
+| Core v2 protocol, HTTP transport | stable | complete | — |
+| `EXTENSION-RESPONSES` facilitator sidechannel | HTTP transport §7.2.1 | missing | **0.7.0** |
+| `payment-identifier` extension | `payment-identifier` key, `info.id`/`info.required`, 409 on fingerprint mismatch | legacy `paymentIdentifier` only | **0.7.0** (dual format), legacy removed in 1.0.0 |
+| `sign-in-with-x` extension | CAIP-122 header, challenge advertisement, `invalid_siwx_*` codes, EVM + Solana | legacy `{message, signature}` header, EVM only, no gate integration | **0.7.0** (dual format), legacy removed in 1.0.0 |
+| Bazaar discovery metadata | sanitised service name / tags / icon URL, `routeTemplate` | unvalidated | **0.7.0** |
+| Client `paymentFlow` rule | only `authorization` (or absent) is payable | any value accepted | **0.7.0** |
+| Supply chain | pinned actions, least-privilege tokens | floating action tags | **0.7.0** |
+| `exact` on EVM via Permit2 (`permit2Authorization` payload variant) | shipped | EIP-3009 only | 0.8.0 |
+| Client default spend controls (per-request / session ceilings) | shipped | none by default | 0.8.0 |
+| Dynamic price / `payTo`, `routeTemplate` + `pathParams` | shipped | static route maps | 0.8.0 |
+| `builder-code` extension | shipped | missing | 0.8.0 |
+| Resource-server hooks `on_verified_payment_canceled`, `on_protected_request`; extension hook adapters | shipped | partial (facilitator hooks only) | 0.8.0 |
+| MCP client hooks | shipped | missing | 0.8.0 |
+| Bazaar `/discovery/search` | shipped | `/discovery/resources` only | 0.8.0 |
+| Automatic SIWX in Finch / MCP clients | shipped | manual | 0.8.0 |
+| `batch-settlement`, `auth-capture`, `extension-auth-hints`, `http-message-signatures` extensions | shipped | missing | 0.9.0 |
+| `upto` on Solana | shipped | missing | 0.9.0 |
+| LiveDashboard page, per-wallet rate limiting, multi-facilitator failover | n/a (Elixir-specific polish) | missing | 0.9.0 |
 
-- [x] **P0.1** Remove the fake v1 validation path — explicit `{:unsupported_x402_version, v}` rejection (#50)
-- [x] **P0.2** GET `/supported` + `/discovery/resources` in the facilitator client; feePayer / facilitatorAddress discovery (#61)
-- [x] **P0.3** De-serialized facilitator client — GenServer holds config, HTTP + retries run in the caller (#60)
-- [x] **P0.4** Payer client — `X402.Signer`, `X402.EIP3009` signing, `X402.Client` + Finch 402→sign→retry (#58)
+## Release train
 
-### P1 — ecosystem parity
+### 0.7.0 — spec conformance (in progress)
 
-- [x] **P1.1** `X402.Scheme` behaviour + registry (CAIP-2 wildcards); `ExactEVM` / `UptoEVM` / `ExactSVM` (#70)
-- [x] **P1.2a** Local pre-verification checks before the facilitator call (#52)
-- [x] **P1.2b** Full local EVM verification — `X402.Verify.EVM`, `X402.RPC`, `X402.ERC6492` (EOA / ERC-1271 / ERC-6492, simulation) (#67)
-- [x] **P1.3** `put_new/3` Cache behaviour; gate routed through pluggable adapters (#53)
-- [x] **P1.3b** Redis replay-cache adapter over optional `redix` (#69)
-- [x] **P1.4** Route matching on decoded `script_name ++ path_info` + GHSA-3j63-5h8p-gf7c regression tests (#51)
-- [x] **P1.5** Upstream e2e harness component (`integration/e2e_server/`); the foundation PR is staged on a fork (#59)
-- [x] **P1.6** MCP transport — `X402.MCP` client + server payment wrapper on `_meta` `x402/payment` keys (#64)
+- [x] CI hardening: pinned actions, `contents: read` token
+- [x] Client rejects requirements whose `extra.paymentFlow` is not `authorization`
+- [x] Bazaar metadata sanitisers (`X402.Extensions.Bazaar.Metadata`, `:route_template`)
+- [x] `EXTENSION-RESPONSES` sidechannel (`X402.ExtensionResponses`, facilitator client,
+  gate assign + telemetry, facilitator plug emission)
+- [x] `payment-identifier` spec format: `extension/1`, `generate_id/0`, `extract_id/1`,
+  `fingerprint/2`, client `enricher/1`; gate + MCP enforce `required` (400) and
+  fingerprint conflicts (409); legacy format deprecated
+- [x] `sign-in-with-x` spec format: challenge advertisement, CAIP-122 messages for
+  EVM and Solana, `sign/3`, `verify/2`, `Signer.sign_message/2`, Ed25519 verifier,
+  `X402.Extensions.SIWX.Server`, gate `siwx:` option; legacy header deprecated
+- [ ] Docs: CHANGELOG, guides, README
 
-### P2 — differentiation
+### 0.8.0 — ecosystem parity
 
-- [x] **P2.1** Facilitator engine + HTTP scaffold — `X402.Facilitator.Engine`, `X402.Plug.Facilitator`, runnable example (#73)
-- [x] **P2.2** `upto` via Permit2 witness signing — `X402.Permit2` (#71)
-- [x] **P2.3** SVM `exact` — `X402.Base58`, `X402.Solana`, `X402.Signer.SolanaKey`, `X402.Scheme.ExactSVM` (#74)
-- [x] **P2.4** Gas-sponsoring extensions (EIP-2612, ERC-20 approval) (#65) + offer-receipt (EIP-712 & JWS) (#68); bazaar discovery client (#62)
-- [x] **P2.5** Browser paywall — content negotiation + `X402.Paywall` / `X402.Paywall.Default` (#66)
+- [ ] `exact` via Permit2 on EVM (client signing, local verification, engine settlement)
+- [ ] Client spend controls: default per-request ceiling and session budget
+- [ ] Dynamic route pricing: `price`/`pay_to` functions, `routeTemplate` + `pathParams`
+- [ ] `builder-code` extension (advertise, echo, validate)
+- [ ] Gate hooks `on_verified_payment_canceled` / `on_protected_request`; extension hook adapters
+- [ ] MCP client hooks mirroring the Finch client
+- [ ] Bazaar `/discovery/search` client
+- [ ] Automatic SIWX in `X402.Client.Finch` / `X402.MCP.Client`
 
-### Security recommendations (report §6.6)
+### 0.9.0 — advanced extensions and operations
 
-- [x] `claim_order: :before_verify` replay-storm shedding (#54)
-- [x] `SECURITY.md` + CDP token-reuse doc correction (#56)
+- [ ] `batch-settlement`, `auth-capture`, `extension-auth-hints`, `http-message-signatures`
+- [ ] `upto` on Solana
+- [ ] LiveDashboard page over the existing telemetry
+- [ ] Per-wallet rate limiting in the gate
+- [ ] Multi-facilitator failover for `X402.Facilitator`
 
-## Next up — production polish (v1.0)
+### 1.0.0 — stable API
 
-Release gates for the stable API:
-
+- [ ] Remove the legacy `paymentIdentifier` and SIWX `{message, signature}` formats and the
+  deprecated functions listed under "Compatibility policy"
 - [ ] Independent security audit of the crypto verification and settlement paths
-- [ ] Official upstream e2e harness acceptance plus a passing cross-language run
+- [ ] Upstream e2e harness PR (`integration/e2e_server/`) merged and a passing
+  cross-language run; SDK listed in the upstream feature matrix
 - [ ] Live EVM exact/upto and SVM exact settlement matrix, including Redis replay
   protection and pending-settlement reconciliation
-- [ ] Public API, error-contract, and migration-policy stability review
+- [ ] Public API, error-contract and migration-policy review; `guides/upgrading.md`
+- [ ] Guides ("Build a paid API in 5 minutes", "x402 for AI agents", deployment),
+  example Phoenix app, `mix x402.gen.paywall`
+- [ ] Hex 1.0.0 publish
 
-- [ ] LiveDashboard integration, rate limiting per wallet, multi-facilitator failover
-- [ ] Guides: "Build a paid API in 5 minutes", "x402 for AI agents", "Deploying on Fly.io"
-- [ ] Example Phoenix app, `mix x402.gen.paywall` generator
-- [ ] Hex v1.0 publish
+## Compatibility policy
 
-## Follow-ups noted during the sprint — closed 2026-08-28
+`0.7.x` accepts both the spec wire formats and the pre-0.7.0 formats. Legacy
+input emits `[:x402, :payment_identifier, :legacy]` / `[:x402, :siwx, :legacy]`
+telemetry plus a one-time warning. `1.0.0` removes:
 
-- [x] `X402.Verify.EVM` wired into the gate as the inline `local_verification` option
-  (`:structural` / `:signature` / `:full`, exact-EVM only, fail-closed on infrastructure errors).
-- [x] Facilitator engine: counterfactual ERC-6492 settlement behind the `eip6492_allowed_factories`
-  allowlist (+ `max_deploy_gas_limit` ceiling), ERC-20 Transfer-event receipt verification, and
-  pending-settlement reconciliation (`X402.Facilitator.PendingSettlementStore` + ETS adapter,
-  delete-before-reconcile fast path); the gate retries a `settlement_pending` settle exactly once.
-- [x] SVM on-chain verify/settle: `X402.Solana.RPC`, `X402.Verify.SVM` (local Ed25519 + static path +
-  simulation, TS `invalid_exact_svm_*` reasons), `X402.Facilitator.SVMEngine` (fee-payer co-sign,
-  `duplicate_settlement` dedup, confirmation polling), and a multi-engine `X402.Plug.Facilitator`.
-- [x] Hardened replay keys: the gate's dedup claim now keys on signature-covered payment identity
-  (EIP-3009 from+nonce / Permit2 owner+nonce / SVM message-bytes hash) instead of raw header bytes,
-  and the `payment_identifier` extension's `paymentId` is decoded, validated, and surfaced.
-- [ ] Open the staged upstream e2e PR from the fork to `x402-foundation/x402`
-  (`cardotrejos/x402-1@feat/elixir-e2e-server` — merges cleanly at upstream HEAD; publishing it is a
-  maintainer action under the repo owner's name).
-
----
-
-*Last updated: 2026-08-28 — sprint follow-ups closed (inline verification, 6492 settlement,
-reconciliation, SVM facilitator, canonical replay keys).*
+| Deprecated | Replacement |
+|------------|-------------|
+| `extensions["paymentIdentifier"]` (Base64 `{"paymentId"}` or map) | `extensions["payment-identifier"]["info"]["id"]` |
+| `X402.Extensions.PaymentIdentifier.encode/1`, `decode/1`, `fetch_payment_id/1` | `extension/1`, `extract_id/1`, `enricher/1` |
+| `SIGN-IN-WITH-X` = Base64 `{"message","signature"}` | Base64 CAIP-122 fields (`X402.Extensions.SIWX.encode_signed/1`) |
+| `X402.Extensions.SIWX.encode_header/1`, `decode_header/1` | `encode_signed/1`, `decode_signed/1`, `sign/3`, `verify/2` |
