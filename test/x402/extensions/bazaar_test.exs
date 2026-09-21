@@ -596,6 +596,74 @@ defmodule X402.Extensions.BazaarTest do
       assert {:error, %NimbleOptions.ValidationError{}} = Bazaar.list_resources(limit: 0)
     end
 
+    test "search/2 returns typed resources and the cursor page from the facilitator" do
+      facilitator =
+        start_discovery_facilitator(
+          fn conn ->
+            conn = Plug.Conn.fetch_query_params(conn)
+            assert conn.query_params == %{"query" => "market data", "limit" => "1"}
+
+            Plug.Conn.resp(
+              conn,
+              200,
+              Jason.encode!(%{
+                "x402Version" => 2,
+                "resources" => [@valid_item],
+                "partialResults" => false,
+                "pagination" => %{"limit" => 1, "cursor" => "next"}
+              })
+            )
+          end,
+          "/discovery/search"
+        )
+
+      assert {:ok,
+              %{
+                x402_version: 2,
+                resources: [full],
+                partial_results: false,
+                pagination: %{limit: 1, cursor: "next"}
+              }} = Bazaar.search(facilitator, query: "market data", limit: 1)
+
+      assert %{resource: "https://api.example.com/premium-data", type: "http"} = full
+      assert [%{"scheme" => "exact", "amount" => "10000"}] = full.accepts
+    end
+
+    test "search/2 fails closed on a structurally invalid entry" do
+      invalid_item = Map.delete(@valid_item, "accepts")
+
+      facilitator =
+        start_discovery_facilitator(
+          fn conn ->
+            Plug.Conn.resp(conn, 200, Jason.encode!(%{"resources" => [invalid_item]}))
+          end,
+          "/discovery/search"
+        )
+
+      assert {:error,
+              %X402.Facilitator.Error{
+                type: :malformed_facilitator_response,
+                reason: {:invalid_resource, 0, {:missing_field, "accepts"}}
+              }} = Bazaar.search(facilitator, query: "market data")
+    end
+
+    test "search/2 propagates transport and validation errors" do
+      facilitator =
+        start_discovery_facilitator(
+          fn conn -> Plug.Conn.resp(conn, 503, "unavailable") end,
+          "/discovery/search"
+        )
+
+      assert {:error, %X402.Facilitator.Error{type: :http_error, status: 503}} =
+               Bazaar.search(facilitator, query: "market data")
+
+      assert {:error, %NimbleOptions.ValidationError{}} = Bazaar.search(facilitator, [])
+    end
+
+    test "search/1 applies parameters to the default facilitator name" do
+      assert {:error, %NimbleOptions.ValidationError{}} = Bazaar.search(query: "x", limit: 0)
+    end
+
     test "parse_resource/1 rejects mistyped or missing required fields" do
       assert {:error, {:invalid_field, "resource"}} =
                Bazaar.parse_resource(%{@valid_item | "resource" => 123})
@@ -693,13 +761,13 @@ defmodule X402.Extensions.BazaarTest do
       end
     end
 
-    defp start_discovery_facilitator(handler) do
+    defp start_discovery_facilitator(handler, path \\ "/discovery/resources") do
       suffix = System.unique_integer([:positive, :monotonic])
       finch = String.to_atom("bazaar_finch_#{suffix}")
       name = String.to_atom("bazaar_facilitator_#{suffix}")
 
       bypass = Bypass.open()
-      Bypass.stub(bypass, "GET", "/discovery/resources", handler)
+      Bypass.stub(bypass, "GET", path, handler)
 
       start_supervised!(Supervisor.child_spec({Finch, name: finch}, id: finch))
 

@@ -28,6 +28,21 @@ defmodule X402.Client.Finch do
           end
         )
 
+  ## Spend controls
+
+  Cap what an automated payer signs with `:max_amount` (per payment),
+  `:policies` (`X402.Client.Policy` filters on network, asset, scheme, or
+  anything else), and `:budget` (an `X402.Client.Budget` shared across
+  requests). With none of them configured a warning is logged once.
+
+  ## Sign-In-With-X
+
+  With `siwx: [chain_id: :auto]` the client answers a server's
+  `sign-in-with-x` challenge before paying: a returning payer whose address
+  the server remembers gets the resource without a new payment
+  (`siwx_authenticated: true` in the response); otherwise the payment flow
+  runs as usual, with the proof attached to the paid request too.
+
   ## Security
 
   Like the facilitator client, URLs must use `https://` — payment
@@ -36,11 +51,17 @@ defmodule X402.Client.Finch do
   """
 
   alias X402.Client
+  alias X402.Client.Budget
+  alias X402.Client.Hooks
+  alias X402.Client.SIWX, as: ClientSIWX
+  alias X402.Extensions.SIWX
   alias X402.PaymentRequired
   alias X402.PaymentResponse
   alias X402.Telemetry
+  alias X402.Utils
 
   @loopback_hosts ["localhost", "127.0.0.1", "::1"]
+  @siwx_header String.downcase(SIWX.header_name())
 
   @request_opts_schema [
     signer: [
@@ -87,6 +108,39 @@ defmodule X402.Client.Finch do
       for automated payers. Requirements above it are never selected.
       """
     ],
+    policies: [
+      type: {:list, {:fun, 2}},
+      default: [],
+      doc: """
+      Selection policies forwarded to `X402.Client.select_requirements/2` —
+      see `X402.Client.Policy`.
+      """
+    ],
+    budget: [
+      type: {:or, [nil, {:custom, Budget, :validate_ref, []}]},
+      default: nil,
+      doc: """
+      An `X402.Client.Budget` the selected amount is reserved against
+      before the paid retry is sent. See `X402.Client.Budget` for what
+      counts as spent.
+      """
+    ],
+    hooks: [
+      type: {:custom, Hooks, :validate_module, []},
+      default: Hooks.Default,
+      doc: """
+      `X402.Client.Hooks` module forwarded to `X402.Client.build_payment/3`.
+      """
+    ],
+    siwx: [
+      type: {:custom, ClientSIWX, :validate_opts, []},
+      default: nil,
+      doc: """
+      Automatic Sign-In-With-X: a keyword list of `X402.Client.SIWX`
+      options (`chain_id:` required, or `:auto`). `nil`/`false` disables
+      it.
+      """
+    ],
     valid_after_buffer: [
       type: :non_neg_integer,
       default: 60,
@@ -127,12 +181,15 @@ defmodule X402.Client.Finch do
 
   `:payment_response` holds the decoded `PAYMENT-RESPONSE` header (the
   settlement receipt) when the server sent a valid one, otherwise `nil`.
+  `:siwx_authenticated` is `true` when the server accepted a Sign-In-With-X
+  proof instead of a payment (see the `:siwx` option).
   """
   @type response :: %{
           status: non_neg_integer(),
           headers: [{String.t(), String.t()}],
           body: binary(),
-          payment_response: map() | nil
+          payment_response: map() | nil,
+          siwx_authenticated: boolean()
         }
 
   @type request_error ::
@@ -142,6 +199,8 @@ defmodule X402.Client.Finch do
           | :payment_already_attempted
           | {:transport_error, term()}
           | {:invalid_payment_required, term()}
+          | {:siwx, ClientSIWX.reason()}
+          | Budget.reserve_error()
           | Client.build_error()
 
   @doc since: "0.6.0"
@@ -153,12 +212,27 @@ defmodule X402.Client.Finch do
   1. Perform the request. Anything other than a `402` with a
      `PAYMENT-REQUIRED` header is returned as-is.
   2. Decode the `PAYMENT-REQUIRED` header (`X402.PaymentRequired.decode/1`).
-  3. Invoke the `:on_payment_required` hook, which may cancel.
-  4. Build and sign a payment (`X402.Client.build_payment/3`) and retry the
-     request once with the `PAYMENT-SIGNATURE` header.
-  5. Return the retried response with the decoded `PAYMENT-RESPONSE`
+  3. With `:siwx` configured and a `sign-in-with-x` challenge advertised,
+     sign it (`X402.Client.SIWX.authenticate/4`) and retry the request with
+     the `SIGN-IN-WITH-X` header and no payment. Anything other than a
+     `402` with a `PAYMENT-REQUIRED` header is returned as-is, with
+     `siwx_authenticated: true` for a 2xx. On a second `402` the flow
+     continues with the new payment requirements; the paid request carries a
+     proof for the new challenge (when advertised) so the server can record
+     the payer.
+  4. Invoke the `:on_payment_required` hook, which may cancel.
+  5. Build and sign a payment (`X402.Client.build_payment/3`), reserve its
+     amount against `:budget` (when given), and retry the request once with
+     the `PAYMENT-SIGNATURE` header.
+  6. Return the retried response with the decoded `PAYMENT-RESPONSE`
      settlement receipt, when present. A second `402` is returned as-is —
-     the payment is never re-signed or re-sent.
+     the payment is never re-signed or re-sent — and the budget
+     reservation is released unless the response is 2xx or carries a
+     successful receipt.
+
+  When neither `:max_amount`, `:policies`, nor `:budget` is given a warning
+  is logged once per VM: the client will then sign any amount a server asks
+  for.
 
   ## Options
 
@@ -168,6 +242,7 @@ defmodule X402.Client.Finch do
           {:ok, response()} | {:error, request_error()}
   def request(finch_name, url, opts) when is_binary(url) and is_list(opts) do
     opts = NimbleOptions.validate!(opts, @request_opts_schema)
+    maybe_warn_no_spend_limit(opts)
 
     result =
       with {:ok, finch_module} <- ensure_finch_module(),
@@ -261,12 +336,165 @@ defmodule X402.Client.Finch do
 
     with :ok <- ensure_not_already_paid(headers),
          {:ok, payment_required} <- decode_payment_required(header_value),
-         :ok <- consent(ctx.opts, payment_required),
+         {:ok, outcome} <- try_siwx(ctx, payment_required) do
+      case outcome do
+        {:done, response} -> {:ok, response}
+        {:pay, payment_required, siwx_headers} -> pay(ctx, payment_required, siwx_headers)
+      end
+    end
+  end
+
+  @spec pay(map(), map(), [{String.t(), String.t()}]) ::
+          {:ok, response()} | {:error, request_error()}
+  defp pay(ctx, payment_required, siwx_headers) do
+    headers = Keyword.fetch!(ctx.opts, :headers) ++ siwx_headers
+
+    with :ok <- consent(ctx.opts, payment_required),
          {:ok, payload} <-
            Client.build_payment(payment_required, ctx.opts[:signer], build_opts(ctx.opts)),
          {:ok, payment_header} <- Client.encode_payment(payload),
-         {:ok, response} <- perform(ctx, headers ++ [{"payment-signature", payment_header}]) do
+         :ok <- reserve_budget(ctx.opts, payload),
+         {:ok, response} <-
+           ctx
+           |> perform(headers ++ [{"payment-signature", payment_header}])
+           |> settle_budget(ctx.opts, payload) do
       {:ok, finalize(response)}
+    end
+  end
+
+  # -- Sign-In-With-X ---------------------------------------------------------
+
+  # Outcome of the SIWX attempt: `{:done, response}` when the server answered
+  # the proof with anything but a fresh payment challenge, or
+  # `{:pay, payment_required, siwx_headers}` with the challenge to pay for and
+  # the proof headers to send along with the payment.
+  @spec try_siwx(map(), map()) ::
+          {:ok, {:done, response()} | {:pay, map(), [{String.t(), String.t()}]}}
+          | {:error, request_error()}
+  defp try_siwx(%{opts: opts} = ctx, payment_required) do
+    case Keyword.fetch!(opts, :siwx) do
+      nil ->
+        {:ok, {:pay, payment_required, []}}
+
+      siwx_opts ->
+        case sign_siwx(ctx, payment_required, siwx_opts) do
+          :none -> {:ok, {:pay, payment_required, []}}
+          {:ok, proof} -> authenticate_siwx(ctx, proof, siwx_opts)
+          {:error, _reason} = error -> error
+        end
+    end
+  end
+
+  @spec sign_siwx(map(), map(), keyword()) ::
+          {:ok, ClientSIWX.proof()} | :none | {:error, {:siwx, ClientSIWX.reason()}}
+  defp sign_siwx(ctx, payment_required, siwx_opts) do
+    ClientSIWX.authenticate(payment_required, ctx.opts[:signer], siwx_opts,
+      resource_url: ctx.url,
+      transport: :http
+    )
+  end
+
+  @spec authenticate_siwx(map(), ClientSIWX.proof(), keyword()) ::
+          {:ok, {:done, response()} | {:pay, map(), [{String.t(), String.t()}]}}
+          | {:error, request_error()}
+  defp authenticate_siwx(ctx, proof, siwx_opts) do
+    headers = Keyword.fetch!(ctx.opts, :headers) ++ [{@siwx_header, proof.header}]
+
+    with {:ok, response} <- perform(ctx, headers) do
+      case {response.status, fetch_header(response.headers, "payment-required")} do
+        {402, header_value} when is_binary(header_value) ->
+          emit_siwx(:payment_required, proof.chain_id)
+          pay_with_fresh_proof(ctx, header_value, siwx_opts)
+
+        {status, _header} when status in 200..299 ->
+          emit_siwx(:authenticated, proof.chain_id)
+          {:ok, {:done, finalize(response, true)}}
+
+        {_status, _header} ->
+          {:ok, {:done, finalize(response, false)}}
+      end
+    end
+  end
+
+  @spec pay_with_fresh_proof(map(), String.t(), keyword()) ::
+          {:ok, {:pay, map(), [{String.t(), String.t()}]}} | {:error, request_error()}
+  defp pay_with_fresh_proof(ctx, header_value, siwx_opts) do
+    with {:ok, payment_required} <- decode_payment_required(header_value) do
+      case sign_siwx(ctx, payment_required, siwx_opts) do
+        {:ok, proof} -> {:ok, {:pay, payment_required, [{@siwx_header, proof.header}]}}
+        :none -> {:ok, {:pay, payment_required, []}}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  @spec emit_siwx(:authenticated | :payment_required, String.t()) :: :ok
+  defp emit_siwx(outcome, chain_id),
+    do:
+      Telemetry.emit(:client, :siwx, :ok, %{
+        transport: :http,
+        chain_id: chain_id,
+        outcome: outcome
+      })
+
+  # -- Budget -----------------------------------------------------------------
+
+  @spec reserve_budget(keyword(), map()) :: :ok | {:error, Budget.reserve_error()}
+  defp reserve_budget(opts, payload) do
+    case Keyword.fetch!(opts, :budget) do
+      nil -> :ok
+      budget -> Budget.reserve(budget, accepted_asset(payload), accepted_amount(payload))
+    end
+  end
+
+  # The reservation stands once the server answered 2xx or attached a
+  # successful settlement receipt; any other outcome means the payment was
+  # not accepted and the amount is given back.
+  @spec settle_budget({:ok, map()} | {:error, term()}, keyword(), map()) ::
+          {:ok, map()} | {:error, term()}
+  defp settle_budget(result, opts, payload) do
+    case Keyword.fetch!(opts, :budget) do
+      nil -> result
+      budget -> settle_budget(result, budget, payload, accepted?(result))
+    end
+  end
+
+  @spec settle_budget({:ok, map()} | {:error, term()}, Budget.budget(), map(), boolean()) ::
+          {:ok, map()} | {:error, term()}
+  defp settle_budget(result, _budget, _payload, true), do: result
+
+  defp settle_budget(result, budget, payload, false) do
+    Budget.release(budget, accepted_asset(payload), accepted_amount(payload))
+    result
+  end
+
+  @spec accepted?({:ok, map()} | {:error, term()}) :: boolean()
+  defp accepted?({:ok, %{status: status} = response}) do
+    status in 200..299 or
+      match?(%{"success" => true}, decode_payment_response_header(response.headers))
+  end
+
+  defp accepted?({:error, _reason}), do: false
+
+  @spec accepted_asset(map()) :: String.t()
+  defp accepted_asset(payload), do: accepted_field(payload, {"asset", :asset}) || ""
+
+  @spec accepted_amount(map()) :: term()
+  defp accepted_amount(payload), do: accepted_field(payload, {"amount", :amount})
+
+  @spec accepted_field(map(), {String.t(), atom()}) :: term()
+  defp accepted_field(payload, keys) do
+    case Utils.map_value(payload, {"accepted", :accepted}) do
+      %{} = accepted -> Utils.map_value(accepted, keys)
+      _other -> nil
+    end
+  end
+
+  @spec maybe_warn_no_spend_limit(keyword()) :: :ok
+  defp maybe_warn_no_spend_limit(opts) do
+    case {opts[:max_amount], Keyword.fetch!(opts, :policies), Keyword.fetch!(opts, :budget)} do
+      {nil, [], nil} -> Client.warn_no_spend_limit_once(__MODULE__)
+      _limited -> :ok
     end
   end
 
@@ -310,32 +538,31 @@ defmodule X402.Client.Finch do
         :scheme,
         :asset,
         :max_amount,
+        :policies,
+        :hooks,
         :valid_after_buffer,
         :extensions,
         :schemes
       ])
 
-  @spec finalize(map()) :: response()
-  defp finalize(response) do
-    payment_response =
-      case fetch_header(response.headers, "payment-response") do
-        nil -> nil
-        header_value -> decode_payment_response(header_value)
-      end
-
+  @spec finalize(map(), boolean()) :: response()
+  defp finalize(response, siwx_authenticated \\ false) do
     %{
       status: response.status,
       headers: response.headers,
       body: response.body,
-      payment_response: payment_response
+      payment_response: decode_payment_response_header(response.headers),
+      siwx_authenticated: siwx_authenticated
     }
   end
 
-  @spec decode_payment_response(String.t()) :: map() | nil
-  defp decode_payment_response(header_value) do
-    case PaymentResponse.decode(header_value) do
-      {:ok, decoded} -> decoded
-      {:error, _reason} -> nil
+  @spec decode_payment_response_header([{String.t(), String.t()}]) :: map() | nil
+  defp decode_payment_response_header(headers) do
+    with header_value when is_binary(header_value) <- fetch_header(headers, "payment-response"),
+         {:ok, decoded} <- PaymentResponse.decode(header_value) do
+      decoded
+    else
+      _absent_or_invalid -> nil
     end
   end
 

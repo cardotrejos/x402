@@ -9,14 +9,14 @@ defmodule X402.Facilitator.Engine do
   (`X402.Signer`) into the engine behind the facilitator API's three
   operations, speaking the same wire shapes as the reference facilitators:
 
-  * `verify/3` — the full exact-EVM verify checklist at `:full` level,
-    returning the `POST /verify` response
+  * `verify/3` — the full exact-EVM / upto-EVM verify checklist at `:full`
+    level, returning the `POST /verify` response
     (`%{"isValid" => true, "payer" => ...}` /
     `%{"isValid" => false, "invalidReason" => ..., "payer" => ...}`).
-  * `settle/3` — **re-verifies independently** (the exact-EVM scheme's
-    normative requirement), then broadcasts the `transferWithAuthorization`
-    transaction and awaits its receipt, returning the `POST /settle`
-    response (`%{"success" => true, "transaction" => ..., ...}` /
+  * `settle/3` — **re-verifies independently** (the schemes' normative
+    requirement), then broadcasts the settlement transaction and awaits
+    its receipt, returning the `POST /settle` response
+    (`%{"success" => true, "transaction" => ..., ...}` /
     `%{"success" => false, "errorReason" => ..., ...}`).
   * `supported/1` — the `GET /supported` response derived from the
     configured networks.
@@ -24,14 +24,38 @@ defmodule X402.Facilitator.Engine do
   Expose the engine over HTTP with `X402.Plug.Facilitator`, or call it
   directly from your own transport.
 
+  ## Payment kinds
+
+  The engine settles every EVM flow `X402.Verify.EVM` verifies:
+
+  | Scheme  | `extra.assetTransferMethod` | Settlement transaction                          |
+  | ------- | --------------------------- | ----------------------------------------------- |
+  | `exact` | absent / `"eip3009"`        | `asset.transferWithAuthorization(...)`          |
+  | `exact` | `"permit2"`                 | `x402ExactPermit2Proxy.settle(...)`             |
+  | `upto`  | —                           | `x402UptoPermit2Proxy.settle(...)` for `amount` |
+
+  The requirements select the authorization used throughout verification,
+  settlement, payer reporting, pending lookup, and receipt checking. Extra
+  unsigned authorization objects do not change that selection; a missing
+  selected authorization never falls back to another transfer method.
+
+  For `upto` the requirements' `extra.facilitatorAddress` must be this
+  engine's signer address (the proxy only accepts the witness facilitator
+  as sender); other facilitators' payments are rejected with
+  `upto_facilitator_mismatch`. The settled `amount` is the requirements'
+  `amount`, which re-verification proves to be at most the signed
+  `permitted.amount`.
+
   ## Fee-payer safety
 
   The facilitator's signing key pays gas, so what it signs is structurally
   constrained: settlement transactions are always built by this module with
-  `to` set to the verified requirements' `asset`, `value` `0`, and calldata
-  produced exclusively by `X402.EIP3009.transfer_calldata/3` from the
-  authorization fields the signature verification just proved. The single
-  exception is ERC-6492 *counterfactual* settlement: the engine signs
+  `to` set to the verified requirements' `asset` (EIP-3009) or the fixed
+  x402 Permit2 proxy address (Permit2), `value` `0`, and calldata produced
+  exclusively by `X402.EIP3009.transfer_calldata/3` /
+  `X402.Permit2.exact_settle_calldata/2` / `X402.Permit2.upto_settle_calldata/3`
+  from the authorization fields the signature verification just proved.
+  The single exception is ERC-6492 *counterfactual* settlement: the engine signs
   caller-supplied calldata ONLY toward explicitly allowlisted factory
   addresses (`:eip6492_allowed_factories`), capped by
   `:max_deploy_gas_limit` — with the default empty allowlist it never does,
@@ -52,8 +76,8 @@ defmodule X402.Facilitator.Engine do
      undeployed, broadcast the wrapper's factory calldata (allowlist-gated,
      `:max_deploy_gas_limit`-capped) and require a successful deploy
      receipt first.
-  4. Build `transferWithAuthorization` calldata (shared with verification's
-     simulation encoding).
+  4. Build the settlement calldata — `transferWithAuthorization` or the
+     proxy's `settle` (shared with verification's simulation encoding).
   5. One batched RPC round-trip: `eth_estimateGas` (with a safety margin),
      `eth_maxPriorityFeePerGas` + `eth_feeHistory` (falling back to
      `eth_gasPrice` on nodes without EIP-1559 fee APIs), and
@@ -113,7 +137,9 @@ defmodule X402.Facilitator.Engine do
   alias X402.Facilitator.PendingSettlementStore
   alias X402.Hooks
   alias X402.Hooks.Context
+  alias X402.Permit2
   alias X402.RPC
+  alias X402.Scheme.ExactEVM
   alias X402.Signer
   alias X402.Telemetry
   alias X402.Transaction
@@ -121,7 +147,7 @@ defmodule X402.Facilitator.Engine do
   alias X402.Verify.EVM
 
   @x402_version 2
-  @scheme "exact"
+  @schemes ["exact", "upto"]
 
   # keccak256("Transfer(address,address,uint256)")
   @transfer_event_topic "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -345,7 +371,7 @@ defmodule X402.Facilitator.Engine do
           |> handle_verify_result(engine, before_context, metadata)
 
         {:halt, reason} ->
-          {:ok, invalid_response(stringify_reason(reason), payer(payment_payload))}
+          {:ok, invalid_response(stringify_reason(reason), payer(payment_payload, requirements))}
 
         {:error, reason} ->
           {:error, reason}
@@ -388,7 +414,7 @@ defmodule X402.Facilitator.Engine do
              stringify_reason(reason),
              "",
              network(requirements, payment_payload),
-             payer(payment_payload)
+             payer(payment_payload, requirements)
            )}
 
         {:error, reason} ->
@@ -404,15 +430,21 @@ defmodule X402.Facilitator.Engine do
   @doc """
   Returns the `GET /supported` wire response for this engine.
 
-  One `exact` kind per configured network, no extensions, and the signer's
-  address under the `eip155:*` family.
+  One `exact` and one `upto` kind per configured network, no extensions,
+  and the signer's address under the `eip155:*` family. Resource servers
+  advertising `upto` requirements forward that signer address as
+  `extra.facilitatorAddress` — the engine only settles upto payments whose
+  witness binds it.
 
   ## Examples
 
       {:ok, engine} = X402.Facilitator.Engine.new(rpc: rpc, signer: signer, networks: ["eip155:84532"])
       X402.Facilitator.Engine.supported(engine)
       #=> %{
-      #     "kinds" => [%{"x402Version" => 2, "scheme" => "exact", "network" => "eip155:84532"}],
+      #     "kinds" => [
+      #       %{"x402Version" => 2, "scheme" => "exact", "network" => "eip155:84532"},
+      #       %{"x402Version" => 2, "scheme" => "upto", "network" => "eip155:84532"}
+      #     ],
       #     "extensions" => [],
       #     "signers" => %{"eip155:*" => ["0x..."]}
       #   }
@@ -421,9 +453,9 @@ defmodule X402.Facilitator.Engine do
   def supported(%__MODULE__{} = engine) do
     %{
       "kinds" =>
-        Enum.map(engine.networks, fn network ->
-          %{"x402Version" => @x402_version, "scheme" => @scheme, "network" => network}
-        end),
+        for network <- engine.networks, scheme <- @schemes do
+          %{"x402Version" => @x402_version, "scheme" => scheme, "network" => network}
+        end,
       "extensions" => [],
       "signers" => signers(engine)
     }
@@ -463,7 +495,7 @@ defmodule X402.Facilitator.Engine do
   # -- Verify -----------------------------------------------------------------
 
   @typep protocol_result ::
-           {:valid, wire_response(), EVM.signature_type()}
+           {:valid, wire_response(), EVM.signature_type(), EVM.kind()}
            | {:invalid, wire_response()}
            | {:error, term()}
 
@@ -474,7 +506,10 @@ defmodule X402.Facilitator.Engine do
         delegate_verify(engine, payload, requirements, simulate)
 
       {:unsupported, reason_string} ->
-        {:invalid, invalid_response(reason_string, payer(payload))}
+        {:invalid, invalid_response(reason_string, payer(payload, requirements))}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -493,18 +528,18 @@ defmodule X402.Facilitator.Engine do
     ]
 
     case EVM.verify(payload, requirements, opts) do
-      {:ok, %{payer: verified_payer, signature_type: signature_type}} ->
-        {:valid, put_payer(%{"isValid" => true}, verified_payer), signature_type}
+      {:ok, %{payer: verified_payer, signature_type: signature_type, kind: kind}} ->
+        {:valid, put_payer(%{"isValid" => true}, verified_payer), signature_type, kind}
 
       {:error, {:invalid, reason}} ->
-        {:invalid, invalid_response(EVM.reason_string(reason), payer(payload))}
+        {:invalid, invalid_response(EVM.reason_string(reason), payer(payload, requirements))}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  @spec route(t(), map(), map()) :: :ok | {:unsupported, String.t()}
+  @spec route(t(), map(), map()) :: :ok | {:unsupported, String.t()} | {:error, term()}
   defp route(engine, payload, requirements) do
     version = Utils.map_value(payload, {"x402Version", :x402Version})
     scheme = Utils.map_value(requirements, {"scheme", :scheme})
@@ -512,15 +547,31 @@ defmodule X402.Facilitator.Engine do
 
     cond do
       version != @x402_version -> {:unsupported, "invalid_x402_version"}
-      scheme != @scheme -> {:unsupported, "unsupported_scheme"}
+      scheme not in @schemes -> {:unsupported, "unsupported_scheme"}
       network not in engine.networks -> {:unsupported, "invalid_network"}
+      scheme == "upto" -> route_upto(engine, requirements)
       true -> :ok
+    end
+  end
+
+  # The upto proxy only lets the witness facilitator settle, so an upto
+  # payment is only ours when the requirements name this engine's signer.
+  @spec route_upto(t(), map()) :: :ok | {:unsupported, String.t()} | {:error, term()}
+  defp route_upto(engine, requirements) do
+    with {:ok, signer_address} <- Signer.address(engine.signer),
+         {:ok, facilitator} <- Permit2.facilitator_address(requirements),
+         true <- String.downcase(facilitator) == String.downcase(signer_address) do
+      :ok
+    else
+      {:error, {:missing_extra, _key}} -> {:unsupported, "upto_facilitator_mismatch"}
+      false -> {:unsupported, "upto_facilitator_mismatch"}
+      {:error, reason} -> {:error, {:settle_error, reason}}
     end
   end
 
   @spec handle_verify_result(protocol_result(), t(), Context.t(), Hooks.metadata()) ::
           {:ok, wire_response()} | {:error, term()}
-  defp handle_verify_result({:valid, response, _signature_type}, engine, context, metadata) do
+  defp handle_verify_result({:valid, response, _signature_type, _kind}, engine, context, metadata) do
     finalize_success(engine.hooks, :after_verify, context, response, metadata)
   end
 
@@ -547,6 +598,7 @@ defmodule X402.Facilitator.Engine do
            payer: String.t() | nil,
            pending_key: String.t() | nil,
            event: map(),
+           failed_reason: String.t(),
            entry: PendingSettlementStore.entry() | nil
          }
 
@@ -566,14 +618,17 @@ defmodule X402.Facilitator.Engine do
 
       {:unsupported, reason_string} ->
         {:settled, failure_response(reason_string, "", ctx.network, ctx.payer)}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   @spec verify_and_settle(t(), map(), map(), settle_context()) :: settle_result()
   defp verify_and_settle(engine, payload, requirements, ctx) do
     case delegate_verify(engine, payload, requirements, settle_simulate(engine)) do
-      {:valid, _response, signature_type} ->
-        execute_settlement(engine, payload, requirements, ctx, signature_type)
+      {:valid, _response, signature_type, kind} ->
+        execute_settlement(engine, payload, requirements, ctx, signature_type, kind)
 
       {:invalid, response} ->
         {:settled, failure_response(response["invalidReason"], "", ctx.network, ctx.payer)}
@@ -585,8 +640,8 @@ defmodule X402.Facilitator.Engine do
 
   @spec settle_context(t(), map(), map()) :: settle_context()
   defp settle_context(engine, payload, requirements) do
-    payer = payer(payload)
-    authorization = authorization(payload)
+    payer = payer(payload, requirements)
+    scheme = Utils.map_value(requirements, {"scheme", :scheme})
 
     %{
       network: network(requirements, payload),
@@ -600,14 +655,55 @@ defmodule X402.Facilitator.Engine do
       # the log address stays the requirements' asset, matching the
       # reference facilitator's awaitEIP3009Settlement. (The fresh-broadcast
       # path re-verifies, proving authorization and requirements agree.)
+      # The one field that must come from the requirements is upto's
+      # settled amount — which is why the pending key binds it too.
       event: %{
         asset: asset(requirements),
         from: payer,
-        to: Utils.map_value(authorization, {"to", :to}),
-        value: Utils.map_value(authorization, {"value", :value})
+        to: transfer_recipient(payload, requirements),
+        value: transfer_value(payload, requirements)
       },
+      failed_reason:
+        if(scheme == "upto",
+          do: "invalid_upto_evm_transaction_failed",
+          else: "invalid_exact_evm_transaction_failed"
+        ),
       entry: nil
     }
+  end
+
+  @spec transfer_recipient(map(), map()) :: term()
+  defp transfer_recipient(payload, requirements) do
+    case authorization_kind(payload, requirements) do
+      {:eip3009, authorization} ->
+        Utils.map_value(authorization, {"to", :to})
+
+      {:permit2, authorization} ->
+        Utils.nested_map_value(authorization, [{"witness", :witness}, {"to", :to}])
+
+      :none ->
+        nil
+    end
+  end
+
+  # EIP-3009 and exact-Permit2 move the signed amount; upto moves the
+  # requirements' amount (at most the signed ceiling).
+  @spec transfer_value(map(), map()) :: term()
+  defp transfer_value(payload, requirements) do
+    case {authorization_kind(payload, requirements),
+          Utils.map_value(requirements, {"scheme", :scheme})} do
+      {{:eip3009, authorization}, _scheme} ->
+        Utils.map_value(authorization, {"value", :value})
+
+      {{:permit2, _authorization}, "upto"} ->
+        Utils.map_value(requirements, {"amount", :amount})
+
+      {{:permit2, authorization}, _scheme} ->
+        Utils.nested_map_value(authorization, [{"permitted", :permitted}, {"amount", :amount}])
+
+      {:none, _scheme} ->
+        nil
+    end
   end
 
   # Settle's independent re-verify keeps the atomic counterfactual
@@ -647,28 +743,59 @@ defmodule X402.Facilitator.Engine do
     signature =
       Utils.nested_map_value(payload, [{"payload", :payload}, {"signature", :signature}])
 
-    authorization = authorization(payload)
-
-    fields =
-      [
-        Utils.map_value(authorization, {"from", :from}),
-        Utils.map_value(authorization, {"to", :to}),
-        Utils.map_value(authorization, {"value", :value}),
-        Utils.map_value(authorization, {"validAfter", :validAfter}),
-        Utils.map_value(authorization, {"validBefore", :validBefore}),
-        Utils.map_value(authorization, {"nonce", :nonce}),
-        asset(requirements)
-      ]
-      |> Enum.map(&canonical_key_field/1)
+    fields = Enum.map(key_fields(payload, requirements), &canonical_key_field/1)
 
     with {:ok, bytes} <- unhex(signature),
-         false <- Enum.any?(fields, &is_nil/1) do
+         false <- fields == [] or Enum.any?(fields, &is_nil/1) do
       digest =
         :crypto.hash(:sha256, [:crypto.hash(:sha256, bytes), "\n", Enum.intersperse(fields, "\n")])
 
       Base.encode16(digest, case: :lower)
     else
       _missing_or_malformed -> nil
+    end
+  end
+
+  # Every field the reconcile path's Transfer-event check (and, for upto,
+  # the settled amount) depends on. The authorization kind is prefixed so
+  # the two shapes can never alias each other.
+  @spec key_fields(map(), map()) :: [term()]
+  defp key_fields(payload, requirements) do
+    case authorization_kind(payload, requirements) do
+      {:eip3009, authorization} ->
+        [
+          "eip3009",
+          Utils.map_value(authorization, {"from", :from}),
+          Utils.map_value(authorization, {"to", :to}),
+          Utils.map_value(authorization, {"value", :value}),
+          Utils.map_value(authorization, {"validAfter", :validAfter}),
+          Utils.map_value(authorization, {"validBefore", :validBefore}),
+          Utils.map_value(authorization, {"nonce", :nonce}),
+          asset(requirements)
+        ]
+
+      {:permit2, authorization} ->
+        scheme = Utils.map_value(requirements, {"scheme", :scheme})
+
+        [
+          "permit2:#{scheme}",
+          Utils.map_value(authorization, {"from", :from}),
+          Utils.map_value(authorization, {"spender", :spender}),
+          Utils.nested_map_value(authorization, [{"permitted", :permitted}, {"token", :token}]),
+          Utils.nested_map_value(authorization, [{"permitted", :permitted}, {"amount", :amount}]),
+          Utils.map_value(authorization, {"nonce", :nonce}),
+          Utils.map_value(authorization, {"deadline", :deadline}),
+          Utils.nested_map_value(authorization, [{"witness", :witness}, {"to", :to}]),
+          Utils.nested_map_value(authorization, [
+            {"witness", :witness},
+            {"validAfter", :validAfter}
+          ]),
+          asset(requirements),
+          transfer_value(payload, requirements)
+        ]
+
+      :none ->
+        []
     end
   end
 
@@ -713,30 +840,33 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec execute_settlement(t(), map(), map(), settle_context(), EVM.signature_type()) ::
-          settle_result()
-  defp execute_settlement(engine, payload, requirements, ctx, signature_type) do
-    # Fee-payer safety: `to` is the verified requirements' asset, `value` is
-    # 0, and the calldata comes exclusively from the shared EIP-3009 builder
-    # over the authorization the re-verify just proved. The one exception is
-    # the allowlist-gated counterfactual deployment (deploy_wallet/4). The
-    # overload follows the VERIFIED signature type (an ERC-1271 signature
-    # can be 65 bytes too).
+  @spec execute_settlement(
+          t(),
+          map(),
+          map(),
+          settle_context(),
+          EVM.signature_type(),
+          EVM.kind()
+        ) :: settle_result()
+  defp execute_settlement(engine, payload, requirements, ctx, signature_type, kind) do
+    # Fee-payer safety: `to` is the verified requirements' asset (EIP-3009)
+    # or the fixed x402 proxy (Permit2), `value` is 0, and the calldata
+    # comes exclusively from the shared builders over the authorization the
+    # re-verify just proved. The one exception is the allowlist-gated
+    # counterfactual deployment (deploy_wallet/4). The EIP-3009 overload
+    # follows the VERIFIED signature type (an ERC-1271 signature can be 65
+    # bytes too).
+    target = settlement_target(kind, requirements)
+
     with {:ok, parsed} <- parse_wrapper(payload),
          {:ok, from} <- Signer.address(engine.signer),
          {:ok, chain_id} <- chain_id(requirements),
          :ok <- ensure_wallet_deployed(engine, signature_type, parsed, ctx.payer, from, chain_id),
-         {:ok, calldata} <- build_calldata(payload, parsed.inner_signature, signature_type),
+         {:ok, calldata} <-
+           build_calldata(kind, payload, requirements, parsed.inner_signature, signature_type),
          {:ok, params} <-
-           transaction_params(
-             engine,
-             from,
-             asset(requirements),
-             calldata,
-             transfer_limits(engine)
-           ),
-         {:ok, raw} <-
-           sign_or_release(engine, chain_id, params, asset(requirements), calldata, from) do
+           transaction_params(engine, from, target, calldata, transfer_limits(engine, kind)),
+         {:ok, raw} <- sign_or_release(engine, chain_id, params, target, calldata, from) do
       broadcast_and_await(engine, raw, from, params.nonce, ctx)
     else
       {:settle_failed, reason_string} ->
@@ -747,13 +877,23 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec transfer_limits(t()) :: {pos_integer(), String.t()}
-  defp transfer_limits(engine),
-    do: {engine.max_gas_limit, "invalid_exact_evm_transaction_simulation_failed"}
+  @spec settlement_target(EVM.kind(), map()) :: String.t() | nil
+  defp settlement_target(:eip3009, requirements), do: asset(requirements)
+  defp settlement_target(:permit2_exact, _requirements), do: Permit2.exact_proxy_address()
+  defp settlement_target(:permit2_upto, _requirements), do: Permit2.upto_proxy_address()
 
-  @spec deploy_limits(t()) :: {pos_integer(), String.t()}
+  @typep limits :: {pos_integer(), String.t(), EVM.kind() | :deploy}
+
+  @spec transfer_limits(t(), EVM.kind()) :: limits()
+  defp transfer_limits(engine, :eip3009),
+    do: {engine.max_gas_limit, "invalid_exact_evm_transaction_simulation_failed", :eip3009}
+
+  defp transfer_limits(engine, kind),
+    do: {engine.max_gas_limit, "permit2_simulation_failed", kind}
+
+  @spec deploy_limits(t()) :: limits()
   defp deploy_limits(engine),
-    do: {engine.max_deploy_gas_limit, "smart_wallet_deployment_failed"}
+    do: {engine.max_deploy_gas_limit, "smart_wallet_deployment_failed", :deploy}
 
   # A wallet verified as counterfactual may have been deployed since — the
   # bytes-variant transfer calldata already carries the inner signature, so
@@ -913,13 +1053,28 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec build_calldata(map(), binary(), EVM.signature_type()) ::
+  # Permit2 settlements always pass the raw signature bytes: Permit2 routes
+  # EOA vs. contract verification itself from the owner's bytecode.
+  @spec build_calldata(EVM.kind(), map(), map(), binary(), EVM.signature_type()) ::
           {:ok, binary()} | {:error, term()}
-  defp build_calldata(payload, inner_signature, signature_type) do
-    authorization =
-      Utils.nested_map_value(payload, [{"payload", :payload}, {"authorization", :authorization}])
+  defp build_calldata(kind, payload, requirements, inner_signature, signature_type) do
+    result =
+      case {kind, authorization_kind(payload, requirements)} do
+        {:eip3009, {:eip3009, authorization}} ->
+          EIP3009.transfer_calldata(authorization, inner_signature, signature_type)
 
-    case EIP3009.transfer_calldata(authorization || %{}, inner_signature, signature_type) do
+        {:permit2_exact, {:permit2, authorization}} ->
+          Permit2.exact_settle_calldata(authorization, inner_signature)
+
+        {:permit2_upto, {:permit2, authorization}} ->
+          amount = Utils.map_value(requirements, {"amount", :amount})
+          Permit2.upto_settle_calldata(authorization, amount, inner_signature)
+
+        _mismatch ->
+          {:error, :missing_authorization}
+      end
+
+    case result do
       {:ok, calldata} -> {:ok, calldata}
       {:error, reason} -> {:error, {:settle_error, reason}}
     end
@@ -936,7 +1091,7 @@ defmodule X402.Facilitator.Engine do
   # One batched round-trip: gas estimate, EIP-1559 fee data, pending nonce.
   # `limits` carries the gas ceiling and the estimate-revert reason for the
   # transaction kind being built (transfer vs. factory deployment).
-  @spec transaction_params(t(), String.t(), String.t(), binary(), {pos_integer(), String.t()}) ::
+  @spec transaction_params(t(), String.t(), String.t() | nil, binary(), limits()) ::
           {:ok, map()} | {:settle_failed, String.t()} | {:error, term()}
   defp transaction_params(%{nonce_manager: nil} = engine, from, to, calldata, limits) do
     requests = [
@@ -1043,7 +1198,7 @@ defmodule X402.Facilitator.Engine do
           RPC.batch_result(),
           RPC.batch_result(),
           RPC.batch_result(),
-          {pos_integer(), String.t()}
+          limits()
         ) :: {:ok, map()} | {:settle_failed, String.t()} | {:error, term()}
   defp assemble_params(engine, estimate, priority, fee_history, nonce, limits) do
     with {:ok, gas_limit} <- gas_limit(engine, estimate, limits),
@@ -1062,9 +1217,9 @@ defmodule X402.Facilitator.Engine do
   # An eth_estimateGas revert means the call would fail on chain — a
   # protocol-level rejection (it is itself a simulation), not an
   # infrastructure error.
-  @spec gas_limit(t(), RPC.batch_result(), {pos_integer(), String.t()}) ::
+  @spec gas_limit(t(), RPC.batch_result(), limits()) ::
           {:ok, pos_integer()} | {:settle_failed, String.t()} | {:error, term()}
-  defp gas_limit(engine, {:ok, hex}, {gas_ceiling, _revert_reason}) do
+  defp gas_limit(engine, {:ok, hex}, {gas_ceiling, _revert_reason, _kind}) do
     case parse_quantity(hex) do
       {:ok, estimate} ->
         margined = div(estimate * (100 + engine.gas_limit_margin_percent), 100)
@@ -1082,24 +1237,32 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  defp gas_limit(_engine, {:error, {:jsonrpc_error, error}}, {_gas_ceiling, revert_reason}),
-    do: {:settle_failed, estimate_revert_reason(error, revert_reason)}
+  defp gas_limit(_engine, {:error, {:jsonrpc_error, error}}, {_gas_ceiling, revert_reason, kind}),
+    do: {:settle_failed, estimate_revert_reason(error, revert_reason, kind)}
 
-  # The transfer's estimateGas revert carries the token's revert text —
+  # The settlement's estimateGas revert carries the contract's revert text —
   # classify it onto the canonical wire reasons (matching the reference
-  # facilitator's parseEip3009TransferError) so a retry of an
-  # already-confirmed authorization reports nonce_already_used instead of a
-  # generic simulation failure. Unclassifiable reverts keep the fixed
-  # reason, and the factory-deployment path always keeps its own.
-  @spec estimate_revert_reason(RPC.jsonrpc_error(), String.t()) :: String.t()
-  defp estimate_revert_reason(error, "invalid_exact_evm_transaction_simulation_failed" = fixed) do
-    case EVM.classify_revert(error) do
-      nil -> fixed
+  # facilitator's parseEip3009TransferError / Permit2 error mapping) so a
+  # retry of an already-confirmed authorization reports nonce_already_used
+  # (or permit2_invalid_nonce) instead of a generic simulation failure.
+  # Unclassifiable reverts keep the fixed reason, and the factory-deployment
+  # path always keeps its own.
+  @spec estimate_revert_reason(RPC.jsonrpc_error(), String.t(), EVM.kind() | :deploy) ::
+          String.t()
+  defp estimate_revert_reason(_error, fixed_reason, :deploy), do: fixed_reason
+
+  defp estimate_revert_reason(error, fixed_reason, kind) do
+    classified =
+      case kind do
+        :eip3009 -> EVM.classify_revert(error)
+        _permit2 -> EVM.classify_permit2_revert(error)
+      end
+
+    case classified do
+      nil -> fixed_reason
       reason -> EVM.reason_string(reason)
     end
   end
-
-  defp estimate_revert_reason(_error, fixed_reason), do: fixed_reason
 
   # EIP-1559 fee data: next base fee from eth_feeHistory plus the node's
   # suggested priority fee; maxFeePerGas = 2 * baseFee + priority. Nodes
@@ -1216,13 +1379,7 @@ defmodule X402.Facilitator.Engine do
         confirm_transfer(engine, transaction_hash, receipt, ctx)
 
       {:ok, %{"status" => "0x0"}} ->
-        {:settled,
-         failure_response(
-           "invalid_exact_evm_transaction_failed",
-           transaction_hash,
-           ctx.network,
-           ctx.payer
-         )}
+        {:settled, failure_response(ctx.failed_reason, transaction_hash, ctx.network, ctx.payer)}
 
       # Pending (null receipt), unexpected shapes, and transient RPC errors
       # all keep polling until the deadline; the transaction is broadcast, so
@@ -1293,13 +1450,7 @@ defmodule X402.Facilitator.Engine do
             inspect(reason)
         )
 
-        {:settled,
-         failure_response(
-           "invalid_exact_evm_transaction_failed",
-           transaction_hash,
-           ctx.network,
-           ctx.payer
-         )}
+        {:settled, failure_response(ctx.failed_reason, transaction_hash, ctx.network, ctx.payer)}
     end
   end
 
@@ -1532,25 +1683,48 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec payer(map()) :: String.t() | nil
-  defp payer(payload) do
-    Utils.nested_map_value(payload, [
-      {"payload", :payload},
-      {"authorization", :authorization},
-      {"from", :from}
-    ])
-  end
-
-  @spec authorization(map()) :: map()
-  defp authorization(payload) do
-    case Utils.nested_map_value(payload, [
-           {"payload", :payload},
-           {"authorization", :authorization}
-         ]) do
-      %{} = authorization -> authorization
-      _missing -> %{}
+  @spec payer(map(), map()) :: String.t() | nil
+  defp payer(payload, requirements) do
+    case authorization_kind(payload, requirements) do
+      {_kind, authorization} -> Utils.map_value(authorization, {"from", :from})
+      :none -> nil
     end
   end
+
+  # Match verification's requirements-selected method everywhere, including
+  # pre-verification pending lookup. Extra unsigned authorization objects must
+  # never select calldata, payer identity, pending keys, or receipt fields.
+  @spec authorization_kind(map(), map()) :: {:eip3009 | :permit2, map()} | :none
+  defp authorization_kind(payload, requirements) do
+    with {:ok, method} <- authorization_method(requirements),
+         %{} = authorization <-
+           Utils.nested_map_value(payload, [{"payload", :payload}, authorization_field(method)]) do
+      {method, authorization}
+    else
+      _missing_or_unsupported -> :none
+    end
+  end
+
+  @spec authorization_method(map()) :: {:ok, ExactEVM.transfer_method()} | :error
+  defp authorization_method(requirements) do
+    case Utils.map_value(requirements, {"scheme", :scheme}) do
+      "upto" ->
+        {:ok, :permit2}
+
+      "exact" ->
+        case ExactEVM.transfer_method(requirements) do
+          {:ok, method} -> {:ok, method}
+          {:error, _reason} -> :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  @spec authorization_field(ExactEVM.transfer_method()) :: {String.t(), atom()}
+  defp authorization_field(:eip3009), do: {"authorization", :authorization}
+  defp authorization_field(:permit2), do: {"permit2Authorization", :permit2Authorization}
 
   @spec network(map(), map()) :: String.t()
   defp network(requirements, payload) do

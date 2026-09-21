@@ -1214,4 +1214,268 @@ defmodule X402.MCP.ServerTest do
                        %{tool: "premium_search", reason: :invalid_x402_version}}
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Resource-server lifecycle hooks
+  # ---------------------------------------------------------------------------
+
+  defmodule LifecycleHooks do
+    @moduledoc false
+    # The on_protected_request result is taken from the process dictionary;
+    # hooks run in the calling (test) process.
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.RequestContext
+
+    def before_verify(context, _metadata), do: {:cont, context}
+    def after_verify(context, _metadata), do: {:cont, context}
+    def on_verify_failure(context, _metadata), do: {:cont, context}
+    def before_settle(context, _metadata), do: {:cont, context}
+    def after_settle(context, _metadata), do: {:cont, context}
+    def on_settle_failure(context, _metadata), do: {:cont, context}
+
+    def on_protected_request(%RequestContext{} = context, metadata) do
+      send(self(), {:on_protected_request, context, metadata})
+
+      case Process.get(:protected_request_result) do
+        nil -> {:cont, context}
+        :discount -> {:cont, %{context | requirements: discounted(context.requirements)}}
+        result -> result
+      end
+    end
+
+    def on_verified_payment_canceled(%RequestContext{} = context, metadata) do
+      send(self(), {:on_verified_payment_canceled, context, metadata})
+      :ok
+    end
+
+    defp discounted(requirements), do: Enum.map(requirements, &Map.put(&1, "amount", "5000"))
+  end
+
+  describe "on_protected_request" do
+    test "runs before the payment is inspected with the MCP request context" do
+      config = config(start_facilitator(), hooks: LifecycleHooks)
+
+      result = Server.call(%{"name" => "premium_search"}, config, refute_handler())
+      assert result["isError"] == true
+
+      assert_received {:on_protected_request, context, %{tool: "premium_search"}}
+      assert context.transport == :mcp
+      assert context.request == %{"name" => "premium_search"}
+      assert context.tool == "premium_search"
+      assert context.route.tool == "premium_search"
+      assert context.requirements == [@requirements]
+      assert context.extensions == %{}
+      assert is_nil(context.conn)
+    end
+
+    test "replaced requirements are advertised and matched" do
+      Process.put(:protected_request_result, :discount)
+      config = config(start_facilitator(), hooks: LifecycleHooks)
+
+      required = Server.call(%{"name" => "premium_search"}, config, refute_handler())
+      assert [%{"amount" => "5000"}] = required["structuredContent"]["accepts"]
+
+      discounted_payment =
+        payment(%{
+          "accepted" => %{@requirements | "amount" => "5000"},
+          "payload" => %{"signature" => "0xsignature", "authorization" => %{"value" => "5000"}}
+        })
+
+      result = Server.call(request(discounted_payment), config, ok_handler())
+      assert result["_meta"]["x402/payment-response"]
+      assert_received {:verify_called, _payload, %{"amount" => "5000"}, nil}
+
+      full_price = Server.call(request(payment()), config, refute_handler())
+      assert full_price["structuredContent"]["error"] == "No matching payment requirements"
+    end
+
+    test "{:halt, :skip_payment} runs the handler unpaid and emits pass_through" do
+      handler_id = "mcp-pass-through-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:x402, :mcp, :pass_through],
+        fn event, _measurements, metadata, _config ->
+          send(parent, {:telemetry, event, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Process.put(:protected_request_result, {:halt, :skip_payment})
+      config = config(start_facilitator(), hooks: LifecycleHooks)
+
+      result = Server.call(%{"name" => "premium_search"}, config, ok_handler())
+
+      assert result == %{"content" => [%{"type" => "text", "text" => "results"}]}
+      assert_received {:handler_called, %{"name" => "premium_search"}}
+
+      assert_received {:telemetry, [:x402, :mcp, :pass_through],
+                       %{tool: "premium_search", reason: :hook_skipped}}
+
+      refute_received {:verify_called, _payload, _requirements, nil}
+    end
+
+    test "{:halt, {status, body}} answers an error result carrying the body" do
+      Process.put(:protected_request_result, {:halt, {403, %{"error" => "blocked"}}})
+      config = config(start_facilitator(), hooks: LifecycleHooks)
+
+      result = Server.call(request(payment()), config, refute_handler())
+
+      assert result == %{
+               "isError" => true,
+               "content" => [%{"type" => "text", "text" => "blocked"}],
+               "structuredContent" => %{"error" => "blocked"}
+             }
+
+      Process.put(:protected_request_result, {:halt, {403, %{"code" => 7}}})
+      result = Server.call(request(payment()), config, refute_handler())
+      assert result["content"] == [%{"type" => "text", "text" => "request rejected"}]
+      assert result["structuredContent"] == %{"code" => 7}
+    end
+
+    test "an invalid return fails closed with the internal error result" do
+      Process.put(:protected_request_result, :nope)
+      config = config(start_facilitator(), hooks: LifecycleHooks)
+
+      assert Server.call(request(payment()), config, refute_handler()) == @internal_error
+    end
+  end
+
+  describe "on_verified_payment_canceled" do
+    test "runs with :handler_failed when the handler returns an error result" do
+      config = config(start_facilitator(), hooks: LifecycleHooks)
+
+      handler = fn _request -> %{"isError" => true, "content" => []} end
+      assert %{"isError" => true} = Server.call(request(payment()), config, handler)
+
+      assert_received {:on_verified_payment_canceled, context,
+                       %{reason: :handler_failed, tool: "premium_search"}}
+
+      assert context.payload["x402Version"] == 2
+      assert context.matched_requirements == @requirements
+      refute_received {:settle_called, _payload, _requirements, nil}
+    end
+
+    test "runs with :handler_raised when the handler raises or throws" do
+      config = config(start_facilitator(), hooks: LifecycleHooks)
+
+      assert_raise RuntimeError, "tool boom", fn ->
+        Server.call(request(payment()), config, fn _request -> raise "tool boom" end)
+      end
+
+      assert_received {:on_verified_payment_canceled, _context,
+                       %{reason: :handler_raised, error: %RuntimeError{message: "tool boom"}}}
+
+      assert catch_throw(
+               Server.call(request(payment()), config, fn _request -> throw(:tool_throw) end)
+             ) == :tool_throw
+
+      assert_received {:on_verified_payment_canceled, _context,
+                       %{reason: :handler_raised, error: {:throw, :tool_throw}}}
+    end
+
+    test "runs with :settlement_failed when settlement fails" do
+      failed = %{
+        "success" => false,
+        "errorReason" => "insufficient_funds",
+        "transaction" => "",
+        "network" => @network
+      }
+
+      config =
+        config(start_facilitator(settle: {:ok, %{status: 200, body: failed}}),
+          hooks: LifecycleHooks
+        )
+
+      result = Server.call(request(payment()), config, ok_handler())
+      assert result["structuredContent"]["error"] =~ "settlement failed"
+
+      assert_received {:on_verified_payment_canceled, _context,
+                       %{reason: :settlement_failed, error: {:settlement_failed, _reason}}}
+    end
+
+    test "does not run on success" do
+      config = config(start_facilitator(), hooks: LifecycleHooks)
+      result = Server.call(request(payment()), config, ok_handler())
+      assert result["_meta"]["x402/payment-response"]
+      refute_received {:on_verified_payment_canceled, _context, _metadata}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Builder code
+  # ---------------------------------------------------------------------------
+
+  describe "builder-code echo" do
+    alias X402.Extensions.BuilderCode
+
+    test "forwards a valid echo of the advertised code to the facilitator" do
+      config =
+        config(start_facilitator(),
+          extensions: %{"builder-code" => BuilderCode.extension("my_app")}
+        )
+
+      echo = %{
+        "builder-code" => %{
+          "info" => %{"a" => "my_app", "s" => ["my_client"]},
+          "schema" => BuilderCode.schema()
+        }
+      }
+
+      result = Server.call(request(payment(%{"extensions" => echo})), config, ok_handler())
+      assert result["_meta"]["x402/payment-response"]
+
+      assert_received {:verify_called, %{"extensions" => %{"builder-code" => %{"info" => info}}},
+                       _requirements, nil}
+
+      assert info == %{"a" => "my_app", "s" => ["my_client"]}
+    end
+
+    test "rejects an app code the server never declared as an echo mismatch" do
+      config = config(start_facilitator())
+      echo = %{"builder-code" => %{"a" => "other_app"}}
+
+      result = Server.call(request(payment(%{"extensions" => echo})), config, refute_handler())
+      assert result["structuredContent"]["error"] == "invalid_payload"
+      refute_received {:verify_called, _payload, _requirements, nil}
+    end
+
+    test "rejects malformed codes and too many service codes" do
+      handler_id = "mcp-builder-code-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:x402, :mcp, :payment_rejected],
+        fn _event, _measurements, metadata, _config -> send(parent, {:rejected, metadata}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      config = config(start_facilitator())
+
+      malformed = %{"builder-code" => %{"info" => %{"s" => ["Bad Code"]}}}
+
+      result =
+        Server.call(request(payment(%{"extensions" => malformed})), config, refute_handler())
+
+      assert result["structuredContent"]["error"] == "invalid_payload"
+
+      assert_received {:rejected,
+                       %{reason: {:invalid_builder_code, {:invalid_builder_code, "s"}}}}
+
+      too_many = %{"builder-code" => %{"s" => Enum.map(1..11, &"code_#{&1}")}}
+
+      result =
+        Server.call(request(payment(%{"extensions" => too_many})), config, refute_handler())
+
+      assert result["structuredContent"]["error"] == "invalid_payload"
+      assert_received {:rejected, %{reason: {:invalid_builder_code, :too_many_service_codes}}}
+    end
+  end
 end

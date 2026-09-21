@@ -41,7 +41,10 @@ defmodule X402.Extensions.Bazaar do
   `{:error, %X402.Facilitator.Error{type: :malformed_facilitator_response}}`
   identifying the offending entry, rather than partial data. Use
   `X402.Facilitator.list_resources/2` directly and `parse_resource/1`
-  per-entry to build a lenient listing instead.
+  per-entry to build a lenient listing instead. `search/2` does the same
+  for the natural-language `GET /discovery/search` endpoint
+  (`X402.Facilitator.search_resources/2`), which pages with an opaque
+  cursor.
 
   The pure filter helpers `filter_by_network/2`, `filter_by_scheme/2`, and
   `filter_by_max_price/2` narrow a parsed listing client-side:
@@ -125,6 +128,14 @@ defmodule X402.Extensions.Bazaar do
           x402_version: integer() | nil,
           items: [resource()],
           pagination: Facilitator.discovery_pagination() | nil
+        }
+
+  @typedoc "Parsed response of `search/2`."
+  @type search_response :: %{
+          x402_version: integer() | nil,
+          resources: [resource()],
+          partial_results: boolean() | nil,
+          pagination: Facilitator.discovery_search_pagination() | nil
         }
 
   @doc since: "0.5.0"
@@ -295,6 +306,43 @@ defmodule X402.Extensions.Bazaar do
     with {:ok, response} <- Facilitator.list_resources(server, params),
          {:ok, items} <- parse_resources(response.items) do
       {:ok, %{response | items: items}}
+    end
+  end
+
+  @doc """
+  Searches a facilitator's bazaar with a natural-language query, as typed maps.
+
+  Queries `GET /discovery/search` through
+  `X402.Facilitator.search_resources/2` (accepting the same parameters —
+  `:query` is required) and parses every matching entry with
+  `parse_resource/1`, fail-closed exactly like `list_resources/2`. Pass
+  `pagination.cursor` back as `:cursor` to fetch the next page.
+
+  When called with just a keyword list — `search(query: "weather")` — the
+  parameters apply to the default `X402.Facilitator` process name.
+
+  ## Examples
+
+      {:ok, %{resources: resources, partial_results: partial, pagination: pagination}} =
+        X402.Extensions.Bazaar.search(MyFacilitator, query: "weather forecast", limit: 10)
+
+      Enum.map(resources, & &1.resource)
+  """
+  @doc group: :discovery
+  @doc since: "0.8.0"
+  @spec search(Facilitator.server() | keyword(), keyword()) ::
+          {:ok, search_response()}
+          | {:error, Error.t() | NimbleOptions.ValidationError.t() | term()}
+  def search(server_or_params \\ Facilitator, params \\ [])
+
+  def search(params, []) when is_list(params) do
+    search(Facilitator, params)
+  end
+
+  def search(server, params) when is_list(params) do
+    with {:ok, response} <- Facilitator.search_resources(server, params),
+         {:ok, resources} <- parse_resources(response.resources) do
+      {:ok, %{response | resources: resources}}
     end
   end
 

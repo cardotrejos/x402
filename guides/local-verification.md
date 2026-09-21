@@ -6,8 +6,10 @@ Two modules remove that dependency by running the facilitator verify
 checklist locally — the same checks the reference TypeScript, Go, and Python
 facilitator engines perform:
 
-- `X402.Verify.EVM` for EVM `exact`/`eip3009` payments, from EIP-712
-  signature recovery to on-chain `transferWithAuthorization` simulation.
+- `X402.Verify.EVM` for EVM `exact` payments — EIP-3009 and the Permit2
+  transfer method — and `upto` payments, from EIP-712 signature recovery
+  to on-chain simulation of `transferWithAuthorization` or the x402
+  Permit2 proxy's `settle`.
 - `X402.Verify.SVM` for `exact` payments on `solana:*` networks, from local
   Ed25519 signature verification to `simulateTransaction`.
 
@@ -33,6 +35,57 @@ weaker check.
 At `:signature`, smart-wallet signatures (ERC-1271 contracts, ERC-6492
 wrappers) are rejected with `{:error, {:invalid, :smart_wallet_requires_rpc}}`
 rather than assumed valid — proving them requires the chain.
+
+### Permit2 payments (`exact` via `permit2`, and `upto`)
+
+The requirements select the flow and the result's `kind` echoes it:
+`:eip3009` for `exact` with `extra.assetTransferMethod` absent or
+`"eip3009"`, `:permit2_exact` for `exact` with `"permit2"`, and
+`:permit2_upto` for `upto`. Any other transfer method is rejected as
+`{:invalid, :unsupported_transfer_method}`. Permit2 payloads carry
+`permit2Authorization` instead of `authorization` and are verified at the
+same three levels, running the reference facilitator's Permit2 checklist
+in its order — scheme, network, spender, recipient, deadline,
+`validAfter`, amount, token, signature:
+
+| Level | Permit2 checks |
+|---|---|
+| `:structural` | scheme and network match; the `spender` is the x402 proxy for the flow (`x402ExactPermit2Proxy` for exact, `x402UptoPermit2Proxy` for upto); `witness.to` equals `payTo`; the `deadline` covers now plus the 6-second buffer and `witness.validAfter` has passed; `permitted.amount` equals `amount` (exact) or is at least `amount` (upto — `amount` is what gets settled); `permitted.token` equals `asset`; and for upto the witness `facilitator` equals `extra.facilitatorAddress` |
+| `:signature` | `:structural` + EIP-712 digest recomputation against the canonical Permit2 domain (no version field) and EOA recovery of the permit's `from` |
+| `:full` | `:signature` + chain-id cross-check, payer-bytecode signature routing, the proxy's deployment (its `PERMIT2()` getter must answer), asset bytecode presence, `balanceOf` funding, and an `eth_call` simulation of the proxy's `settle` — `x402ExactPermit2Proxy.settle` sent from the payer for exact, `x402UptoPermit2Proxy.settle` for `amount` sent from the witness facilitator for upto (the only sender the proxy accepts) — with failure diagnosis |
+
+The simulation encodes the exact calldata the facilitator engine later
+broadcasts (`X402.Permit2.exact_settle_calldata/2` /
+`upto_settle_calldata/3`), so verification and settlement cannot diverge.
+Failure diagnosis mirrors the reference facilitator: a revert is first
+classified by the Permit2 and proxy custom-error selectors (or revert
+text) — `InvalidNonce` → `:permit2_invalid_nonce`, `InvalidAmount`,
+`InvalidDestination`, `InvalidOwner`, `PaymentTooEarly`,
+`Permit2612AmountMismatch`, the signature errors → `:invalid_permit2_signature`,
+and for upto `AmountExceedsPermitted` / `UnauthorizedFacilitator` →
+`:upto_amount_exceeds_permitted` / `:upto_unauthorized_facilitator` — and an
+unexplained revert triggers one batched probe of the proxy's `PERMIT2()`,
+`balanceOf(payer)`, and `allowance(payer, Permit2)` to produce
+`:permit2_proxy_not_deployed`, `:permit2_insufficient_balance`,
+`:permit2_allowance_required` (the payer never approved the canonical
+Permit2 contract for the token), or `:permit2_simulation_failed`.
+
+Reasons come in three families. The checklist reasons are
+`:invalid_permit2_spender`, `:permit2_recipient_mismatch`,
+`:permit2_deadline_expired`, `:permit2_not_yet_valid`,
+`:permit2_amount_mismatch`, `:permit2_token_mismatch`, and
+`:invalid_permit2_signature` (also used where an EIP-3009 payload would
+report `:invalid_signature` or `:smart_wallet_requires_rpc`); the
+simulation reasons are the `permit2_*` atoms above; and the upto-only
+reasons are `:upto_scheme_mismatch`, `:upto_network_mismatch`,
+`:upto_facilitator_mismatch`, `:settlement_exceeds_amount`,
+`:upto_amount_exceeds_permitted`, and `:upto_unauthorized_facilitator`.
+`X402.Verify.EVM.reason_string/1` maps them onto the reference wire strings
+where one exists (`invalid_permit2_recipient_mismatch`,
+`invalid_upto_evm_scheme`, `invalid_upto_evm_network_mismatch`,
+`invalid_upto_evm_payload_settlement_exceeds_amount`;
+`:unsupported_transfer_method` → `invalid_exact_evm_scheme`) and to the
+atom's own name otherwise.
 
 ## Quick start
 
@@ -239,7 +292,9 @@ or `:simulation_failed`.
 `X402.Verify.EVM.reason_string/1` maps each reason atom onto the canonical
 cross-SDK `invalidReason` string (for example `:nonce_already_used` →
 `"invalid_exact_evm_nonce_already_used"`), so a facilitator engine built on
-it answers wire-compatible verify responses.
+it answers wire-compatible verify responses. Permit2 payments have their
+own error table and probe — see
+[Permit2 payments](#permit2-payments-exact-via-permit2-and-upto) above.
 
 ## SVM verification
 

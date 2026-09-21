@@ -375,7 +375,12 @@ defmodule X402.Verify.EVMTest do
       assert EVM.verify(upto, requirements, level: :structural) ==
                {:error, {:invalid, :scheme_mismatch}}
 
+      # upto requirements select the Permit2 upto flow, whose reason family
+      # matches the reference upto facilitator.
       assert EVM.verify(payload, requirements(%{"scheme" => "upto"}), level: :structural) ==
+               {:error, {:invalid, :upto_scheme_mismatch}}
+
+      assert EVM.verify(payload, requirements(%{"scheme" => "other"}), level: :structural) ==
                {:error, {:invalid, :scheme_mismatch}}
     end
 
@@ -404,7 +409,19 @@ defmodule X402.Verify.EVMTest do
                {:error, {:invalid, :missing_eip712_domain}}
     end
 
-    test "rejects non-default asset transfer methods" do
+    test "rejects unsupported asset transfer methods" do
+      requirements =
+        requirements(%{
+          "extra" => %{"name" => "USDC", "version" => "2", "assetTransferMethod" => "erc7710"}
+        })
+
+      payload = unsigned_payload(requirements, @payer, "0x11")
+
+      assert EVM.verify(payload, requirements, level: :structural) ==
+               {:error, {:invalid, :unsupported_transfer_method}}
+    end
+
+    test "rejects an EIP-3009 payload against Permit2 requirements" do
       requirements =
         requirements(%{
           "extra" => %{"name" => "USDC", "version" => "2", "assetTransferMethod" => "permit2"}
@@ -413,7 +430,7 @@ defmodule X402.Verify.EVMTest do
       payload = unsigned_payload(requirements, @payer, "0x11")
 
       assert EVM.verify(payload, requirements, level: :structural) ==
-               {:error, {:invalid, :unsupported_transfer_method}}
+               {:error, {:invalid, :invalid_authorization}}
     end
 
     test "rejects an invalid asset address" do

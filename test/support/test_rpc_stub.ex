@@ -15,11 +15,20 @@ defmodule X402.TestRPCStub do
   # keccak256("Transfer(address,address,uint256)")
   @transfer_topic "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
+  @exact_proxy "0x402085c248EeA27D92E8b30b2C58ed07f9E20001"
+  @upto_proxy "0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002"
+
   def defaults do
     %{
       chain_id: 84_532,
-      code: %{String.downcase(@asset) => "0x6001"},
+      code: %{
+        String.downcase(@asset) => "0x6001",
+        String.downcase(@exact_proxy) => "0x6002",
+        String.downcase(@upto_proxy) => "0x6003"
+      },
       balance: 1_000_000,
+      allowance: 1_000_000,
+      permit2_probe: :ok,
       simulate: :ok,
       multicall: [{true, <<>>}, {true, <<>>}],
       estimate_gas: {:ok, 60_000},
@@ -188,12 +197,29 @@ defmodule X402.TestRPCStub do
   defp dispatch_call(<<0x70, 0xA0, 0x82, 0x31, _rest::binary>>, config),
     do: {:ok, quantity_word(config.balance)}
 
+  # allowance(address,address) — the payer's ERC-20 approval to Permit2
+  defp dispatch_call(<<0xDD, 0x62, 0xED, 0x3E, _rest::binary>>, config),
+    do: {:ok, quantity_word(config.allowance)}
+
   # transferWithAuthorization — (v,r,s) and bytes variants
   defp dispatch_call(<<0xE3, 0xEE, 0x16, 0x0E, _rest::binary>>, config),
     do: simulate_result(config)
 
   defp dispatch_call(<<0xCF, 0x09, 0x29, 0x95, _rest::binary>>, config),
     do: simulate_result(config)
+
+  # x402ExactPermit2Proxy.settle / x402UptoPermit2Proxy.settle
+  defp dispatch_call(<<0x13, 0xCD, 0x3B, 0x53, _rest::binary>>, config),
+    do: simulate_result(config)
+
+  defp dispatch_call(<<0xFF, 0x11, 0xE7, 0xB4, _rest::binary>>, config),
+    do: simulate_result(config)
+
+  # PERMIT2() — the proxies' deployment probe
+  defp dispatch_call(<<0x6A, 0xFD, 0xD8, 0x50>>, %{permit2_probe: :empty}), do: {:ok, "0x"}
+
+  defp dispatch_call(<<0x6A, 0xFD, 0xD8, 0x50>>, _config),
+    do: {:ok, "0x" <> String.duplicate("0", 24) <> "000000000022d473030f116ddee9f6b43ac78ba3"}
 
   # aggregate3((address,bool,bytes)[]) — the atomic ERC-6492 counterfactual
   # deploy-and-transfer simulation.
@@ -212,6 +238,16 @@ defmodule X402.TestRPCStub do
 
   defp simulate_result(%{simulate: {:revert, message}}),
     do: {:error, %{"code" => 3, "message" => "execution reverted: #{message}"}}
+
+  # A custom-error revert carrying only the ABI selector as data.
+  defp simulate_result(%{simulate: {:revert_data, data}}),
+    do:
+      {:error,
+       %{
+         "code" => 3,
+         "message" => "execution reverted",
+         "data" => "0x" <> Base.encode16(data, case: :lower)
+       }}
 
   defp quantity_hex(value), do: "0x" <> Integer.to_string(value, 16)
 
