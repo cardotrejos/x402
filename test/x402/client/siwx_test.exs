@@ -388,7 +388,7 @@ defmodule X402.Client.SIWXTest do
   end
 
   describe "telemetry" do
-    test "emits [:x402, :client, :siwx] with the failure reason" do
+    setup do
       handler_id = "client-siwx-#{System.unique_integer([:positive])}"
       parent = self()
 
@@ -396,20 +396,79 @@ defmodule X402.Client.SIWXTest do
         handler_id,
         [:x402, :client, :siwx],
         fn event, measurements, metadata, _config ->
-          send(parent, {:telemetry, event, measurements, metadata})
+          if self() == parent, do: send(parent, {:telemetry, event, measurements, metadata})
         end,
         nil
       )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
+      :ok
+    end
 
+    test "direct calls report the attempted chain and an unspecified transport" do
       ClientSIWX.authenticate(payment_required(challenge()), evm_signer(),
         chain_id: "eip155:1",
         domain: "api.example.com"
       )
 
       assert_received {:telemetry, [:x402, :client, :siwx], %{count: 1},
-                       %{status: :error, reason: :unsupported_chain}}
+                       %{
+                         status: :error,
+                         reason: :unsupported_chain,
+                         chain_id: "eip155:1",
+                         transport: nil
+                       }}
+
+      refute_received {:telemetry, _, _, _}
+    end
+
+    test "failures before chain selection report nil rather than :auto or an untrusted chain" do
+      for {opts, reason} <- [
+            {[chain_id: @evm_chain, domain: "other.example.com"], :domain_mismatch},
+            {[chain_id: :auto, domain: "api.example.com"], :unsupported_chain}
+          ] do
+        assert ClientSIWX.authenticate(payment_required(challenge()), %URI{}, opts,
+                 transport: :mcp
+               ) == {:error, {:siwx, reason}}
+
+        assert_received {:telemetry, [:x402, :client, :siwx], %{count: 1},
+                         %{status: :error, reason: ^reason, chain_id: nil, transport: :mcp}}
+
+        refute_received {:telemetry, _, _, _}
+      end
+    end
+
+    test "automatic selection retains the chain when proof construction fails" do
+      malformed = challenge() |> update_in(["info"], &Map.delete(&1, "nonce"))
+
+      assert {:error, {:siwx, :invalid_payload}} =
+               ClientSIWX.authenticate(
+                 payment_required(malformed),
+                 solana_signer(),
+                 [chain_id: :auto, domain: "api.example.com"],
+                 transport: :http
+               )
+
+      assert_received {:telemetry, [:x402, :client, :siwx], %{count: 1},
+                       %{
+                         status: :error,
+                         reason: :invalid_payload,
+                         chain_id: @solana_chain,
+                         transport: :http
+                       }}
+
+      refute_received {:telemetry, _, _, _}
+    end
+
+    test "successful signing and absent challenges do not emit an outcome prematurely" do
+      assert {:ok, _proof} =
+               ClientSIWX.authenticate(payment_required(challenge()), evm_signer(),
+                 chain_id: :auto,
+                 domain: "api.example.com"
+               )
+
+      assert :none = ClientSIWX.authenticate(%{}, evm_signer(), chain_id: :auto)
+      refute_received {:telemetry, _, _, _}
     end
   end
 end

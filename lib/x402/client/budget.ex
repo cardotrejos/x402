@@ -123,7 +123,9 @@ defmodule X402.Client.Budget do
   @doc """
   Releases a previous reservation of `amount` of `asset`.
 
-  Totals never go below zero.
+  Releases at most the amount held for this asset, reducing both its bucket
+  and the total by the same amount. Other assets' reservations are unaffected;
+  totals never go below zero.
 
   ## Examples
 
@@ -228,11 +230,12 @@ defmodule X402.Client.Budget do
   def handle_call({:release, asset, amount}, _from, state) do
     key = String.downcase(asset)
     asset_spent = Map.get(state.spent_by, key, 0)
+    released = min(amount, asset_spent)
 
     state = %{
       state
-      | spent: max(state.spent - amount, 0),
-        spent_by: Map.put(state.spent_by, key, max(asset_spent - amount, 0))
+      | spent: state.spent - released,
+        spent_by: Map.put(state.spent_by, key, asset_spent - released)
     }
 
     {:reply, :ok, state}

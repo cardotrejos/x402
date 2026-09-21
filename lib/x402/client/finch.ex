@@ -378,39 +378,36 @@ defmodule X402.Client.Finch do
 
       siwx_opts ->
         case sign_siwx(ctx, payment_required, siwx_opts) do
-          {:ok, []} -> {:ok, {:pay, payment_required, []}}
-          {:ok, siwx_headers} -> authenticate_siwx(ctx, siwx_headers, siwx_opts)
+          :none -> {:ok, {:pay, payment_required, []}}
+          {:ok, proof} -> authenticate_siwx(ctx, proof, siwx_opts)
           {:error, _reason} = error -> error
         end
     end
   end
 
   @spec sign_siwx(map(), map(), keyword()) ::
-          {:ok, [{String.t(), String.t()}]} | {:error, {:siwx, ClientSIWX.reason()}}
+          {:ok, ClientSIWX.proof()} | :none | {:error, {:siwx, ClientSIWX.reason()}}
   defp sign_siwx(ctx, payment_required, siwx_opts) do
-    case ClientSIWX.authenticate(payment_required, ctx.opts[:signer], siwx_opts,
-           resource_url: ctx.url
-         ) do
-      {:ok, proof} -> {:ok, [{@siwx_header, proof.header}]}
-      :none -> {:ok, []}
-      {:error, _reason} = error -> error
-    end
+    ClientSIWX.authenticate(payment_required, ctx.opts[:signer], siwx_opts,
+      resource_url: ctx.url,
+      transport: :http
+    )
   end
 
-  @spec authenticate_siwx(map(), [{String.t(), String.t()}], keyword()) ::
+  @spec authenticate_siwx(map(), ClientSIWX.proof(), keyword()) ::
           {:ok, {:done, response()} | {:pay, map(), [{String.t(), String.t()}]}}
           | {:error, request_error()}
-  defp authenticate_siwx(ctx, siwx_headers, siwx_opts) do
-    headers = Keyword.fetch!(ctx.opts, :headers) ++ siwx_headers
+  defp authenticate_siwx(ctx, proof, siwx_opts) do
+    headers = Keyword.fetch!(ctx.opts, :headers) ++ [{@siwx_header, proof.header}]
 
     with {:ok, response} <- perform(ctx, headers) do
       case {response.status, fetch_header(response.headers, "payment-required")} do
         {402, header_value} when is_binary(header_value) ->
-          emit_siwx(:payment_required)
+          emit_siwx(:payment_required, proof.chain_id)
           pay_with_fresh_proof(ctx, header_value, siwx_opts)
 
         {status, _header} when status in 200..299 ->
-          emit_siwx(:authenticated)
+          emit_siwx(:authenticated, proof.chain_id)
           {:ok, {:done, finalize(response, true)}}
 
         {_status, _header} ->
@@ -422,15 +419,23 @@ defmodule X402.Client.Finch do
   @spec pay_with_fresh_proof(map(), String.t(), keyword()) ::
           {:ok, {:pay, map(), [{String.t(), String.t()}]}} | {:error, request_error()}
   defp pay_with_fresh_proof(ctx, header_value, siwx_opts) do
-    with {:ok, payment_required} <- decode_payment_required(header_value),
-         {:ok, siwx_headers} <- sign_siwx(ctx, payment_required, siwx_opts) do
-      {:ok, {:pay, payment_required, siwx_headers}}
+    with {:ok, payment_required} <- decode_payment_required(header_value) do
+      case sign_siwx(ctx, payment_required, siwx_opts) do
+        {:ok, proof} -> {:ok, {:pay, payment_required, [{@siwx_header, proof.header}]}}
+        :none -> {:ok, {:pay, payment_required, []}}
+        {:error, _reason} = error -> error
+      end
     end
   end
 
-  @spec emit_siwx(:authenticated | :payment_required) :: :ok
-  defp emit_siwx(outcome),
-    do: Telemetry.emit(:client, :siwx, :ok, %{transport: :http, outcome: outcome})
+  @spec emit_siwx(:authenticated | :payment_required, String.t()) :: :ok
+  defp emit_siwx(outcome, chain_id),
+    do:
+      Telemetry.emit(:client, :siwx, :ok, %{
+        transport: :http,
+        chain_id: chain_id,
+        outcome: outcome
+      })
 
   # -- Budget -----------------------------------------------------------------
 

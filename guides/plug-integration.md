@@ -185,7 +185,12 @@ client.
 A route `:path` may be a template with `:param` segments. Each parameter
 matches exactly one non-empty path segment, and the captured values are
 assigned as `:x402_path_params` on every gated request — paid or not — so
-they are available to dynamic pricing functions, hooks, and your handler:
+they are available to dynamic pricing functions, hooks, and your handler.
+Matching preserves Plug's segment boundaries, including forwarded prefixes,
+and percent-decodes each segment once. For example, `r%2F1` is one parameter
+with value `"r/1"`, not two path components.
+
+Example:
 
 ```elixir
 %{

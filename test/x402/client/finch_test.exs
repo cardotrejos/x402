@@ -668,6 +668,23 @@ defmodule X402.Client.FinchTest do
     @evm_chain "eip155:8453"
     @solana_chain "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 
+    setup do
+      owner = self()
+      handler_id = "finch-siwx-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:x402, :client, :siwx],
+        fn _event, _measurements, metadata, _config ->
+          if self() == owner, do: send(owner, {:siwx, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+      :ok
+    end
+
     defp siwx_server_opts(bypass, chains \\ [@evm_chain]) do
       [
         domain: "localhost",
@@ -700,16 +717,6 @@ defmodule X402.Client.FinchTest do
       signer: signer
     } do
       test_pid = self()
-      handler_id = "finch-siwx-#{System.unique_integer([:positive])}"
-
-      :telemetry.attach(
-        handler_id,
-        [:x402, :client, :siwx],
-        fn _event, _measurements, metadata, _config -> send(test_pid, {:siwx, metadata}) end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
 
       Bypass.expect(bypass, "GET", "/premium", fn conn ->
         assert Conn.get_req_header(conn, "payment-signature") == []
@@ -737,7 +744,16 @@ defmodule X402.Client.FinchTest do
 
       assert_received {:authenticated, %{address: address, chain_id: @evm_chain}}
       assert address == signer.address
-      assert_received {:siwx, %{status: :ok, transport: :http, outcome: :authenticated}}
+
+      assert_received {:siwx,
+                       %{
+                         status: :ok,
+                         transport: :http,
+                         chain_id: @evm_chain,
+                         outcome: :authenticated
+                       }}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "falls back to payment with a fresh proof when the address is unknown", %{
@@ -795,6 +811,16 @@ defmodule X402.Client.FinchTest do
       assert_received {:consent, %{"extensions" => %{"sign-in-with-x" => %{"info" => info}}}}
       assert info["nonce"] == second_nonce
       refute_received {:consent, _payment_required}
+
+      assert_received {:siwx,
+                       %{
+                         status: :ok,
+                         transport: :http,
+                         chain_id: @evm_chain,
+                         outcome: :payment_required
+                       }}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "chain_id: :auto follows the signer family", %{bypass: bypass, finch: finch} do
@@ -822,6 +848,16 @@ defmodule X402.Client.FinchTest do
                )
 
       assert_received {:authenticated, @solana_chain}
+
+      assert_received {:siwx,
+                       %{
+                         status: :ok,
+                         transport: :http,
+                         chain_id: @solana_chain,
+                         outcome: :authenticated
+                       }}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "pays without a proof when the second 402 carries no challenge", %{
@@ -893,6 +929,14 @@ defmodule X402.Client.FinchTest do
                siwx: [chain_id: "eip155:1"]
              ) == {:error, {:siwx, :unsupported_chain}}
 
+      assert_received {:siwx,
+                       %{
+                         status: :error,
+                         transport: :http,
+                         chain_id: "eip155:1",
+                         reason: :unsupported_chain
+                       }}
+
       Bypass.expect_once(bypass, "GET", "/premium", fn conn ->
         challenge =
           SIWX.challenge(
@@ -917,6 +961,14 @@ defmodule X402.Client.FinchTest do
                siwx: [chain_id: @evm_chain]
              ) == {:error, {:siwx, :domain_mismatch}}
 
+      assert_received {:siwx,
+                       %{
+                         status: :error,
+                         transport: :http,
+                         chain_id: nil,
+                         reason: :domain_mismatch
+                       }}
+
       Bypass.expect_once(bypass, "GET", "/premium", fn conn ->
         respond_402_with_challenge(conn, bypass)
       end)
@@ -928,6 +980,16 @@ defmodule X402.Client.FinchTest do
                max_amount: "10000",
                siwx: [chain_id: :auto]
              ) == {:error, {:siwx, :unsupported_chain}}
+
+      assert_received {:siwx,
+                       %{
+                         status: :error,
+                         transport: :http,
+                         chain_id: nil,
+                         reason: :unsupported_chain
+                       }}
+
+      refute_received {:siwx, _metadata}
     end
 
     test "siwx: false and no challenge keep the plain payment flow", %{
@@ -971,6 +1033,8 @@ defmodule X402.Client.FinchTest do
                  max_amount: "10000",
                  siwx: [chain_id: @evm_chain]
                )
+
+      refute_received {:siwx, _metadata}
     end
 
     test "validates siwx options", %{finch: finch, signer: signer} do
