@@ -7,6 +7,11 @@ payment in request `_meta`, and the settlement receipt comes back in result
 `_meta`. This guide covers both halves — charging for a tool you serve, and
 paying for a tool you call.
 
+For local auth-capture escrow, configure `auth_capture_resource:` and return
+`{:ok, result_map, actual_amount}` from paid handlers. Funding precedes the
+handler; synchronous settlement or durable deferred metering precedes content.
+See [Auth-capture on EVM](auth-capture.html) for recovery and retained-budget rules.
+
 ## How a paid tool call happens
 
 1. The client calls a paid tool without payment. The server returns a tool

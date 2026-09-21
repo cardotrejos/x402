@@ -140,6 +140,11 @@ defmodule X402.MCP.Client do
       default: 60,
       doc: "Clock-skew buffer for the authorization's `validAfter`, in seconds."
     ],
+    auth_capture: [
+      type: {:custom, X402.Scheme.AuthCaptureEVM, :validate_options, []},
+      default: [],
+      doc: "Auth-capture signing options forwarded to `X402.Client.build_payment/3`."
+    ],
     on_payment_required: [
       type: {:or, [{:fun, 1}, nil]},
       default: nil,
@@ -382,8 +387,16 @@ defmodule X402.MCP.Client do
           {:ok, map()} | {:error, term()}
   defp settle_budget(result, opts, payload) do
     case Keyword.fetch!(opts, :budget) do
-      nil -> result
-      budget -> settle_budget(result, budget, payload, accepted?(result))
+      nil ->
+        result
+
+      budget ->
+        settle_budget(
+          result,
+          budget,
+          payload,
+          Budget.retain_after_dispatch?(payload) or accepted?(result)
+        )
     end
   end
 
@@ -458,6 +471,7 @@ defmodule X402.MCP.Client do
         :max_amount,
         :policies,
         :hooks,
+        :auth_capture,
         :valid_after_buffer
       ])
 

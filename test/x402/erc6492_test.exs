@@ -8,6 +8,16 @@ defmodule X402.ERC6492Test do
   @factory "0x2222222222222222222222222222222222222222"
   @zero_factory "0x0000000000000000000000000000000000000000"
 
+  test "already-decoded signatures preserve raw hex-prefix bytes and wrappers" do
+    assert {:ok, %{inner_signature: <<"0x", 1, 2>>, wrapped?: false}} =
+             ERC6492.parse_bytes(<<"0x", 1, 2>>)
+
+    {:ok, wrapped} = ERC6492.wrap(@factory, <<1>>, <<"0x", 2, 3>>)
+
+    assert {:ok, %{inner_signature: <<"0x", 2, 3>>, wrapped?: true}} =
+             ERC6492.parse_bytes(wrapped)
+  end
+
   describe "parse/1" do
     test "round-trips a wrapped signature built with wrap/3" do
       inner = :crypto.strong_rand_bytes(65)

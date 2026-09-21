@@ -84,11 +84,16 @@ been released. Tier C is in progress.
 ### 0.9.0 — advanced schemes, extensions, and operations
 
 - [ ] EVM bindings for the `batch-settlement` and `auth-capture` schemes
-- [ ] `auth-hints` and `http-message-signatures` extensions
+- [x] `auth-hints` and `http-message-signatures` extensions (unreleased)
 - [ ] `upto` on Solana
-- [ ] Metrics for LiveDashboard's Metrics page, without a Phoenix dependency
-- [ ] Per-wallet rate limiting in the gate
-- [ ] Multi-facilitator failover for `X402.Facilitator`
+- [x] Metrics for LiveDashboard's Metrics page, without a Phoenix dependency (unreleased)
+- [x] Per-wallet rate limiting in the gate (unreleased)
+- [x] Multi-facilitator failover for `X402.Facilitator` (unreleased)
+
+Auth-capture local execution and transport integration are under validation.
+See its [support and recovery limits](guides/auth-capture.md). The combined
+advanced-scheme milestone remains open until integration, validation, and
+publication are complete; local implementation is not a release.
 
 ### 1.0.0 — stable API
 

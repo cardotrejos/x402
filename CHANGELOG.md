@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **EVM auth-capture**: EIP-3009/Permit2 signing, v1.0/v1.1 encoders,
+  account-aware pinned verification, explicit-consent execution and receipt
+  reconciliation, durable multi-key store contracts, and metered escrow
+  resources. Plug/MCP adapters withhold output until synchronous settlement
+  or durable deferred metering. Dispatched client budgets retain the maximum
+  on all outcomes. The bundled ETS store is development-only; production
+  durability, recovery scheduling, and refund funding remain application-owned.
+- **Transaction signer callback**: dedicated `X402.Signer.sign_transaction/2`
+  dispatch for auth-capture execution, with complete type-2 transaction intent.
+  Existing facilitator execution paths are unchanged.
 - **Authentication extensions**: `X402.Extensions.AuthHints` builds and
   reads `auth-hints` declarations for OAuth2 and SIWX, scoped to accepted
   payment indexes. `X402.Extensions.HTTPMessageSignatures` advertises

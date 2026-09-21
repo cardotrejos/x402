@@ -54,7 +54,8 @@ defmodule X402.Scheme.RegistryTest do
       assert Registry.builtins() == [
                X402.Scheme.ExactEVM,
                X402.Scheme.ExactSVM,
-               X402.Scheme.UptoEVM
+               X402.Scheme.UptoEVM,
+               X402.Scheme.AuthCaptureEVM
              ]
     end
   end

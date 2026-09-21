@@ -165,6 +165,12 @@ budget is a cap on what the client has *authorized*, not a ledger of
 on-chain transfers. `reserve/3`, `release/3`, and `spent/1` are public for
 transports you drive yourself.
 
+Auth-capture is an exception to release-on-error: after dispatch, its entire
+maximum stays reserved on **every** outcome, including transport failures and
+renewed payment challenges. A hold or charge may already exist. Release exposure
+only after application reconciliation against trusted payment state. See
+[Auth-capture on EVM](auth-capture.html) for signing options and operational limits.
+
 ### Lifecycle hooks
 
 For anything beyond selection — auditing, pinning a different entry,

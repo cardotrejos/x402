@@ -228,6 +228,30 @@ defmodule X402.EIP3009 do
     end
   end
 
+  @doc since: "0.9.0"
+  @doc """
+  Computes the `ReceiveWithAuthorization` digest used by token collectors.
+
+  Uses the same six fields as `eip712_digest/2`, but a distinct type hash.
+  A receive authorization cannot be substituted for a transfer authorization.
+
+  ## Examples
+
+      iex> X402.EIP3009.receive_authorization_digest(%{}, %{})
+      {:error, {:missing_field, "from"}}
+  """
+  @spec receive_authorization_digest(map(), map()) :: {:ok, binary()} | {:error, encode_error()}
+  def receive_authorization_digest(domain, authorization)
+      when is_map(domain) and is_map(authorization) do
+    type =
+      "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+
+    with {:ok, words} <- authorization_words(authorization),
+         {:ok, hash} <- EIP712.hash_struct(type, words) do
+      EIP712.digest(domain, hash)
+    end
+  end
+
   @doc since: "0.6.0"
   @doc """
   Derives the lowercase EVM address for a 32-byte secp256k1 private key.

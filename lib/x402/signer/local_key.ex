@@ -76,13 +76,30 @@ defmodule X402.Signer.LocalKey do
           {:ok, X402.Signer.signature()} | {:error, term()}
   def sign_eip712(%__MODULE__{private_key: private_key}, digest, _typed_data)
       when is_binary(digest) and byte_size(digest) == 32 do
-    with {:ok, secp256k1_module} <- secp256k1_module(),
-         {:ok, {signature, recovery_id}} <- secp256k1_module.sign_compact(digest, private_key) do
-      {:ok, signature <> <<recovery_id + 27>>}
-    end
+    sign_digest(private_key, digest)
   end
 
   def sign_eip712(%__MODULE__{}, _digest, _typed_data), do: {:error, :invalid_digest}
+
+  @doc since: "0.9.0"
+  @doc """
+  Signs a transaction digest with the local key, without broadcasting.
+
+  The dispatcher computes the digest from the transaction. This callback
+  independently recomputes it and rejects a mismatched digest.
+  """
+  @impl X402.Signer
+  @spec sign_transaction(t(), binary(), X402.Transaction.t()) ::
+          {:ok, X402.Signer.signature()} | {:error, term()}
+  def sign_transaction(%__MODULE__{private_key: private_key}, digest, transaction) do
+    with {:ok, expected} <- X402.Transaction.digest(transaction),
+         true <- digest == expected do
+      sign_digest(private_key, digest)
+    else
+      false -> {:error, :invalid_digest}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   @doc since: "0.7.0"
   @doc """
@@ -97,15 +114,22 @@ defmodule X402.Signer.LocalKey do
   @impl X402.Signer
   @spec sign_message(t(), binary()) :: {:ok, String.t()} | {:error, term()}
   def sign_message(%__MODULE__{private_key: private_key}, message) when is_binary(message) do
-    with {:ok, secp256k1_module} <- secp256k1_module(),
-         {:ok, keccak_module} <- keccak_module(),
+    with {:ok, keccak_module} <- keccak_module(),
          digest = keccak_module.hash_256(@eth_sign_prefix <> "#{byte_size(message)}" <> message),
-         {:ok, {signature, recovery_id}} <- secp256k1_module.sign_compact(digest, private_key) do
-      {:ok, "0x" <> Base.encode16(signature <> <<recovery_id + 27>>, case: :lower)}
+         {:ok, signature} <- sign_digest(private_key, digest) do
+      {:ok, "0x" <> Base.encode16(signature, case: :lower)}
     end
   end
 
   def sign_message(%__MODULE__{}, _message), do: {:error, :invalid_message}
+
+  @spec sign_digest(binary(), binary()) :: {:ok, X402.Signer.signature()} | {:error, term()}
+  defp sign_digest(private_key, digest) do
+    with {:ok, secp256k1_module} <- secp256k1_module(),
+         {:ok, {signature, recovery_id}} <- secp256k1_module.sign_compact(digest, private_key) do
+      {:ok, signature <> <<recovery_id + 27>>}
+    end
+  end
 
   @spec normalize_key(binary()) :: {:ok, binary()} | {:error, :invalid_private_key}
   defp normalize_key(key) when byte_size(key) == 32, do: {:ok, key}

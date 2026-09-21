@@ -138,6 +138,7 @@ defmodule X402.MixProject do
         "guides/getting-started.md": [title: "Getting Started"],
         "guides/client.md": [title: "Paying for Resources"],
         "guides/authentication.md": [title: "Authentication Extensions"],
+        "guides/auth-capture.md": [title: "Auth-capture on EVM"],
         "guides/plug-integration.md": [title: "Plug/Phoenix Integration"],
         "guides/custom-schemes.md": [title: "Custom Payment Schemes"],
         "guides/mcp.md": [title: "Paid MCP Tools"],
@@ -201,6 +202,7 @@ defmodule X402.MixProject do
           X402.Scheme.ExactEVM,
           X402.Scheme.ExactSVM,
           X402.Scheme.UptoEVM,
+          X402.Scheme.AuthCaptureEVM,
           X402.Scheme.EVM
         ],
         "MCP Transport": [
@@ -209,6 +211,7 @@ defmodule X402.MixProject do
           X402.MCP.Client
         ],
         "Local Verification": [
+          X402.Verify.AuthCaptureEVM,
           X402.Verify.EVM,
           X402.Verify.SVM,
           X402.RPC,
@@ -223,6 +226,16 @@ defmodule X402.MixProject do
           X402.Plug.Facilitator,
           X402.RLP,
           X402.Transaction
+        ],
+        "Auth-capture": [
+          X402.AuthCapture,
+          X402.AuthCapture.EVM,
+          X402.AuthCapture.Engine,
+          X402.AuthCapture.Resource,
+          X402.AuthCapture.Store,
+          X402.AuthCapture.ETSStore,
+          X402.AuthCapture.Journal,
+          X402.AuthCapture.Receipt
         ],
         Solana: [
           X402.Solana,

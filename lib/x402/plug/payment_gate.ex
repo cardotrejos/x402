@@ -366,6 +366,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @behaviour Plug
 
+    alias X402.AuthCapture.Transport, as: AuthCaptureTransport
     alias X402.EIP712
     alias X402.Extension
     alias X402.Extensions.Bazaar
@@ -385,6 +386,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     alias X402.PaymentResponse
     alias X402.PaymentSignature
     alias X402.Paywall
+    alias X402.Plug.AuthCapture, as: AuthCapturePlug
     alias X402.RateLimiter
     alias X402.RPC
     alias X402.Scheme
@@ -408,7 +410,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       ]
 
     @http_methods [:any, :delete, :get, :head, :options, :patch, :post, :put, :trace]
-    @route_schemes ["exact", "upto"]
+    @route_schemes ["exact", "upto", "auth-capture"]
     @x402_version 2
     @supported_payment_flow "authorization"
     @settlement_amount_private :x402_settlement_amount
@@ -652,6 +654,17 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     ]
 
     @options_schema [
+      auth_capture: [
+        type: {:custom, AuthCapturePlug, :validate, []},
+        default: nil,
+        doc: """
+        Local escrow execution, `[resource: resource, handler: fn conn -> conn end]`.
+        The handler must set an actual amount with `put_settlement_amount/2`.
+        Responses and callbacks are buffered. Streaming, files, upgrades and
+        early hints are unsupported. Deferred results do not grant SIWX access.
+        See the auth-capture guide for durable recovery and output limits.
+        """
+      ],
       facilitator: [
         type: :any,
         default: Facilitator,
@@ -812,6 +825,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     @typedoc "Configuration map produced by `init/1`."
     @type options :: %{
+            auth_capture: map() | nil,
             facilitator: Facilitator.server(),
             hooks: module(),
             payment_identifier_cache: Cache.adapter() | nil,
@@ -1142,6 +1156,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
 
       %{
+        auth_capture: Keyword.fetch!(validated_opts, :auth_capture),
         facilitator: Keyword.fetch!(validated_opts, :facilitator),
         hooks: Keyword.fetch!(validated_opts, :hooks),
         payment_identifier_cache: cache,
@@ -1721,9 +1736,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         |> assign(:x402_payment_requirements, requirements)
         |> maybe_assign_client_payment_id(client_payment_id)
         |> maybe_assign_extension_responses(verify_response)
-        |> register_before_send(fn response_conn ->
-          settle_after_resource(response_conn, settlement_context)
-        end)
+        |> prepare_resource(opts, settlement_context)
       else
         # A rate-limited request already emitted [:x402, :plug, :rate_limited];
         # it is not a payment rejection.
@@ -1758,6 +1771,61 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
             siwx: opts.siwx
           )
       end
+    end
+
+    @spec prepare_resource(Plug.Conn.t(), options(), settlement_context()) :: Plug.Conn.t()
+    defp prepare_resource(conn, opts, context) do
+      case Utils.map_value(context.requirements, {"scheme", :scheme}) do
+        "auth-capture" ->
+          {result, conn} =
+            AuthCapturePlug.run(
+              opts.auth_capture,
+              conn,
+              context.payment_payload,
+              context.requirements
+            )
+
+          complete_auth_capture(result, conn, context)
+
+        _scheme ->
+          register_before_send(conn, &settle_after_resource(&1, context))
+      end
+    end
+
+    @spec complete_auth_capture(tuple(), Plug.Conn.t(), settlement_context()) :: Plug.Conn.t()
+    defp complete_auth_capture({:ok, response, receipt}, conn, context) do
+      context = if receipt.status == :deferred, do: %{context | siwx: nil}, else: context
+      body = AuthCaptureTransport.response(receipt, context.requirements)
+
+      conn
+      |> AuthCapturePlug.restore(response)
+      |> complete_successful_settlement(%{status: 200, body: body}, context)
+      |> send_resp()
+      |> halt()
+    end
+
+    defp complete_auth_capture({:not_admitted, reason}, conn, context) do
+      release_claims(context)
+      complete_auth_capture({:error, reason}, conn, context)
+    end
+
+    defp complete_auth_capture(result, conn, context) do
+      # Local funding or handler execution may already be durable. Only the
+      # application recovery API can continue it; never release these claims.
+      emit(:payment_rejected, %{
+        method: context.request_method,
+        path: context.request_path,
+        route: context.route.path,
+        reason: :auth_capture_unresolved
+      })
+
+      status = if match?({:pending, _}, result), do: 503, else: 500
+
+      %{conn | private: Map.delete(conn.private, :before_send), resp_cookies: %{}}
+      |> internal_error_conn()
+      |> resp(status, "{}")
+      |> send_resp()
+      |> halt()
     end
 
     # Runs only after verification succeeded: the payer of an unverified
@@ -2302,6 +2370,11 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     @spec verify_payment(options(), map(), map()) :: {:ok, map()} | {:error, term()}
+    defp verify_payment(opts, payment_payload, %{"scheme" => "auth-capture"} = requirements) do
+      resource = if opts.auth_capture, do: opts.auth_capture.resource
+      AuthCaptureTransport.verify(resource, payment_payload, requirements)
+    end
+
     defp verify_payment(opts, payment_payload, requirements) do
       with :ok <- run_local_verification(opts, payment_payload, requirements),
            {:ok, verify_response} <-
@@ -2480,7 +2553,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     defp ensure_supported_payment_flow(%{accepts: accepts})
          when is_list(accepts) and accepts != [] do
       Enum.reduce_while(accepts, :ok, fn accept, :ok ->
-        case ensure_authorization_flow(Map.get(accept, :extra, %{})) do
+        case ensure_accept_flow(accept) do
           :ok -> {:cont, :ok}
           {:error, reason} -> {:halt, {:error, reason}}
         end
@@ -2488,8 +2561,18 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     end
 
     defp ensure_supported_payment_flow(route) do
-      ensure_authorization_flow(Map.get(route, :extra, %{}))
+      ensure_accept_flow(route)
     end
+
+    @spec ensure_accept_flow(map()) :: :ok | {:error, String.t()}
+    defp ensure_accept_flow(%{scheme: "auth-capture", extra: extra}) do
+      case Utils.map_value(extra, {"paymentFlow", :paymentFlow}) do
+        "escrow" -> :ok
+        _flow -> {:error, "auth-capture routes require explicit escrow flow"}
+      end
+    end
+
+    defp ensure_accept_flow(accept), do: ensure_authorization_flow(Map.get(accept, :extra, %{}))
 
     @spec ensure_authorization_flow(map()) :: :ok | {:error, String.t()}
     defp ensure_authorization_flow(extra) do
@@ -2814,6 +2897,9 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     # "permit2") carries `permit2Authorization` instead. Select from the
     # matched requirements, never from attacker-added unsigned payload fields.
     @spec derive_replay_key(term(), term(), term(), map()) :: {:ok, String.t()} | :error
+    defp derive_replay_key("auth-capture", _network, payload, requirements),
+      do: AuthCaptureTransport.replay_key(payload, requirements)
+
     defp derive_replay_key(
            "exact",
            "eip155:" <> _reference = network,

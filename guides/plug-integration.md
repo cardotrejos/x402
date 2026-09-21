@@ -22,6 +22,7 @@ The plug accepts these options (validated via `NimbleOptions`):
 | `:siwx` | `keyword()` | no | `nil` | Sign-In-With-X configuration — `X402.Extensions.SIWX.Server.new/1` options (`:domain`, `:uri`, `:supported_chains` required); see "Sign-In-With-X" |
 | `:extensions` | `[module() \| {module(), keyword()}]` | no | `[]` | `X402.Extension` adapters that advertise, validate, and observe protocol extensions on every gated request; see "Extension Adapters" |
 | `:rate_limit` | `keyword()` | no | `nil` | Per-wallet verified-payment limit; requires `:limit` and `:window_ms` |
+| `:auth_capture` | `keyword()` | no | `nil` | Explicit escrow `resource` and buffered `handler`; see [Auth-capture](auth-capture.html) |
 
 > **Important:** When `:payment_identifier_cache` is not configured, the plug
 > emits a runtime warning. Without it, concurrent identical requests can

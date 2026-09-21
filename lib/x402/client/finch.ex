@@ -146,6 +146,11 @@ defmodule X402.Client.Finch do
       default: 60,
       doc: "Clock-skew buffer for the authorization's `validAfter`, in seconds."
     ],
+    auth_capture: [
+      type: {:custom, X402.Scheme.AuthCaptureEVM, :validate_options, []},
+      default: [],
+      doc: "Auth-capture signing options forwarded to `X402.Client.build_payment/3`."
+    ],
     extensions: [
       type: {:list, {:fun, 2}},
       default: [],
@@ -449,8 +454,16 @@ defmodule X402.Client.Finch do
           {:ok, map()} | {:error, term()}
   defp settle_budget(result, opts, payload) do
     case Keyword.fetch!(opts, :budget) do
-      nil -> result
-      budget -> settle_budget(result, budget, payload, accepted?(result))
+      nil ->
+        result
+
+      budget ->
+        settle_budget(
+          result,
+          budget,
+          payload,
+          Budget.retain_after_dispatch?(payload) or accepted?(result)
+        )
     end
   end
 
@@ -535,6 +548,7 @@ defmodule X402.Client.Finch do
         :max_amount,
         :policies,
         :hooks,
+        :auth_capture,
         :valid_after_buffer,
         :extensions,
         :schemes

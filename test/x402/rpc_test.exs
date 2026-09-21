@@ -10,6 +10,28 @@ defmodule X402.RPCTest do
   setup :setup_bypass
   setup :setup_finch
 
+  test "quantity decoding is canonical and uint256 bounded" do
+    assert RPC.decode_quantity("0x0") == {:ok, 0}
+    assert RPC.decode_quantity("0xAb") == {:ok, 171}
+
+    assert RPC.decode_quantity("0x" <> String.duplicate("f", 64)) ==
+             {:ok, :binary.decode_unsigned(:binary.copy(<<255>>, 32))}
+
+    for value <- [
+          nil,
+          1,
+          "0x",
+          "0x00",
+          "0x+1",
+          "0x-1",
+          "0x1\n",
+          "0X1",
+          "0x" <> String.duplicate("f", 65)
+        ] do
+      assert RPC.decode_quantity(value) == {:error, :invalid_quantity}
+    end
+  end
+
   defp rpc(%{bypass: bypass, finch: finch}, opts \\ []) do
     {:ok, rpc} =
       RPC.new(Keyword.merge([rpc_url: "http://localhost:#{bypass.port}", finch: finch], opts))
