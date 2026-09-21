@@ -34,6 +34,11 @@ defmodule X402.Facilitator.Engine do
   | `exact` | `"permit2"`                 | `x402ExactPermit2Proxy.settle(...)`             |
   | `upto`  | —                           | `x402UptoPermit2Proxy.settle(...)` for `amount` |
 
+  The requirements select the authorization used throughout verification,
+  settlement, payer reporting, pending lookup, and receipt checking. Extra
+  unsigned authorization objects do not change that selection; a missing
+  selected authorization never falls back to another transfer method.
+
   For `upto` the requirements' `extra.facilitatorAddress` must be this
   engine's signer address (the proxy only accepts the witness facilitator
   as sender); other facilitators' payments are rejected with
@@ -134,6 +139,7 @@ defmodule X402.Facilitator.Engine do
   alias X402.Hooks.Context
   alias X402.Permit2
   alias X402.RPC
+  alias X402.Scheme.ExactEVM
   alias X402.Signer
   alias X402.Telemetry
   alias X402.Transaction
@@ -365,7 +371,7 @@ defmodule X402.Facilitator.Engine do
           |> handle_verify_result(engine, before_context, metadata)
 
         {:halt, reason} ->
-          {:ok, invalid_response(stringify_reason(reason), payer(payment_payload))}
+          {:ok, invalid_response(stringify_reason(reason), payer(payment_payload, requirements))}
 
         {:error, reason} ->
           {:error, reason}
@@ -408,7 +414,7 @@ defmodule X402.Facilitator.Engine do
              stringify_reason(reason),
              "",
              network(requirements, payment_payload),
-             payer(payment_payload)
+             payer(payment_payload, requirements)
            )}
 
         {:error, reason} ->
@@ -500,7 +506,7 @@ defmodule X402.Facilitator.Engine do
         delegate_verify(engine, payload, requirements, simulate)
 
       {:unsupported, reason_string} ->
-        {:invalid, invalid_response(reason_string, payer(payload))}
+        {:invalid, invalid_response(reason_string, payer(payload, requirements))}
 
       {:error, reason} ->
         {:error, reason}
@@ -526,7 +532,7 @@ defmodule X402.Facilitator.Engine do
         {:valid, put_payer(%{"isValid" => true}, verified_payer), signature_type, kind}
 
       {:error, {:invalid, reason}} ->
-        {:invalid, invalid_response(EVM.reason_string(reason), payer(payload))}
+        {:invalid, invalid_response(EVM.reason_string(reason), payer(payload, requirements))}
 
       {:error, reason} ->
         {:error, reason}
@@ -634,7 +640,7 @@ defmodule X402.Facilitator.Engine do
 
   @spec settle_context(t(), map(), map()) :: settle_context()
   defp settle_context(engine, payload, requirements) do
-    payer = payer(payload)
+    payer = payer(payload, requirements)
     scheme = Utils.map_value(requirements, {"scheme", :scheme})
 
     %{
@@ -654,7 +660,7 @@ defmodule X402.Facilitator.Engine do
       event: %{
         asset: asset(requirements),
         from: payer,
-        to: transfer_recipient(payload),
+        to: transfer_recipient(payload, requirements),
         value: transfer_value(payload, requirements)
       },
       failed_reason:
@@ -666,9 +672,9 @@ defmodule X402.Facilitator.Engine do
     }
   end
 
-  @spec transfer_recipient(map()) :: term()
-  defp transfer_recipient(payload) do
-    case authorization_kind(payload) do
+  @spec transfer_recipient(map(), map()) :: term()
+  defp transfer_recipient(payload, requirements) do
+    case authorization_kind(payload, requirements) do
       {:eip3009, authorization} ->
         Utils.map_value(authorization, {"to", :to})
 
@@ -684,7 +690,8 @@ defmodule X402.Facilitator.Engine do
   # requirements' amount (at most the signed ceiling).
   @spec transfer_value(map(), map()) :: term()
   defp transfer_value(payload, requirements) do
-    case {authorization_kind(payload), Utils.map_value(requirements, {"scheme", :scheme})} do
+    case {authorization_kind(payload, requirements),
+          Utils.map_value(requirements, {"scheme", :scheme})} do
       {{:eip3009, authorization}, _scheme} ->
         Utils.map_value(authorization, {"value", :value})
 
@@ -754,7 +761,7 @@ defmodule X402.Facilitator.Engine do
   # the two shapes can never alias each other.
   @spec key_fields(map(), map()) :: [term()]
   defp key_fields(payload, requirements) do
-    case authorization_kind(payload) do
+    case authorization_kind(payload, requirements) do
       {:eip3009, authorization} ->
         [
           "eip3009",
@@ -1052,7 +1059,7 @@ defmodule X402.Facilitator.Engine do
           {:ok, binary()} | {:error, term()}
   defp build_calldata(kind, payload, requirements, inner_signature, signature_type) do
     result =
-      case {kind, authorization_kind(payload)} do
+      case {kind, authorization_kind(payload, requirements)} do
         {:eip3009, {:eip3009, authorization}} ->
           EIP3009.transfer_calldata(authorization, inner_signature, signature_type)
 
@@ -1676,33 +1683,48 @@ defmodule X402.Facilitator.Engine do
     end
   end
 
-  @spec payer(map()) :: String.t() | nil
-  defp payer(payload) do
-    case authorization_kind(payload) do
+  @spec payer(map(), map()) :: String.t() | nil
+  defp payer(payload, requirements) do
+    case authorization_kind(payload, requirements) do
       {_kind, authorization} -> Utils.map_value(authorization, {"from", :from})
       :none -> nil
     end
   end
 
-  # The scheme payload carries exactly one authorization object; its key
-  # tells the flow apart before any verification runs.
-  @spec authorization_kind(map()) :: {:eip3009 | :permit2, map()} | :none
-  defp authorization_kind(payload) do
-    scheme_payload =
-      case Utils.map_value(payload, {"payload", :payload}) do
-        %{} = scheme_payload -> scheme_payload
-        _other -> %{}
-      end
-
-    eip3009 = Utils.map_value(scheme_payload, {"authorization", :authorization})
-    permit2 = Utils.map_value(scheme_payload, {"permit2Authorization", :permit2Authorization})
-
-    cond do
-      is_map(eip3009) -> {:eip3009, eip3009}
-      is_map(permit2) -> {:permit2, permit2}
-      true -> :none
+  # Match verification's requirements-selected method everywhere, including
+  # pre-verification pending lookup. Extra unsigned authorization objects must
+  # never select calldata, payer identity, pending keys, or receipt fields.
+  @spec authorization_kind(map(), map()) :: {:eip3009 | :permit2, map()} | :none
+  defp authorization_kind(payload, requirements) do
+    with {:ok, method} <- authorization_method(requirements),
+         %{} = authorization <-
+           Utils.nested_map_value(payload, [{"payload", :payload}, authorization_field(method)]) do
+      {method, authorization}
+    else
+      _missing_or_unsupported -> :none
     end
   end
+
+  @spec authorization_method(map()) :: {:ok, ExactEVM.transfer_method()} | :error
+  defp authorization_method(requirements) do
+    case Utils.map_value(requirements, {"scheme", :scheme}) do
+      "upto" ->
+        {:ok, :permit2}
+
+      "exact" ->
+        case ExactEVM.transfer_method(requirements) do
+          {:ok, method} -> {:ok, method}
+          {:error, _reason} -> :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  @spec authorization_field(ExactEVM.transfer_method()) :: {String.t(), atom()}
+  defp authorization_field(:eip3009), do: {"authorization", :authorization}
+  defp authorization_field(:permit2), do: {"permit2Authorization", :permit2Authorization}
 
   @spec network(map(), map()) :: String.t()
   defp network(requirements, payload) do
