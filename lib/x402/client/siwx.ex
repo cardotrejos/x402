@@ -292,11 +292,9 @@ defmodule X402.Client.SIWX do
   @spec url_domains(String.t()) :: [String.t()]
   defp url_domains(url) do
     case URI.parse(url) do
-      %URI{host: host, port: port} when is_binary(host) and is_integer(port) ->
-        [host, "#{host}:#{port}"]
-
-      %URI{host: host} when is_binary(host) ->
-        [host]
+      %URI{host: host, port: port} when is_binary(host) ->
+        host = if String.contains?(host, ":"), do: "[" <> host <> "]", else: host
+        if is_integer(port), do: [host, "#{host}:#{port}"], else: [host]
 
       _uri ->
         []

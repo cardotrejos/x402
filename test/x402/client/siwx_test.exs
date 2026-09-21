@@ -221,6 +221,61 @@ defmodule X402.Client.SIWXTest do
   end
 
   describe "authenticate/4 origin binding" do
+    test "accepts bracketed IPv6 URI pins without rewriting the signed challenge" do
+      for {domain, uri} <- [
+            {"[::1]:3000", "http://[::1]:3000/tools/test"},
+            {"[::1]:80", "http://[::1]:80/tools/test"},
+            {"[2001:DB8::1]", "https://[2001:DB8::1]/tools/test"},
+            {"[2001:db8::1]:443", "https://[2001:db8::1]:443/tools/test"}
+          ],
+          context <- [[transport: :mcp], [transport: :http, resource_url: uri]] do
+        ipv6 = challenge(domain: domain, uri: uri)
+
+        assert {:ok, proof} =
+                 ClientSIWX.authenticate(
+                   payment_required(ipv6),
+                   evm_signer(),
+                   [chain_id: @evm_chain, domain: domain, uri: uri],
+                   context
+                 )
+
+        assert {:ok, {:spec, fields}} = SIWX.decode_signed(proof.header)
+        assert fields["domain"] == domain
+        assert fields["uri"] == uri
+      end
+    end
+
+    test "derives bracketed IPv6 domains from the HTTP resource URL" do
+      uri = "http://[::1]:3000/tools/test"
+
+      for domain <- ["[::1]", "[::1]:3000"],
+          opts <- [[chain_id: @evm_chain], [chain_id: @evm_chain, uri: uri]] do
+        assert {:ok, _proof} =
+                 ClientSIWX.authenticate(
+                   payment_required(challenge(domain: domain, uri: uri)),
+                   evm_signer(),
+                   opts,
+                   transport: :http,
+                   resource_url: uri
+                 )
+      end
+    end
+
+    test "IPv6 URI pins reject other hosts and ports before consent" do
+      uri = "http://[::1]:3000/tools/test"
+
+      for domain <- ["[::2]:3000", "[::1]:3001", "::1:3000"] do
+        assert {:error, {:siwx, :domain_mismatch}} =
+                 ClientSIWX.authenticate(
+                   payment_required(challenge(domain: domain, uri: uri)),
+                   evm_signer(),
+                   [chain_id: @evm_chain, domain: domain, uri: uri],
+                   transport: :mcp,
+                   before_sign: fn -> flunk("mismatched IPv6 domain reached consent") end
+                 )
+      end
+    end
+
     test "matches domain case without rewriting the signed challenge" do
       mixed = challenge(domain: "API.Example.COM:8443", uri: "https://API.Example.COM:8443")
 
