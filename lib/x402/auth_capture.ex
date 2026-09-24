@@ -701,12 +701,7 @@ defmodule X402.AuthCapture do
   """
   @spec complete_charge(map(), keyword()) :: {:ok, map()} | {:error, term()}
   def complete_charge(envelope, opts \\ []) when is_map(envelope) and is_list(opts) do
-    requirements =
-      case Utils.map_value(envelope, {"accepted", :accepted}) do
-        %{} = requirements -> requirements
-        _other -> %{}
-      end
-
+    requirements = Utils.map_value(envelope, {"accepted", :accepted})
     payload = inner(envelope)
 
     with {:ok, opts} <- validate(opts, @charge_schema),
