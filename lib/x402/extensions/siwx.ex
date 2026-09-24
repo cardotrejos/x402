@@ -194,7 +194,7 @@ defmodule X402.Extensions.SIWX do
 
   # -- Spec format ------------------------------------------------------------
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the extension key on the wire.
 
@@ -218,7 +218,7 @@ defmodule X402.Extensions.SIWX do
   @spec header_name() :: String.t()
   def header_name, do: "SIGN-IN-WITH-X"
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the JSON schema of a proof, advertised under `schema`.
 
@@ -230,7 +230,7 @@ defmodule X402.Extensions.SIWX do
   @spec schema() :: map()
   defdelegate schema(), to: Challenge
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Generates a challenge nonce: 32 lowercase hex characters from 16 random
   bytes.
@@ -244,7 +244,7 @@ defmodule X402.Extensions.SIWX do
   @spec generate_nonce() :: String.t()
   defdelegate generate_nonce(), to: Challenge
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Builds the server-side challenge advertised under
   `PaymentRequired.extensions["sign-in-with-x"]`.
@@ -278,7 +278,7 @@ defmodule X402.Extensions.SIWX do
   @spec challenge(keyword()) :: map()
   defdelegate challenge(opts), to: Challenge, as: :build
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Builds the CAIP-122 message text a wallet signs for a fields map.
 
@@ -302,7 +302,7 @@ defmodule X402.Extensions.SIWX do
   @spec message(map()) :: {:ok, String.t()} | {:error, Message.build_error()}
   defdelegate message(fields), to: Message, as: :build
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Signs a challenge with an `X402.Signer`, producing the proof fields.
 
@@ -431,7 +431,7 @@ defmodule X402.Extensions.SIWX do
     end
   end
 
-  @doc since: "0.7.0", group: :headers
+  @doc since: "0.9.0", group: :headers
   @doc """
   Encodes signed proof fields as a `SIGN-IN-WITH-X` header value.
 
@@ -476,7 +476,7 @@ defmodule X402.Extensions.SIWX do
     end
   end
 
-  @doc since: "0.7.0", group: :headers
+  @doc since: "0.9.0", group: :headers
   @doc """
   Decodes a `SIGN-IN-WITH-X` header value.
 
@@ -539,7 +539,7 @@ defmodule X402.Extensions.SIWX do
 
   defp classify_proof(_decoded), do: {:error, :invalid_payload}
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Validates and normalizes spec-format proof fields.
 
@@ -654,7 +654,7 @@ defmodule X402.Extensions.SIWX do
 
   defp maybe_put_resources(map, _resources), do: map
 
-  @doc since: "0.7.0", group: :verification
+  @doc since: "0.9.0", group: :verification
   @doc """
   Verifies a decoded (or raw) `SIGN-IN-WITH-X` proof against the server's
   configuration.

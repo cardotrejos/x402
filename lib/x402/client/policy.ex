@@ -30,7 +30,7 @@ defmodule X402.Client.Policy do
   @typedoc "A selection policy."
   @type t :: (map(), map() | nil -> boolean() | {:error, term()})
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Accepts entries whose `amount` (atomic units) does not exceed `limit`.
 
@@ -62,7 +62,7 @@ defmodule X402.Client.Policy do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Accepts entries on one of the given CAIP-2 networks.
 
@@ -88,7 +88,7 @@ defmodule X402.Client.Policy do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Accepts entries paying with one of the given assets (compared
   case-insensitively).
@@ -113,7 +113,7 @@ defmodule X402.Client.Policy do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Accepts entries using one of the given schemes.
 

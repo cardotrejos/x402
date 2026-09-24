@@ -72,7 +72,7 @@ defmodule X402.Extension do
 
   @optional_callbacks init: 1, advertise: 2, validate: 3, after_verify: 4, after_settle: 4
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Validates one `:extensions` entry and normalizes it to `{module, opts}`.
 
@@ -119,7 +119,7 @@ defmodule X402.Extension do
     "expected a module implementing X402.Extension (key/0), got: #{inspect(value)}"
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Merges every adapter's advertisement over a base extensions map.
 
@@ -152,7 +152,7 @@ defmodule X402.Extension do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Runs every adapter's `c:validate/3` over the echoed and advertised maps.
 
@@ -211,7 +211,7 @@ defmodule X402.Extension do
   defp string_key(key) when is_atom(key), do: Atom.to_string(key)
   defp string_key(key), do: key
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Notifies every adapter defining `c:after_verify/4`.
 
@@ -223,7 +223,7 @@ defmodule X402.Extension do
     notify_all(entries, :after_verify, [payload, requirements, result])
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Notifies every adapter defining `c:after_settle/4`.
 

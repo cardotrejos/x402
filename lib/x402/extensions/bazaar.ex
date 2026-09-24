@@ -329,7 +329,7 @@ defmodule X402.Extensions.Bazaar do
       Enum.map(resources, & &1.resource)
   """
   @doc group: :discovery
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @spec search(Facilitator.server() | keyword(), keyword()) ::
           {:ok, search_response()}
           | {:error, Error.t() | NimbleOptions.ValidationError.t() | term()}

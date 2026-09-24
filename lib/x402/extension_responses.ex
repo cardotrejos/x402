@@ -31,7 +31,7 @@ defmodule X402.ExtensionResponses do
   @type encode_error :: :invalid_responses | :invalid_json
   @type decode_error :: :invalid_base64 | :invalid_json | :invalid_responses | :payload_too_large
 
-  @doc since: "0.7.0", group: :headers
+  @doc since: "0.9.0", group: :headers
   @doc """
   Returns the canonical sidechannel header name.
 
@@ -43,7 +43,7 @@ defmodule X402.ExtensionResponses do
   @spec header_name() :: String.t()
   def header_name, do: "EXTENSION-RESPONSES"
 
-  @doc since: "0.7.0", group: :headers
+  @doc since: "0.9.0", group: :headers
   @doc """
   Encodes extension outcomes to a Base64 header value.
 
@@ -72,7 +72,7 @@ defmodule X402.ExtensionResponses do
 
   def encode(_responses), do: {:error, :invalid_responses}
 
-  @doc since: "0.7.0", group: :headers
+  @doc since: "0.9.0", group: :headers
   @doc """
   Decodes a Base64 `EXTENSION-RESPONSES` value to a map of outcomes.
 
@@ -106,7 +106,7 @@ defmodule X402.ExtensionResponses do
 
   def decode(_value), do: {:error, :invalid_base64}
 
-  @doc since: "0.7.0", group: :headers
+  @doc since: "0.9.0", group: :headers
   @doc """
   Extracts and decodes the sidechannel from a list of response headers.
 
@@ -136,7 +136,7 @@ defmodule X402.ExtensionResponses do
 
   def from_headers(_headers), do: {:ok, nil}
 
-  @doc since: "0.7.0", group: :headers
+  @doc since: "0.9.0", group: :headers
   @doc """
   Decodes the sidechannel from response headers, dropping malformed values.
 

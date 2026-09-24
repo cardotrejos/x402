@@ -41,7 +41,7 @@ defmodule X402.Extensions.Bazaar.Metadata do
   @typedoc "A string-keyed `ResourceInfo` map as carried on the wire."
   @type resource :: %{optional(String.t()) => term()}
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Checks a `serviceName` value.
 
@@ -68,7 +68,7 @@ defmodule X402.Extensions.Bazaar.Metadata do
   @spec valid_service_name?(term()) :: boolean()
   def valid_service_name?(name), do: printable_ascii_text?(name)
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Sanitizes a `tags` value.
 
@@ -98,7 +98,7 @@ defmodule X402.Extensions.Bazaar.Metadata do
 
   def sanitize_tags(_tags), do: []
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Checks an `iconUrl` value.
 
@@ -144,7 +144,7 @@ defmodule X402.Extensions.Bazaar.Metadata do
 
   def valid_icon_url?(_url), do: false
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Applies the soft-drop rules to a string-keyed `ResourceInfo` map.
 
@@ -177,7 +177,7 @@ defmodule X402.Extensions.Bazaar.Metadata do
     |> sanitize_tags_field()
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Checks a `routeTemplate` value.
 
@@ -213,7 +213,7 @@ defmodule X402.Extensions.Bazaar.Metadata do
 
   def valid_route_template?(_template), do: false
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the validated `routeTemplate` of a bazaar extension map, or `nil`.
 

@@ -127,7 +127,7 @@ defmodule X402.Extensions.SIWX.Challenge do
   @spec opts_schema() :: keyword()
   def opts_schema, do: @opts_schema
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the JSON schema advertised under `schema`.
 
@@ -139,7 +139,7 @@ defmodule X402.Extensions.SIWX.Challenge do
   @spec schema() :: map()
   def schema, do: @schema
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Generates a nonce: 32 lowercase hex characters from 16 random bytes.
 
@@ -154,7 +154,7 @@ defmodule X402.Extensions.SIWX.Challenge do
     @nonce_bytes |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower)
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Builds the `sign-in-with-x` advertisement map.
 
@@ -213,7 +213,7 @@ defmodule X402.Extensions.SIWX.Challenge do
     }
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Formats a `DateTime` as ISO 8601 UTC with millisecond precision.
 

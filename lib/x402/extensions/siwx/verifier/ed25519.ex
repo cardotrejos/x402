@@ -28,7 +28,7 @@ defmodule X402.Extensions.SIWX.Verifier.Ed25519 do
     Base.decode16!("26E8958FC2B227B045C3F489F2EF98F0D5DFAC05D3C63339B13802886D53FC85")
   ]
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Verifies a Base58 Ed25519 signature over `message` for a Base58 address.
 

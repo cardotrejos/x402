@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-24
+
+This release includes all changes merged since 0.6.1: the spec-conformance
+and ecosystem-parity work originally planned for 0.7.0 and 0.8.0, plus
+auth-capture, authentication, operations, and documentation cleanup.
+Versions 0.7.0 and 0.8.0 were not published separately.
+
 ### Added
 
 - **EVM auth-capture**: EIP-3009/Permit2 signing, v1.0/v1.1 encoders,
@@ -370,6 +377,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Update the repository lockfile to Mint `1.10.1`, which fixes
+  [CVE-2026-82672](https://github.com/elixir-mint/mint/security/advisories/GHSA-rj5m-69wp-cxq9).
+  Applications using Finch should run `mix deps.update mint` to update their
+  own lockfiles; upgrading x402 alone does not update a locked transitive dependency.
 - Pin every GitHub Actions step in `.github/workflows/ci.yml` to a commit
   SHA (with the tag recorded in a comment) and grant the workflow
   least-privilege `permissions: contents: read`

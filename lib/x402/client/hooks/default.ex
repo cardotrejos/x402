@@ -10,7 +10,7 @@ defmodule X402.Client.Hooks.Default do
 
   alias X402.Client.Hooks.Context
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Continues payment creation without changes.
 
@@ -23,14 +23,14 @@ defmodule X402.Client.Hooks.Default do
   @spec before_payment(Context.t(), map()) :: {:cont, Context.t()}
   def before_payment(%Context{} = context, _metadata), do: {:cont, context}
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Continues after payment creation without changes.
   """
   @spec after_payment(Context.t(), map()) :: {:cont, Context.t()}
   def after_payment(%Context{} = context, _metadata), do: {:cont, context}
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Continues failure handling without changes.
   """

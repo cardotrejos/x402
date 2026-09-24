@@ -92,7 +92,7 @@ defmodule X402.Client.SIWX do
           | SIWX.sign_error()
           | SIWX.signed_encode_error()
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Validates a driver's `:siwx` option.
 
@@ -125,7 +125,7 @@ defmodule X402.Client.SIWX do
 
   def validate_opts(_opts), do: {:error, "expected nil, false, or a keyword list"}
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Fetches the advertised challenge from a `PaymentRequired` map.
 
@@ -152,7 +152,7 @@ defmodule X402.Client.SIWX do
 
   def fetch_challenge(_payment_required), do: :error
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Signs the challenge advertised in a `PaymentRequired` map.
 

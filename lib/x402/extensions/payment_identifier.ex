@@ -112,7 +112,7 @@ defmodule X402.Extensions.PaymentIdentifier do
 
   # -- Spec format ------------------------------------------------------------
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the extension key on the wire.
 
@@ -124,7 +124,7 @@ defmodule X402.Extensions.PaymentIdentifier do
   @spec extension_key() :: String.t()
   def extension_key, do: @extension_key
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the deprecated pre-0.7.0 extension key.
 
@@ -136,7 +136,7 @@ defmodule X402.Extensions.PaymentIdentifier do
   @spec legacy_extension_key() :: String.t()
   def legacy_extension_key, do: @legacy_extension_key
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the JSON schema the server advertises for the extension.
 
@@ -149,7 +149,7 @@ defmodule X402.Extensions.PaymentIdentifier do
   @spec schema() :: map()
   def schema, do: @schema
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Builds the server-side advertisement for `PaymentRequired.extensions`.
 
@@ -179,7 +179,7 @@ defmodule X402.Extensions.PaymentIdentifier do
     }
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Checks whether `id` is a valid spec-format identifier.
 
@@ -208,7 +208,7 @@ defmodule X402.Extensions.PaymentIdentifier do
 
   def valid_id?(_id), do: false
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Generates a random 32-character identifier (#{@generated_id_bytes} random
   bytes, Base64url without padding).
@@ -228,7 +228,7 @@ defmodule X402.Extensions.PaymentIdentifier do
     |> Base.url_encode64(padding: false)
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns whether an advertised extensions map marks the id as required.
 
@@ -260,7 +260,7 @@ defmodule X402.Extensions.PaymentIdentifier do
 
   def required?(_extensions), do: false
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Extracts the client's payment id from a `PaymentPayload.extensions` map.
 
@@ -378,7 +378,7 @@ defmodule X402.Extensions.PaymentIdentifier do
 
   defp decode_bare_legacy_value(_value), do: {:error, {:legacy, :invalid_payment_id}}
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Computes the request fingerprint a payment id is bound to.
 
@@ -434,7 +434,7 @@ defmodule X402.Extensions.PaymentIdentifier do
   defp fingerprint_component(value) when is_integer(value), do: Integer.to_string(value)
   defp fingerprint_component(value), do: inspect(value)
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Builds a client-side enricher for `X402.Client.build_payment/3`'s
   `:extensions` option.

@@ -25,7 +25,7 @@ defmodule X402.Client.Hooks.Context do
           error: term() | nil
         }
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Builds a new client hook context.
 

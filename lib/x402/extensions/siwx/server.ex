@@ -174,7 +174,7 @@ defmodule X402.Extensions.SIWX.Server do
   @spec opts_schema() :: keyword()
   def opts_schema, do: @opts_schema
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Validates server options.
 
@@ -202,7 +202,7 @@ defmodule X402.Extensions.SIWX.Server do
     end
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Validates server options, raising `NimbleOptions.ValidationError` on
   failure.
@@ -268,7 +268,7 @@ defmodule X402.Extensions.SIWX.Server do
 
   def validate_storage(module), do: Storage.validate_module(module)
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Builds a fresh challenge and, with a `:nonce_cache`, records its nonce as
   issued.
@@ -306,7 +306,7 @@ defmodule X402.Extensions.SIWX.Server do
     end
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Records a challenge nonce as issued in the `:nonce_cache`.
 
@@ -324,7 +324,7 @@ defmodule X402.Extensions.SIWX.Server do
     end
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Verifies a `SIGN-IN-WITH-X` proof against the server configuration.
 
@@ -347,7 +347,7 @@ defmodule X402.Extensions.SIWX.Server do
     )
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Verifies a proof and checks that its address has a payment record for
   `resource`.
@@ -366,7 +366,7 @@ defmodule X402.Extensions.SIWX.Server do
     end
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Looks up the payment record for an address and resource.
   """
@@ -380,7 +380,7 @@ defmodule X402.Extensions.SIWX.Server do
     end
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Records that `address` paid for `resource`, granting access for `:ttl_ms`.
 
@@ -394,7 +394,7 @@ defmodule X402.Extensions.SIWX.Server do
     storage_put(storage, normalize_address(address), resource, payment_proof, ttl_ms)
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Revokes the payment record for an address and resource.
   """

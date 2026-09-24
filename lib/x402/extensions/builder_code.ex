@@ -119,7 +119,7 @@ defmodule X402.Extensions.BuilderCode do
           | :too_many_service_codes
           | :builder_code_mismatch
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the extension key on the wire.
 
@@ -131,7 +131,7 @@ defmodule X402.Extensions.BuilderCode do
   @spec extension_key() :: String.t()
   def extension_key, do: @extension_key
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the JSON schema the server advertises for the extension.
 
@@ -146,7 +146,7 @@ defmodule X402.Extensions.BuilderCode do
   @spec schema() :: map()
   def schema, do: @schema
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Checks whether a value is a well-formed builder code.
 
@@ -171,7 +171,7 @@ defmodule X402.Extensions.BuilderCode do
   def valid_code?(code) when is_binary(code), do: Regex.match?(@code_pattern, code)
   def valid_code?(_code), do: false
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Builds the server-side advertisement for `PaymentRequired.extensions`.
 
@@ -246,7 +246,7 @@ defmodule X402.Extensions.BuilderCode do
       "or underscore characters"
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Extracts the app code and service codes from a `builder-code` value.
 
@@ -323,7 +323,7 @@ defmodule X402.Extensions.BuilderCode do
 
   defp extract_service_codes(_other), do: {:error, {:invalid_builder_code, "s"}}
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Validates a client's echoed `builder-code` value against the advertised
   one, as the resource server must before forwarding a payment.
@@ -394,7 +394,7 @@ defmodule X402.Extensions.BuilderCode do
 
   defp advertised_app_code(_advertised), do: nil
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Builds a client-side enricher for `X402.Client.build_payment/3`'s
   `:extensions` option.

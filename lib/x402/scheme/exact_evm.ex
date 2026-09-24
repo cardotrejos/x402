@@ -76,7 +76,7 @@ defmodule X402.Scheme.ExactEVM do
   @spec networks() :: [String.t()]
   def networks, do: ["eip155:*"]
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Resolves the asset transfer method selected by the requirements.
 
