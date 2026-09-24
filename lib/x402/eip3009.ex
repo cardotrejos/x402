@@ -112,7 +112,7 @@ defmodule X402.EIP3009 do
 
     with {:ok, domain} <- domain(requirements),
          {:ok, from} <- Signer.address(signer),
-         {:ok, authorization} <- build_authorization(requirements, from, opts),
+         {:ok, authorization} <- do_build_authorization(requirements, from, opts),
          {:ok, signature} <- sign_authorization(signer, domain, authorization) do
       {:ok, %{"signature" => signature, "authorization" => authorization}}
     end
@@ -176,6 +176,12 @@ defmodule X402.EIP3009 do
   def build_authorization(requirements, from, opts \\ [])
       when is_map(requirements) and is_binary(from) and is_list(opts) do
     opts = NimbleOptions.validate!(opts, @authorization_opts_schema)
+    do_build_authorization(requirements, from, opts)
+  end
+
+  @spec do_build_authorization(map(), String.t(), keyword()) ::
+          {:ok, authorization()} | {:error, :invalid_requirements}
+  defp do_build_authorization(requirements, from, opts) do
     value = Utils.map_value(requirements, {"amount", :amount})
     to = Utils.map_value(requirements, {"payTo", :payTo})
     max_timeout = Utils.map_value(requirements, {"maxTimeoutSeconds", :maxTimeoutSeconds})
