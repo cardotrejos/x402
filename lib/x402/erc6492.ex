@@ -181,8 +181,6 @@ defmodule X402.ERC6492 do
     end
   end
 
-  # -- Wrapper decoding -------------------------------------------------------
-
   @spec parse_wrapper(binary()) :: {:ok, parsed()} | {:error, :invalid_erc6492_wrapper}
   defp parse_wrapper(
          <<0::unsigned-big-integer-size(96), factory_bytes::binary-size(20),
@@ -231,8 +229,6 @@ defmodule X402.ERC6492 do
 
   defp decode_dynamic_bytes(_encoded, _offset), do: {:error, :invalid_erc6492_wrapper}
 
-  # -- Encoding helpers -------------------------------------------------------
-
   @spec encode_dynamic_bytes(binary()) :: binary()
   defp encode_dynamic_bytes(bytes) do
     <<byte_size(bytes)::unsigned-big-integer-size(256)>> <> pad_right(bytes)
@@ -248,8 +244,6 @@ defmodule X402.ERC6492 do
 
   @spec padded_size(binary()) :: non_neg_integer()
   defp padded_size(bytes), do: byte_size(pad_right(bytes))
-
-  # -- Input decoding ---------------------------------------------------------
 
   @spec decode_signature_bytes(binary()) :: {:ok, binary()} | {:error, :invalid_signature}
   defp decode_signature_bytes("0x" <> hex) do

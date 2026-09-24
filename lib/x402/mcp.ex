@@ -376,8 +376,6 @@ defmodule X402.MCP do
 
   def payment_required_result(_payment_required), do: {:error, :invalid_payment_required}
 
-  # -- Structure checks -------------------------------------------------------
-
   @spec payment_payload_structure?(map()) :: boolean()
   defp payment_payload_structure?(payment) do
     not is_nil(Utils.map_value(payment, {"x402Version", :x402Version})) and
@@ -401,8 +399,6 @@ defmodule X402.MCP do
   defp has_key?(map, {string_key, atom_key}) do
     Map.has_key?(map, string_key) or Map.has_key?(map, atom_key)
   end
-
-  # -- _meta plumbing ---------------------------------------------------------
 
   @spec extract_payment_required(map()) :: {:ok, map()} | :error
   defp extract_payment_required(result) do

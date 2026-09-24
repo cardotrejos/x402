@@ -86,8 +86,6 @@ defmodule X402.Scheme.ExactEVMTest do
     end
   end
 
-  # -- Permit2 transfer method ------------------------------------------------
-
   @permit2_requirements Map.put(@requirements, "extra", %{
                           "assetTransferMethod" => "permit2",
                           "name" => "USDC",

@@ -122,7 +122,8 @@ defmodule X402.MixProject do
         "Docs" => "https://docs.x402.org"
       },
       maintainers: ["Ricardo Trejos"],
-      files: ~w(lib guides .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
+      files:
+        ~w(lib guides docs/architecture.md .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
     ]
   end
 
@@ -145,7 +146,8 @@ defmodule X402.MixProject do
         "guides/paywall.md": [title: "Browser Paywall"],
         "guides/local-verification.md": [title: "Local Payment Verification"],
         "guides/facilitator.md": [title: "Run Your Own Facilitator"],
-        "guides/live-smoke-tests.md": [title: "Live Smoke Tests"]
+        "guides/live-smoke-tests.md": [title: "Live Smoke Tests"],
+        "docs/architecture.md": [title: "Architecture"]
       ],
       groups_for_extras: [
         Guides: ~r/guides\/.*/

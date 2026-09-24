@@ -302,8 +302,6 @@ defmodule X402.EIP712 do
     end
   end
 
-  # -- Optional dependency resolution ----------------------------------------
-  #
   # The module is resolved at runtime via Module.concat so the library
   # compiles without ex_keccak (same pattern as X402.Facilitator.HTTP).
 
@@ -317,8 +315,6 @@ defmodule X402.EIP712 do
       false -> {:error, :missing_dependency}
     end
   end
-
-  # -- Field access -----------------------------------------------------------
 
   @spec fetch_field(map(), {String.t(), atom()}) ::
           {:ok, term()} | {:error, {:missing_field, String.t()}}

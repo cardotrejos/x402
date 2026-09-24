@@ -30,8 +30,6 @@ defmodule X402.Facilitator.EngineTest do
 
   setup [:setup_bypass, :setup_finch]
 
-  # -- Fixtures ---------------------------------------------------------------
-
   defp requirements(overrides \\ %{}) do
     Map.merge(
       %{
@@ -161,8 +159,6 @@ defmodule X402.Facilitator.EngineTest do
     Base.encode16(digest, case: :lower)
   end
 
-  # -- new/1 ------------------------------------------------------------------
-
   describe "new/1" do
     test "requires eip155 CAIP-2 networks", %{finch: finch} do
       {:ok, rpc} = RPC.new(rpc_url: "https://sepolia.base.org", finch: finch)
@@ -194,8 +190,6 @@ defmodule X402.Facilitator.EngineTest do
     end
   end
 
-  # -- supported/1 ------------------------------------------------------------
-
   describe "supported/1" do
     test "derives kinds and signers from the configuration", context do
       engine = engine(context, networks: [@network, "eip155:8453"])
@@ -212,8 +206,6 @@ defmodule X402.Facilitator.EngineTest do
              }
     end
   end
-
-  # -- verify/3 ---------------------------------------------------------------
 
   describe "verify/3" do
     test "returns the valid wire response for a good payment", context do
@@ -303,8 +295,6 @@ defmodule X402.Facilitator.EngineTest do
       refute_received {:rpc, "eth_call", [%{"data" => "0x82ad56cb" <> _agg}, _block3]}
     end
   end
-
-  # -- settle/3 ---------------------------------------------------------------
 
   describe "settle/3 with a nonce manager" do
     test "assigns distinct consecutive nonces with a single node fetch", context do
@@ -742,8 +732,6 @@ defmodule X402.Facilitator.EngineTest do
     end
   end
 
-  # -- ERC-6492 counterfactual settlement ---------------------------------------
-
   describe "settle/3 — ERC-6492 counterfactual" do
     test "deploys the wallet then transfers, on consecutive nonces", context do
       manager = start_supervised!({X402.Facilitator.NonceManager, []})
@@ -905,8 +893,6 @@ defmodule X402.Facilitator.EngineTest do
     end
   end
 
-  # -- Transfer-event verification ----------------------------------------------
-
   describe "settle/3 Transfer-event verification" do
     test "a mismatched Transfer event is a terminal failure", context do
       engine =
@@ -952,8 +938,6 @@ defmodule X402.Facilitator.EngineTest do
               }} = Engine.settle(engine, signed_payload(requirements), requirements)
     end
   end
-
-  # -- Pending-settlement reconciliation ----------------------------------------
 
   describe "settle/3 with a pending-settlement store" do
     test "a receipt timeout records the pending entry and a retry reconciles it", context do
@@ -1226,8 +1210,6 @@ defmodule X402.Facilitator.EngineTest do
       assert log =~ "failed to persist for retry"
     end
   end
-
-  # -- Hooks ------------------------------------------------------------------
 
   defmodule HaltHooks do
     @behaviour X402.Hooks
@@ -1577,8 +1559,6 @@ defmodule X402.Facilitator.EngineTest do
                Engine.verify(engine, payload, requirements(%{"amount" => "20000"}))
     end
   end
-
-  # -- Permit2 settlement (exact permit2 + upto) ------------------------------
 
   describe "settle/3 through the Permit2 proxies" do
     @exact_proxy "0x402085c248EeA27D92E8b30b2C58ed07f9E20001"

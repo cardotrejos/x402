@@ -23,8 +23,6 @@ defmodule X402.Verify.EVMPermit2Test do
 
   setup [:setup_bypass, :setup_finch]
 
-  # -- Fixtures ---------------------------------------------------------------
-
   defp exact_requirements(overrides \\ %{}) do
     Map.merge(
       %{
@@ -86,8 +84,6 @@ defmodule X402.Verify.EVMPermit2Test do
   end
 
   defp selector(signature), do: binary_part(ExKeccak.hash_256(signature), 0, 4)
-
-  # -- Structural -------------------------------------------------------------
 
   describe "level :structural (exact permit2)" do
     test "accepts a well-formed payload and reports the kind" do
@@ -223,8 +219,6 @@ defmodule X402.Verify.EVMPermit2Test do
     end
   end
 
-  # -- Signature --------------------------------------------------------------
-
   describe "level :signature" do
     test "recovers the payer over the Permit2 digest for both flows" do
       for requirements <- [exact_requirements(), upto_requirements()] do
@@ -259,8 +253,6 @@ defmodule X402.Verify.EVMPermit2Test do
                {:error, {:invalid, :invalid_permit2_signature}}
     end
   end
-
-  # -- Full -------------------------------------------------------------------
 
   describe "level :full" do
     test "simulates the exact proxy's settle from the payer", context do
@@ -428,8 +420,6 @@ defmodule X402.Verify.EVMPermit2Test do
       assert {:ok, %{kind: :permit2_exact}} = full(refreshed, requirements, rpc)
     end
   end
-
-  # -- Reason strings and selectors -------------------------------------------
 
   describe "reason_string/1" do
     test "maps Permit2 reasons onto the reference facilitator strings" do

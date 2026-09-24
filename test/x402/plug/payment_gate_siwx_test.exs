@@ -652,10 +652,6 @@ defmodule X402.Plug.PaymentGateSIWXTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Helpers
-  # ---------------------------------------------------------------------------
-
   defp gate_opts(overrides \\ []) do
     Keyword.merge([routes: [@route], facilitator: self()], overrides)
   end

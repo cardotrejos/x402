@@ -973,10 +973,6 @@ defmodule X402.MCP.ClientTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Full client ⇄ server loop
-  # ---------------------------------------------------------------------------
-
   describe "client-server loop" do
     setup do
       facilitator =

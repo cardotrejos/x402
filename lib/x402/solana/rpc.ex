@@ -172,8 +172,6 @@ defmodule X402.Solana.RPC do
     end
   end
 
-  # -- Response decoding ------------------------------------------------------
-
   # Most Solana query responses wrap the payload as {"context", "value"}.
   @spec unwrap_value(term()) :: {:ok, term()} | {:error, {:invalid_response, term()}}
   defp unwrap_value(%{"value" => value}), do: {:ok, value}

@@ -9,7 +9,6 @@ defmodule X402.Wallet do
   @evm_regex ~r/^0x[0-9a-fA-F]{40}$/
   # Solana addresses are 32-byte Ed25519 public keys encoded in base58.
   # base58(32 bytes) always produces 43 or 44 characters — never shorter.
-  # The original range [32,44] was too permissive; tightened to [43,44].
   #
   # Note: Solana does NOT use Bitcoin's Base58Check format (no checksum byte).
   # This regex is a structural guard only; the facilitator performs full

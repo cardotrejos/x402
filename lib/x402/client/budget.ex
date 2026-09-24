@@ -213,8 +213,6 @@ defmodule X402.Client.Budget do
 
   defp parse_amount(_amount), do: {:error, :invalid_amount}
 
-  # -- GenServer --------------------------------------------------------------
-
   @impl GenServer
   def init(opts) do
     per_asset =

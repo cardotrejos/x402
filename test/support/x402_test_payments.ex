@@ -23,7 +23,6 @@ defmodule X402.TestPayments do
   #
   # All EIP-712/EIP-3009 cryptography delegates to `X402.EIP3009` — the
   # library's payer-client signing code — so the logic exists exactly once.
-  # This module keeps its original raising/bare-value API for test ergonomics.
 
   alias X402.EIP3009
   alias X402.Signer.LocalKey

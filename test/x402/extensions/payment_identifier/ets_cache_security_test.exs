@@ -7,7 +7,6 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheSecurityTest do
     max_size = 10
     cache = start_cache(max_size: max_size)
 
-    # Fill the cache
     for i <- 1..max_size do
       assert :ok = ETSCache.put(cache, "payment-#{i}", :verified)
     end
@@ -15,10 +14,8 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheSecurityTest do
     %{table: table} = :sys.get_state(cache)
     assert :ets.info(table, :size) == max_size
 
-    # Add one more
     assert :ok = ETSCache.put(cache, "payment-#{max_size + 1}", :verified)
 
-    # Size should still be max_size
     assert :ets.info(table, :size) == max_size
   end
 
@@ -26,7 +23,6 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheSecurityTest do
     max_size = 10
     cache = start_cache(max_size: max_size)
 
-    # Fill the cache
     for i <- 1..max_size do
       assert :ok = ETSCache.put(cache, "payment-#{i}", :verified)
     end
@@ -34,12 +30,9 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheSecurityTest do
     %{table: table} = :sys.get_state(cache)
     assert :ets.info(table, :size) == max_size
 
-    # Update an existing key
     assert :ok = ETSCache.put(cache, "payment-1", :verified)
 
-    # Size should still be max_size
     assert :ets.info(table, :size) == max_size
-    # Ensure "payment-1" is still there
     assert {:hit, :verified} = ETSCache.get(cache, "payment-1")
   end
 

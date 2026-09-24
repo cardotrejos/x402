@@ -175,7 +175,6 @@ defmodule X402.Scheme.ExactSVMTest do
       assert ExactSVM.sign(no_hint, signer(), svm_blockhash: @blockhash) ==
                {:ok, %{"transaction" => @reference_transaction}}
 
-      # Then the fetcher.
       parent = self()
 
       fetcher = fn network ->
@@ -671,8 +670,6 @@ defmodule X402.Scheme.ExactSVMTest do
                {:ok, requirements()}
     end
   end
-
-  # -- helpers ----------------------------------------------------------------
 
   defp other_blockhash, do: Base58.encode(:binary.copy(<<9>>, 32))
 

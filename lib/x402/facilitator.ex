@@ -1101,8 +1101,6 @@ defmodule X402.Facilitator do
     end
   end
 
-  # --- read-only GET operations (supported / discovery) ---
-
   defp get_with_telemetry(config, operation, path, query, parser) do
     :telemetry.span(
       [:x402, :facilitator, operation],

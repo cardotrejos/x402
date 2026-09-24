@@ -228,8 +228,6 @@ defmodule X402.Extensions.OfferReceipt.JWS do
       {:error, {:unsupported_json_value, unsupported}}
   end
 
-  # -- Signing primitives -----------------------------------------------------
-
   @spec sign_bytes(String.t(), binary(), binary()) :: {:ok, binary()} | {:error, sign_error()}
   defp sign_bytes("EdDSA", message, key) do
     case byte_size(key) do
@@ -346,8 +344,6 @@ defmodule X402.Extensions.OfferReceipt.JWS do
   defp normalize_s(s) when s > div(@secp256k1_n, 2), do: @secp256k1_n - s
   defp normalize_s(s), do: s
 
-  # -- Compact serialization helpers ------------------------------------------
-
   @spec split(binary()) :: {:ok, binary(), binary(), binary()} | {:error, :invalid_jws}
   defp split(compact) do
     case String.split(compact, ".") do
@@ -402,8 +398,6 @@ defmodule X402.Extensions.OfferReceipt.JWS do
       _missing -> {:error, {:missing_header, "kid"}}
     end
   end
-
-  # -- JCS (RFC 8785) ---------------------------------------------------------
 
   @spec serialize(term()) :: binary()
   defp serialize(nil), do: "null"

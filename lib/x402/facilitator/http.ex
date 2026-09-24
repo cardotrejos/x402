@@ -168,7 +168,6 @@ defmodule X402.Facilitator.HTTP do
     ]
   end
 
-  # Bundles retry-related context to keep function arity ≤ 8.
   defp do_request(%{} = ctx, attempt, max_attempts) do
     result = perform_request(ctx, attempt)
     maybe_retry(result, ctx, attempt, max_attempts)

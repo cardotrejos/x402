@@ -65,8 +65,6 @@ defmodule X402.Facilitator.SVMEngineTest do
 
   setup [:setup_bypass, :setup_finch]
 
-  # -- Fixtures ---------------------------------------------------------------
-
   defp requirements(overrides \\ %{}) do
     Map.merge(
       %{
@@ -142,8 +140,6 @@ defmodule X402.Facilitator.SVMEngineTest do
     public
   end
 
-  # -- new/1 ------------------------------------------------------------------
-
   describe "new/1" do
     test "builds a validated engine", context do
       engine = engine(context)
@@ -187,8 +183,6 @@ defmodule X402.Facilitator.SVMEngineTest do
     end
   end
 
-  # -- supported/1 ------------------------------------------------------------
-
   describe "supported/1" do
     test "lists one exact kind per network with the fee payer in extra", context do
       engine = engine(context)
@@ -210,8 +204,6 @@ defmodule X402.Facilitator.SVMEngineTest do
              }
     end
   end
-
-  # -- verify/3 ---------------------------------------------------------------
 
   describe "verify/3" do
     test "accepts a valid payment and simulates it", context do
@@ -349,8 +341,6 @@ defmodule X402.Facilitator.SVMEngineTest do
                SVMEngine.verify(engine, signed_payload(requirements), requirements)
     end
   end
-
-  # -- settle/3 ---------------------------------------------------------------
 
   describe "settle/3" do
     test "co-signs the fee payer slot and broadcasts the wire", context do
