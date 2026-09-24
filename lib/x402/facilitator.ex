@@ -16,6 +16,17 @@ defmodule X402.Facilitator do
   operation is bounded by the configured `:receive_timeout_ms` and retry
   policy rather than by a `GenServer.call/3` timeout.
 
+  ## Failover
+
+  With `:fallbacks` configured, read operations and `verify/2` retry the
+  next endpoint on transport errors, timeouts, and 5xx responses; a
+  per-endpoint circuit breaker (`:failover` `cooldown_ms`) skips endpoints
+  that recently failed. `settle/2` fails over **only** when the request
+  provably never reached the endpoint (connection refused, DNS, TLS
+  handshake) — never on timeouts or 5xx, since the settlement may already
+  have executed. See `X402.Facilitator.Failover`. Each failover emits
+  `[:x402, :facilitator, :failover]`.
+
   ## Operation results
 
   `verify/2` and `settle/2` return the facilitator's HTTP response as a map
@@ -34,6 +45,7 @@ defmodule X402.Facilitator do
   alias X402.ExtensionResponses
   alias X402.Facilitator.Auth
   alias X402.Facilitator.Error
+  alias X402.Facilitator.Failover
   alias X402.Facilitator.HTTP
   alias X402.Hooks
   alias X402.Hooks.Context
@@ -95,6 +107,25 @@ defmodule X402.Facilitator do
           "`X402.Facilitator.Auth` module, or a `{module, opts}` tuple. See " <>
           "`X402.Facilitator.Auth.CDP` for the Coinbase Developer Platform " <>
           "facilitator. Available since v0.5.0."
+    ],
+    fallbacks: [
+      type: {:custom, Failover, :validate_fallbacks, []},
+      default: [],
+      doc:
+        "Fallback endpoints tried in order when the primary fails — a list of " <>
+          "keyword lists with `:url` (required), `:auth`, `:finch`, `:max_retries`, " <>
+          "`:retry_backoff_ms`, and `:receive_timeout_ms` (unset transport settings " <>
+          "inherit the primary's). See `X402.Facilitator.Failover` for which errors " <>
+          "fail over — settlement only on provably undelivered requests. " <>
+          "Available since v0.9.0."
+    ],
+    failover: [
+      type: {:custom, Failover, :validate_policy, []},
+      default: [],
+      doc:
+        "Failover policy: `:max_attempts` (endpoints tried per operation, default " <>
+          "all) and `:cooldown_ms` (how long an endpoint that failed over is " <>
+          "skipped, default 30000). Available since v0.9.0."
     ]
   ]
 
@@ -173,7 +204,10 @@ defmodule X402.Facilitator do
           auth: nil | Auth.t(),
           max_retries: non_neg_integer(),
           retry_backoff_ms: non_neg_integer(),
-          receive_timeout_ms: non_neg_integer()
+          receive_timeout_ms: non_neg_integer(),
+          fallbacks: [Failover.endpoint()],
+          failover: Failover.policy(),
+          breaker: Failover.breaker()
         }
 
   @doc """
@@ -203,9 +237,15 @@ defmodule X402.Facilitator do
           GenServer.on_start() | {:error, NimbleOptions.ValidationError.t()}
   def start_link(opts) when is_list(opts) do
     with {:ok, validated_opts} <- validated_opts(opts),
-         {:ok, auth} <- Auth.new(Keyword.get(validated_opts, :auth)) do
+         {:ok, auth} <- Auth.new(Keyword.get(validated_opts, :auth)),
+         {:ok, fallbacks} <- resolve_fallback_auths(Keyword.fetch!(validated_opts, :fallbacks)) do
       name = Keyword.fetch!(validated_opts, :name)
-      GenServer.start_link(__MODULE__, Keyword.put(validated_opts, :auth, auth), name: name)
+
+      GenServer.start_link(
+        __MODULE__,
+        Keyword.merge(validated_opts, auth: auth, fallbacks: fallbacks),
+        name: name
+      )
     else
       {:error, %NimbleOptions.ValidationError{} = error} -> {:error, error}
       {:error, reason} -> {:error, {:invalid_auth, reason}}
@@ -249,6 +289,19 @@ defmodule X402.Facilitator do
       {:ok, app} ->
         name = Keyword.get(opts, :name, @default_name)
         Keyword.merge(Application.get_env(app, name, []), opts)
+    end
+  end
+
+  defp resolve_fallback_auths(fallbacks) do
+    Enum.reduce_while(fallbacks, {:ok, []}, fn fallback, {:ok, acc} ->
+      case normalize_auth(Keyword.get(fallback, :auth)) do
+        {:ok, auth} -> {:cont, {:ok, [Keyword.put(fallback, :auth, auth) | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, resolved} -> {:ok, Enum.reverse(resolved)}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -579,23 +632,34 @@ defmodule X402.Facilitator do
   @impl true
   @spec init(keyword()) :: {:ok, state()} | {:stop, term()}
   def init(opts) do
-    case normalize_auth(Keyword.get(opts, :auth)) do
-      {:ok, auth} ->
-        state = %{
-          url: Keyword.fetch!(opts, :url),
-          finch: Keyword.fetch!(opts, :finch),
+    with {:ok, auth} <- normalize_auth(Keyword.get(opts, :auth)),
+         {:ok, fallbacks} <- resolve_fallback_auths(Keyword.get(opts, :fallbacks, [])) do
+      primary = %{
+        url: Keyword.fetch!(opts, :url),
+        finch: Keyword.fetch!(opts, :finch),
+        auth: auth,
+        max_retries: Keyword.fetch!(opts, :max_retries),
+        retry_backoff_ms: Keyword.fetch!(opts, :retry_backoff_ms),
+        receive_timeout_ms: Keyword.fetch!(opts, :receive_timeout_ms)
+      }
+
+      state =
+        Map.merge(primary, %{
           hooks: Keyword.fetch!(opts, :hooks),
-          auth: auth,
-          max_retries: Keyword.fetch!(opts, :max_retries),
-          retry_backoff_ms: Keyword.fetch!(opts, :retry_backoff_ms),
-          receive_timeout_ms: Keyword.fetch!(opts, :receive_timeout_ms)
-        }
+          fallbacks: Failover.build_endpoints(primary, fallbacks),
+          failover: failover_policy(Keyword.get(opts, :failover, [])),
+          breaker: %{}
+        })
 
-        {:ok, state}
-
-      {:error, reason} ->
-        {:stop, {:invalid_auth, reason}}
+      {:ok, state}
+    else
+      {:error, reason} -> {:stop, {:invalid_auth, reason}}
     end
+  end
+
+  defp failover_policy(policy) do
+    {:ok, validated} = Failover.validate_policy(policy)
+    validated
   end
 
   defp normalize_auth(nil), do: {:ok, nil}
@@ -608,10 +672,58 @@ defmodule X402.Facilitator do
     {:reply, state, state}
   end
 
+  # Breaker updates arrive asynchronously from callers; a trip opens the
+  # endpoint's circuit for the policy's cooldown, a reset closes it after a
+  # success on a previously tripped endpoint.
+  @impl true
+  @spec handle_cast({:trip, String.t()} | {:reset, String.t()}, state()) :: {:noreply, state()}
+  def handle_cast({:trip, url}, state) do
+    reopen_at = System.monotonic_time(:millisecond) + state.failover.cooldown_ms
+    {:noreply, %{state | breaker: Map.put(state.breaker, url, reopen_at)}}
+  end
+
+  def handle_cast({:reset, url}, state) do
+    {:noreply, %{state | breaker: Map.delete(state.breaker, url)}}
+  end
+
   # Fetching the configuration is the only work performed inside the
   # facilitator process; everything else (HTTP, retries, hooks, telemetry)
   # runs in the caller so operations never serialize behind this GenServer.
-  defp fetch_config(server), do: GenServer.call(server, :config)
+  defp fetch_config(server), do: server |> GenServer.call(:config) |> Map.put(:server, server)
+
+  # With no fallbacks the request runs once against the primary, exactly as
+  # before failover existed; the breaker is only consulted and updated when
+  # there is somewhere else to go.
+  defp dispatch(%{fallbacks: []} = config, _operation, request), do: request.(primary(config))
+
+  defp dispatch(config, operation, request) do
+    now = System.monotonic_time(:millisecond)
+    endpoints = [primary(config) | config.fallbacks]
+    candidates = Failover.order(endpoints, config.breaker, config.failover, now)
+    server = config.server
+
+    Failover.run(
+      candidates,
+      operation,
+      fn endpoint ->
+        # An inner retry must not hide an earlier ambiguous settlement
+        # behind a later connection failure and permit another provider.
+        endpoint = if operation == :settle, do: %{endpoint | max_retries: 0}, else: endpoint
+        result = request.(endpoint)
+
+        if match?({:ok, _result}, result) and Map.has_key?(config.breaker, endpoint.url) do
+          GenServer.cast(server, {:reset, endpoint.url})
+        end
+
+        result
+      end,
+      fn url -> GenServer.cast(server, {:trip, url}) end
+    )
+  end
+
+  defp primary(config),
+    do:
+      Map.take(config, [:url, :finch, :auth, :max_retries, :retry_backoff_ms, :receive_timeout_ms])
 
   defp request_with_telemetry(state, operation, payment_payload, requirements, hooks_module) do
     endpoint = operation_endpoint(operation)
@@ -649,31 +761,34 @@ defmodule X402.Facilitator do
                    operation,
                    before_context.payload,
                    before_context.requirements
-                 ),
-               {:ok, headers} <- auth_headers(state, endpoint, :post),
-               {:ok, response} <-
-                 HTTP.request(
-                   state.finch,
-                   state.url,
-                   endpoint,
-                   %{
-                     # x402 v2 facilitator wire format (§7.1 / §7.2)
-                     "x402Version" => 2,
-                     "paymentPayload" => before_context.payload,
-                     "paymentRequirements" => before_context.requirements
-                   },
-                   max_retries: state.max_retries,
-                   retry_backoff_ms: state.retry_backoff_ms,
-                   receive_timeout_ms: state.receive_timeout_ms,
-                   headers: headers
                  ) do
-            {:ok, put_extension_responses(response)}
+            body = %{
+              # x402 v2 facilitator wire format (§7.1 / §7.2)
+              "x402Version" => 2,
+              "paymentPayload" => before_context.payload,
+              "paymentRequirements" => before_context.requirements
+            }
+
+            dispatch(state, operation, &post_operation(&1, endpoint, body))
           end
 
         handle_operation_result(hooks_module, operation, before_context, result, metadata)
 
       {:halt, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp post_operation(endpoint, path, body) do
+    with {:ok, headers} <- auth_headers(endpoint, path, :post),
+         {:ok, response} <-
+           HTTP.request(endpoint.finch, endpoint.url, path, body,
+             max_retries: endpoint.max_retries,
+             retry_backoff_ms: endpoint.retry_backoff_ms,
+             receive_timeout_ms: endpoint.receive_timeout_ms,
+             headers: headers
+           ) do
+      {:ok, put_extension_responses(response)}
     end
   end
 
@@ -684,14 +799,14 @@ defmodule X402.Facilitator do
     Map.put(response, :extension_responses, ExtensionResponses.from_headers_lenient(headers))
   end
 
-  defp auth_headers(state, endpoint, method) do
+  defp auth_headers(endpoint, path, method) do
     request_info = %{
       method: method,
-      host: request_host(state.url),
-      path: request_path(state.url) <> endpoint
+      host: request_host(endpoint.url),
+      path: request_path(endpoint.url) <> path
     }
 
-    case Auth.headers(state.auth, request_info) do
+    case Auth.headers(endpoint.auth, request_info) do
       {:ok, headers} ->
         {:ok, headers}
 
@@ -988,26 +1103,26 @@ defmodule X402.Facilitator do
 
   # --- read-only GET operations (supported / discovery) ---
 
-  defp get_with_telemetry(config, operation, endpoint, query, parser) do
+  defp get_with_telemetry(config, operation, path, query, parser) do
     :telemetry.span(
       [:x402, :facilitator, operation],
-      %{operation: operation, endpoint: endpoint},
+      %{operation: operation, endpoint: path},
       fn ->
-        result = get_operation(config, endpoint, query, parser)
-        log_failure(result, operation, endpoint)
+        result = dispatch(config, operation, &get_operation(&1, path, query, parser))
+        log_failure(result, operation, path)
         {result, telemetry_result_metadata(result)}
       end
     )
   end
 
-  defp get_operation(config, endpoint, query, parser) do
-    with {:ok, headers} <- auth_headers(config, endpoint, :get),
+  defp get_operation(endpoint, path, query, parser) do
+    with {:ok, headers} <- auth_headers(endpoint, path, :get),
          {:ok, %{status: status, body: body}} <-
-           HTTP.get(config.finch, config.url, endpoint,
+           HTTP.get(endpoint.finch, endpoint.url, path,
              query: query,
-             max_retries: config.max_retries,
-             retry_backoff_ms: config.retry_backoff_ms,
-             receive_timeout_ms: config.receive_timeout_ms,
+             max_retries: endpoint.max_retries,
+             retry_backoff_ms: endpoint.retry_backoff_ms,
+             receive_timeout_ms: endpoint.receive_timeout_ms,
              headers: headers
            ) do
       parse_body(parser, status, body)

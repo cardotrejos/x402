@@ -5,7 +5,8 @@ defmodule X402.Scheme.Registry do
   The default mapping is seeded with the built-in schemes —
   `X402.Scheme.ExactEVM` (`"exact"` on `"eip155:*"`),
   `X402.Scheme.ExactSVM` (`"exact"` on `"solana:*"`), and
-  `X402.Scheme.UptoEVM` (`"upto"` on `"eip155:*"`). There is no global
+  `X402.Scheme.UptoEVM` (`"upto"` on `"eip155:*"`), and
+  `X402.Scheme.AuthCaptureEVM` (`"auth-capture"` on `"eip155:*"`). There is no global
   registration and no application environment: callers pass additional
   scheme modules explicitly (the `:schemes` option on
   `X402.Client.build_payment/3`, `X402.Plug.PaymentGate`, and
@@ -42,7 +43,12 @@ defmodule X402.Scheme.Registry do
       {:ok, X402.Scheme.ExactSVM}
   """
 
-  @builtins [X402.Scheme.ExactEVM, X402.Scheme.ExactSVM, X402.Scheme.UptoEVM]
+  @builtins [
+    X402.Scheme.ExactEVM,
+    X402.Scheme.ExactSVM,
+    X402.Scheme.UptoEVM,
+    X402.Scheme.AuthCaptureEVM
+  ]
 
   @doc since: "0.6.0"
   @doc """
@@ -51,7 +57,7 @@ defmodule X402.Scheme.Registry do
   ## Examples
 
       iex> X402.Scheme.Registry.builtins()
-      [X402.Scheme.ExactEVM, X402.Scheme.ExactSVM, X402.Scheme.UptoEVM]
+      [X402.Scheme.ExactEVM, X402.Scheme.ExactSVM, X402.Scheme.UptoEVM, X402.Scheme.AuthCaptureEVM]
   """
   @spec builtins() :: [module()]
   def builtins, do: @builtins

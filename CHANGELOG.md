@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **EVM auth-capture**: EIP-3009/Permit2 signing, v1.0/v1.1 encoders,
+  account-aware pinned verification, explicit-consent execution and receipt
+  reconciliation, durable multi-key store contracts, and metered escrow
+  resources. Plug/MCP adapters withhold output until synchronous settlement
+  or durable deferred metering. Dispatched client budgets retain the maximum
+  on all outcomes. The bundled ETS store is development-only; production
+  durability, recovery scheduling, and refund funding remain application-owned.
+- **Transaction signer callback**: dedicated `X402.Signer.sign_transaction/2`
+  dispatch for auth-capture execution, with complete type-2 transaction intent.
+  Existing facilitator execution paths are unchanged.
+- **Authentication extensions**: `X402.Extensions.AuthHints` builds and
+  reads `auth-hints` declarations for OAuth2 and SIWX, scoped to accepted
+  payment indexes. `X402.Extensions.HTTPMessageSignatures` advertises
+  signature registration, algorithms, and tags. Both include gate adapters.
+  These are advertisements, not automatic credential acquisition or
+  authentication enforcement.
+- **HTTP message signatures**: `X402.HTTPSignature` implements a bounded
+  RFC 9421 request/response profile with Ed25519, ECDSA P-256, and
+  RSA-PSS-SHA512, structured fields, required-coverage and time checks,
+  response-to-request binding, and caller-controlled key lookup.
+  `X402.HTTPSignature.Key` imports/exports public JWKs and generates keys;
+  `X402.Plug.HTTPSignatureDirectory` serves a signed public directory with
+  runtime rotation. Negotiation, automatic key discovery, content-digest
+  validation, and nonce replay storage remain application responsibilities.
+- **Operations controls**: optional verified-payer/IP/custom-key rate
+  limits in the payment gate, a per-node ETS limiter, ordered facilitator
+  failover, optional `Telemetry.Metrics` definitions, and local telemetry
+  statistics. Denied payments return 429 without settlement. With fallbacks,
+  settlement makes one HTTP attempt per endpoint and only fails over on
+  proven non-delivery; TLS alerts, timeouts, and HTTP 5xx remain ambiguous.
+  Single-endpoint retries are unchanged.
 - **Permit2 transfer method for the `exact` EVM scheme**: requirements
   declaring `extra.assetTransferMethod: "permit2"` now run end to end
   alongside the default EIP-3009 flow. `X402.Scheme.ExactEVM` dispatches
@@ -162,9 +193,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `siwx:` option of `X402.Client.Finch.request/3` and
   `X402.MCP.Client.call/3` (`chain_id:` — a CAIP-2 chain or `:auto` to
   pick the first advertised `supportedChains` entry the signer can sign
-  — plus optional `address:`, `signature_scheme:`, and `domain:`, the
-  latter required for MCP and defaulting to the resource URL's host on
-  HTTP). When the 402 advertises a `sign-in-with-x` challenge the client
+  — plus optional `address:`, `signature_scheme:`, `domain:`, and `uri:`.
+  MCP requires independent domain and exact URI pins; HTTP defaults its domain
+  to the resource URL's host). MCP consent runs before signing initial or
+  refreshed proofs, once per challenge. When the 402 advertises a
+  `sign-in-with-x` challenge the client
   signs it (`X402.Client.SIWX.authenticate/4`, refusing challenges not
   bound to the expected origin, or lacking a trusted domain/resource URL;
   domain matching ignores case without dropping port boundaries)

@@ -114,6 +114,18 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
     assert %{id: :custom_cache} = ETSCache.child_spec(name: :custom_cache)
   end
 
+  test "unnamed caches keep independent claims for the same payment" do
+    first = start_supervised!(%{ETSCache.child_spec(name: nil) | id: :first})
+    second = start_supervised!(%{ETSCache.child_spec(name: nil) | id: :second})
+
+    assert :ok = ETSCache.put_new(first, "payment-1", :verified)
+    assert :miss = ETSCache.get(second, "payment-1")
+    assert :ok = ETSCache.put_new(second, "payment-1", {:rejected, :verification_failed})
+    assert {:hit, :verified} = ETSCache.get(first, "payment-1")
+    assert :ok = ETSCache.delete(first, "payment-1")
+    assert {:hit, {:rejected, :verification_failed}} = ETSCache.get(second, "payment-1")
+  end
+
   test "put_new/3 inserts a new entry and returns :ok" do
     cache = start_cache(ttl_ms: 1_000)
 

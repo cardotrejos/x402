@@ -37,6 +37,10 @@ defmodule X402.Signer do
   the optional `ex_secp256k1` and `ex_keccak` dependencies.
   `X402.Signer.SolanaKey` signs with an Ed25519 key through OTP's `:crypto`
   (no extra dependencies).
+
+  Gas-paying EVM execution uses the separate optional `c:sign_transaction/3`
+  callback. It receives a type-2 transaction, not EIP-712 typed data. A
+  typed-data-only wallet is never asked to sign a raw transaction digest.
   """
 
   @typedoc "A struct whose module implements `X402.Signer`."
@@ -94,11 +98,53 @@ defmodule X402.Signer do
   @callback sign_message(signer :: t(), message :: binary()) ::
               {:ok, String.t()} | {:error, term()}
 
+  @doc """
+  Signs an EIP-1559 transaction digest without broadcasting.
+
+  Receives the locally computed digest and complete `X402.Transaction` so
+  hardware or remote implementations can reconstruct and review the exact
+  intent. Returns a raw 65-byte signature, not a serialized transaction.
+  Implementations must not broadcast: durable execution records the signed
+  bytes before granting permission to send.
+  """
+  @callback sign_transaction(t(), binary(), X402.Transaction.t()) ::
+              {:ok, signature()} | {:error, term()}
+
   # Chain-family callbacks are optional: a signer implements the ones for
   # the families it supports (EVM signers omit sign_ed25519, Solana signers
   # omit sign_eip712), and the dispatchers report the gap as
   # {:error, :unsupported_signer}.
-  @optional_callbacks sign_eip712: 3, sign_ed25519: 2, sign_message: 2
+  @optional_callbacks sign_eip712: 3, sign_ed25519: 2, sign_message: 2, sign_transaction: 3
+
+  @doc since: "0.9.0"
+  @doc """
+  Signs a type-2 transaction through its dedicated callback, without sending.
+
+  Computes the digest from the complete transaction and normalizes the
+  returned recovery byte. There is no fallback to `sign_eip712/3` or
+  `personal_sign`. Execution code must also verify the recovered gas-account
+  address before recording or broadcasting the encoded transaction.
+
+  ## Examples
+
+      iex> X402.Signer.sign_transaction(:not_a_signer, %{})
+      {:error, :invalid_signer}
+  """
+  @spec sign_transaction(t(), X402.Transaction.t()) :: {:ok, signature()} | {:error, term()}
+  def sign_transaction(%module{} = signer, %X402.Transaction{} = transaction) do
+    case X402.Behaviour.implements?(module, sign_transaction: 3) do
+      true ->
+        with {:ok, digest} <- X402.Transaction.digest(transaction),
+             {:ok, signature} <- module.sign_transaction(signer, digest, transaction) do
+          normalize_signature(signature)
+        end
+
+      false ->
+        {:error, :unsupported_signer}
+    end
+  end
+
+  def sign_transaction(_signer, _transaction), do: {:error, :invalid_signer}
 
   @doc since: "0.6.0"
   @doc """

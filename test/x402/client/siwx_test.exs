@@ -221,6 +221,61 @@ defmodule X402.Client.SIWXTest do
   end
 
   describe "authenticate/4 origin binding" do
+    test "accepts bracketed IPv6 URI pins without rewriting the signed challenge" do
+      for {domain, uri} <- [
+            {"[::1]:3000", "http://[::1]:3000/tools/test"},
+            {"[::1]:80", "http://[::1]:80/tools/test"},
+            {"[2001:DB8::1]", "https://[2001:DB8::1]/tools/test"},
+            {"[2001:db8::1]:443", "https://[2001:db8::1]:443/tools/test"}
+          ],
+          context <- [[transport: :mcp], [transport: :http, resource_url: uri]] do
+        ipv6 = challenge(domain: domain, uri: uri)
+
+        assert {:ok, proof} =
+                 ClientSIWX.authenticate(
+                   payment_required(ipv6),
+                   evm_signer(),
+                   [chain_id: @evm_chain, domain: domain, uri: uri],
+                   context
+                 )
+
+        assert {:ok, {:spec, fields}} = SIWX.decode_signed(proof.header)
+        assert fields["domain"] == domain
+        assert fields["uri"] == uri
+      end
+    end
+
+    test "derives bracketed IPv6 domains from the HTTP resource URL" do
+      uri = "http://[::1]:3000/tools/test"
+
+      for domain <- ["[::1]", "[::1]:3000"],
+          opts <- [[chain_id: @evm_chain], [chain_id: @evm_chain, uri: uri]] do
+        assert {:ok, _proof} =
+                 ClientSIWX.authenticate(
+                   payment_required(challenge(domain: domain, uri: uri)),
+                   evm_signer(),
+                   opts,
+                   transport: :http,
+                   resource_url: uri
+                 )
+      end
+    end
+
+    test "IPv6 URI pins reject other hosts and ports before consent" do
+      uri = "http://[::1]:3000/tools/test"
+
+      for domain <- ["[::2]:3000", "[::1]:3001", "::1:3000"] do
+        assert {:error, {:siwx, :domain_mismatch}} =
+                 ClientSIWX.authenticate(
+                   payment_required(challenge(domain: domain, uri: uri)),
+                   evm_signer(),
+                   [chain_id: @evm_chain, domain: domain, uri: uri],
+                   transport: :mcp,
+                   before_sign: fn -> flunk("mismatched IPv6 domain reached consent") end
+                 )
+      end
+    end
+
     test "matches domain case without rewriting the signed challenge" do
       mixed = challenge(domain: "API.Example.COM:8443", uri: "https://API.Example.COM:8443")
 
@@ -425,7 +480,8 @@ defmodule X402.Client.SIWXTest do
     test "failures before chain selection report nil rather than :auto or an untrusted chain" do
       for {opts, reason} <- [
             {[chain_id: @evm_chain, domain: "other.example.com"], :domain_mismatch},
-            {[chain_id: :auto, domain: "api.example.com"], :unsupported_chain}
+            {[chain_id: :auto, domain: "api.example.com", uri: "https://api.example.com"],
+             :unsupported_chain}
           ] do
         assert ClientSIWX.authenticate(payment_required(challenge()), %URI{}, opts,
                  transport: :mcp
@@ -468,6 +524,27 @@ defmodule X402.Client.SIWXTest do
                )
 
       assert :none = ClientSIWX.authenticate(%{}, evm_signer(), chain_id: :auto)
+      refute_received {:telemetry, _, _, _}
+    end
+
+    test "consent rejection reports the selected chain without signing" do
+      assert {:error, {:siwx, :payment_cancelled}} =
+               ClientSIWX.authenticate(
+                 payment_required(challenge()),
+                 solana_signer(),
+                 [chain_id: :auto, domain: "api.example.com", uri: "https://api.example.com"],
+                 transport: :mcp,
+                 before_sign: fn -> :cancel end
+               )
+
+      assert_received {:telemetry, [:x402, :client, :siwx], %{count: 1},
+                       %{
+                         status: :error,
+                         reason: :payment_cancelled,
+                         chain_id: @solana_chain,
+                         transport: :mcp
+                       }}
+
       refute_received {:telemetry, _, _, _}
     end
   end

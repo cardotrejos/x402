@@ -95,6 +95,8 @@ defmodule X402.MCP.Server do
   (`reason: :settlement_failed`, with `:error`).
   """
 
+  alias X402.AuthCapture.Resource, as: AuthCaptureResource
+  alias X402.AuthCapture.Transport, as: AuthCaptureTransport
   alias X402.Extensions.BuilderCode
   alias X402.Extensions.PaymentIdentifier
   alias X402.Extensions.PaymentIdentifier.Cache
@@ -111,7 +113,7 @@ defmodule X402.MCP.Server do
 
   require Logger
 
-  @schemes ["exact", "upto"]
+  @schemes ["exact", "upto", "auth-capture"]
   @x402_version 2
   @supported_payment_flow "authorization"
   @default_max_timeout_seconds 60
@@ -157,6 +159,15 @@ defmodule X402.MCP.Server do
   ]
 
   @options_schema [
+    auth_capture_resource: [
+      type: {:custom, AuthCaptureTransport, :validate_resource, []},
+      default: nil,
+      doc: """
+      Local escrow resource. Paid handlers return `{:ok, result_map, actual_amount}`
+      or `{:error, reason}`. Content is withheld until sync settlement or durable
+      deferred metering. Recovery is application-only through the resource.
+      """
+    ],
     tool: [
       type: :string,
       required: true,
@@ -228,6 +239,7 @@ defmodule X402.MCP.Server do
 
   @typedoc "Configuration map produced by `init/1`."
   @type options :: %{
+          auth_capture_resource: AuthCaptureResource.t() | nil,
           tool: String.t(),
           facilitator: Facilitator.server(),
           hooks: module(),
@@ -238,7 +250,7 @@ defmodule X402.MCP.Server do
         }
 
   @typedoc "An MCP tool-call handler: request params in, tool result map out."
-  @type handler :: (map() -> map())
+  @type handler :: (map() -> map() | {:ok, map(), non_neg_integer()} | {:error, term()})
 
   @typedoc false
   @type claims :: %{payment_id: String.t(), binding: String.t() | nil}
@@ -304,6 +316,7 @@ defmodule X402.MCP.Server do
     })
 
     %{
+      auth_capture_resource: Keyword.fetch!(validated, :auth_capture_resource),
       tool: tool,
       facilitator: Keyword.fetch!(validated, :facilitator),
       hooks: Keyword.fetch!(validated, :hooks),
@@ -360,7 +373,7 @@ defmodule X402.MCP.Server do
 
       {:halt, :skip_payment} ->
         emit(:pass_through, %{tool: config.tool, reason: :hook_skipped})
-        handler.(request)
+        unpaid_handler_result(handler.(request))
 
       {:halt, {status, body}} ->
         emit(:payment_rejected, %{tool: config.tool, reason: {:hook_halted, status}})
@@ -371,6 +384,11 @@ defmodule X402.MCP.Server do
         internal_error_result()
     end
   end
+
+  @spec unpaid_handler_result(term()) :: map()
+  defp unpaid_handler_result({:ok, %{} = value, _amount}), do: value
+  defp unpaid_handler_result(%{} = value), do: value
+  defp unpaid_handler_result(_error), do: internal_error_result()
 
   @spec gate_call(map(), options(), RequestContext.t(), handler()) :: map()
   defp gate_call(request, config, context, handler) do
@@ -432,12 +450,12 @@ defmodule X402.MCP.Server do
   defp verify_and_execute(request, config, context, handler, payment_payload) do
     with {:ok, requirements} <- validate_payment(payment_payload, config),
          {:ok, client_payment_id} <- client_payment_id(payment_payload, config),
-         {:ok, payment_id} <- payment_id(payment_payload),
+         {:ok, payment_id} <- payment_id(payment_payload, requirements),
          {:ok, binding} <- bind_payment_id(config, client_payment_id, requirements),
          claims = %{payment_id: payment_id, binding: binding},
          :ok <- verify_and_claim(config, payment_payload, requirements, claims) do
       context = %{context | payload: payment_payload, matched_requirements: requirements}
-      execute_and_settle(request, config, context, handler, payment_payload, requirements, claims)
+      execute_resource(request, config, context, handler, payment_payload, requirements, claims)
     else
       {:error, reason} ->
         emit(:payment_rejected, %{tool: config.tool, reason: reason})
@@ -449,7 +467,7 @@ defmodule X402.MCP.Server do
   # claim fails, so a rejected attempt never strands the client's id.
   @spec verify_and_claim(options(), map(), map(), claims()) :: :ok | {:error, term()}
   defp verify_and_claim(config, payment_payload, requirements, claims) do
-    with {:ok, verify_response} <- facilitator_verify(config, payment_payload, requirements),
+    with {:ok, verify_response} <- verify_payment(config, payment_payload, requirements),
          :ok <- ensure_verify_success(verify_response),
          :ok <- claim_or_fail(config.payment_identifier_cache, claims.payment_id) do
       :ok
@@ -459,6 +477,55 @@ defmodule X402.MCP.Server do
         {:error, reason}
     end
   end
+
+  @spec verify_payment(options(), map(), map()) :: {:ok, map()} | {:error, term()}
+  defp verify_payment(config, payload, %{"scheme" => "auth-capture"} = requirements),
+    do: AuthCaptureTransport.verify(config.auth_capture_resource, payload, requirements)
+
+  defp verify_payment(config, payload, requirements),
+    do: facilitator_verify(config, payload, requirements)
+
+  @spec execute_resource(map(), options(), RequestContext.t(), handler(), map(), map(), claims()) ::
+          map()
+  defp execute_resource(
+         request,
+         config,
+         _context,
+         handler,
+         payload,
+         %{"scheme" => "auth-capture"} = requirements,
+         claims
+       ) do
+    result =
+      AuthCaptureResource.run_guarded(config.auth_capture_resource, payload, requirements, fn ->
+        auth_capture_handler_result(handler.(request))
+      end)
+
+    case result do
+      {:ok, value, receipt} ->
+        emit(:payment_verified, %{tool: config.tool})
+        MCP.put_payment_response(value, AuthCaptureTransport.response(receipt, requirements))
+
+      {:not_admitted, _reason} ->
+        release_claims(config, claims)
+        internal_error_result()
+
+      _unresolved ->
+        emit(:payment_rejected, %{tool: config.tool, reason: :auth_capture_unresolved})
+        internal_error_result()
+    end
+  end
+
+  defp execute_resource(request, config, context, handler, payload, requirements, claims),
+    do: execute_and_settle(request, config, context, handler, payload, requirements, claims)
+
+  @spec auth_capture_handler_result(term()) :: tuple() | atom()
+  defp auth_capture_handler_result({:ok, %{} = value, amount}) do
+    if error_result?(value), do: {:error, :handler_failed}, else: {:ok, value, amount}
+  end
+
+  defp auth_capture_handler_result({:error, _reason} = error), do: error
+  defp auth_capture_handler_result(_invalid), do: :invalid_handler_result
 
   @spec client_payment_id(map(), options()) ::
           {:ok, String.t() | nil}
@@ -562,6 +629,19 @@ defmodule X402.MCP.Server do
   # authorization) cannot be altered without failing facilitator
   # verification, which precedes the claim.
   @spec payment_id(map()) :: {:ok, String.t()} | {:error, :invalid_payload}
+  @spec payment_id(map(), map()) :: {:ok, String.t()} | {:error, :invalid_payload}
+  defp payment_id(envelope, %{"scheme" => "auth-capture"} = requirements) do
+    case AuthCaptureTransport.replay_key(
+           Utils.map_value(envelope, {"payload", :payload}),
+           requirements
+         ) do
+      {:ok, key} -> {:ok, key}
+      :error -> {:error, :invalid_payload}
+    end
+  end
+
+  defp payment_id(envelope, _requirements), do: payment_id(envelope)
+
   defp payment_id(payment_payload) do
     case Utils.map_value(payment_payload, {"payload", :payload}) do
       scheme_payload when is_map(scheme_payload) ->
@@ -934,7 +1014,7 @@ defmodule X402.MCP.Server do
   defp compile_accepts(accepts) do
     Enum.map(accepts, fn accept ->
       extra = stringify_keys(Map.get(accept, :extra, %{}))
-      ensure_supported_payment_flow!(extra)
+      ensure_supported_payment_flow!(Map.get(accept, :scheme, "exact"), extra)
 
       %{
         "scheme" => Map.get(accept, :scheme, "exact"),
@@ -949,8 +1029,15 @@ defmodule X402.MCP.Server do
     end)
   end
 
-  @spec ensure_supported_payment_flow!(map()) :: :ok
-  defp ensure_supported_payment_flow!(extra) do
+  @spec ensure_supported_payment_flow!(String.t(), map()) :: :ok
+  defp ensure_supported_payment_flow!("auth-capture", extra) do
+    if Utils.map_value(extra, {"paymentFlow", :paymentFlow}) != "escrow",
+      do: raise(ArgumentError, "auth-capture routes require explicit escrow flow")
+
+    :ok
+  end
+
+  defp ensure_supported_payment_flow!(_scheme, extra) do
     case Utils.map_value(extra, {"paymentFlow", :paymentFlow}) do
       nil -> :ok
       @supported_payment_flow -> :ok

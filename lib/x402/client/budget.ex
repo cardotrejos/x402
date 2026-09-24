@@ -27,6 +27,11 @@ defmodule X402.Client.Budget do
   facilitator actually settled: the budget is a safety cap on what the
   client has authorized, not a ledger of on-chain transfers.
 
+  Auth-capture is deliberately more conservative: once a paid request is
+  dispatched, its entire maximum remains reserved for every outcome, including
+  errors and renewed challenges. A hold or charge may already exist. Only
+  application reconciliation against trusted payment state should release it.
+
   Amounts are atomic units: non-negative integers or integer strings, as in
   `PaymentRequirements.amount`. Assets are compared case-insensitively.
 
@@ -41,6 +46,24 @@ defmodule X402.Client.Budget do
   """
 
   use GenServer
+
+  @doc since: "0.9.0"
+  @doc """
+  Whether a scheme's exposure survives every dispatched-request outcome.
+
+  ## Examples
+
+      iex> X402.Client.Budget.retain_after_dispatch?(%{"accepted" => %{"scheme" => "auth-capture"}})
+      true
+
+      iex> X402.Client.Budget.retain_after_dispatch?(%{"accepted" => %{"scheme" => "exact"}})
+      false
+  """
+  @spec retain_after_dispatch?(map()) :: boolean()
+  def retain_after_dispatch?(payload),
+    do:
+      X402.Utils.nested_map_value(payload, [{"accepted", :accepted}, {"scheme", :scheme}]) ==
+        "auth-capture"
 
   @start_opts_schema [
     name: [

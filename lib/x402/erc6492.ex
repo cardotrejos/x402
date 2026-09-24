@@ -112,13 +112,31 @@ defmodule X402.ERC6492 do
           {:ok, parsed()} | {:error, :invalid_signature | :invalid_erc6492_wrapper}
   def parse(signature) when is_binary(signature) do
     with {:ok, bytes} <- decode_signature_bytes(signature) do
-      case magic_suffix?(bytes) do
-        true ->
-          parse_wrapper(binary_part(bytes, 0, byte_size(bytes) - 32))
+      parse_bytes(bytes)
+    end
+  end
 
-        false ->
-          {:ok, %{wrapped?: false, factory: nil, factory_calldata: nil, inner_signature: bytes}}
-      end
+  @doc since: "0.9.0"
+  @doc """
+  Parses already-decoded signature bytes without interpreting a hex prefix.
+
+  Useful after bounded wire decoding, including a raw signature that
+  happens to start with the ASCII characters `0x`.
+
+  ## Examples
+
+      iex> {:ok, parsed} = X402.ERC6492.parse_bytes(<<"0x", 1, 2>>)
+      iex> parsed.inner_signature
+      <<"0x", 1, 2>>
+  """
+  @spec parse_bytes(binary()) :: {:ok, parsed()} | {:error, :invalid_erc6492_wrapper}
+  def parse_bytes(bytes) when is_binary(bytes) do
+    case magic_suffix?(bytes) do
+      true ->
+        parse_wrapper(binary_part(bytes, 0, byte_size(bytes) - 32))
+
+      false ->
+        {:ok, %{wrapped?: false, factory: nil, factory_calldata: nil, inner_signature: bytes}}
     end
   end
 

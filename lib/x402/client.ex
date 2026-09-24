@@ -87,6 +87,11 @@ defmodule X402.Client do
 
   @build_opts_schema @select_opts_schema ++
                        [
+                         auth_capture: [
+                           type: {:custom, X402.Scheme.AuthCaptureEVM, :validate_options, []},
+                           default: [],
+                           doc: "Auth-capture signing options (`:now`, `:salt`, `:salt_nonce`)."
+                         ],
                          hooks: [
                            type: {:custom, Hooks, :validate_module, []},
                            default: Hooks.Default,
@@ -167,9 +172,7 @@ defmodule X402.Client do
           | {:invalid_policy_result, term()}
           | term()
 
-  # Payment flows (spec §6.1) this client knows how to run. Only the default
-  # verify → resource → settle ordering is implemented; `upfront` and
-  # `escrow` commit funds before the resource executes and are skipped.
+  # Escrow is recognized only for its dedicated auth-capture signer.
   @recognized_payment_flows ["authorization"]
 
   @type build_error ::
@@ -488,6 +491,7 @@ defmodule X402.Client do
       extra when is_map(extra) ->
         case Utils.map_value(extra, {"paymentFlow", :paymentFlow}) do
           nil -> true
+          "escrow" -> Utils.map_value(requirements, {"scheme", :scheme}) == "auth-capture"
           flow -> flow in @recognized_payment_flows
         end
 
@@ -639,7 +643,8 @@ defmodule X402.Client do
     scheme = Utils.map_value(requirements, {"scheme", :scheme})
     network = Utils.map_value(requirements, {"network", :network})
 
-    with {:ok, module} <- resolve_scheme(requirements, Keyword.fetch!(opts, :schemes)),
+    with true <- recognized_payment_flow?(requirements),
+         {:ok, module} <- resolve_scheme(requirements, Keyword.fetch!(opts, :schemes)),
          true <- Scheme.signs?(module) do
       case module.sign(requirements, signer, opts) do
         {:ok, scheme_payload} when is_map(scheme_payload) ->

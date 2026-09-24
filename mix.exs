@@ -87,6 +87,9 @@ defmodule X402.MixProject do
       # Runtime instrumentation
       {:telemetry, "~> 1.0"},
 
+      # Metric definitions for LiveDashboard / reporters (optional)
+      {:telemetry_metrics, "~> 1.0", optional: true},
+
       # EVM signature verification (optional — only needed for SIWX)
       {:ex_secp256k1, "~> 0.8.0", optional: true},
       {:ex_keccak, "~> 0.7.8", optional: true},
@@ -134,6 +137,8 @@ defmodule X402.MixProject do
         LICENSE: [title: "License"],
         "guides/getting-started.md": [title: "Getting Started"],
         "guides/client.md": [title: "Paying for Resources"],
+        "guides/authentication.md": [title: "Authentication Extensions"],
+        "guides/auth-capture.md": [title: "Auth-capture on EVM"],
         "guides/plug-integration.md": [title: "Plug/Phoenix Integration"],
         "guides/custom-schemes.md": [title: "Custom Payment Schemes"],
         "guides/mcp.md": [title: "Paid MCP Tools"],
@@ -151,11 +156,18 @@ defmodule X402.MixProject do
           X402.PaymentRequirements,
           X402.PaymentRequired,
           X402.PaymentSignature,
-          X402.PaymentResponse
+          X402.PaymentResponse,
+          X402.ExtensionResponses
         ],
         "Payer Client": [
           X402.Client,
           X402.Client.Finch,
+          X402.Client.Budget,
+          X402.Client.Hooks,
+          X402.Client.Hooks.Context,
+          X402.Client.Hooks.Default,
+          X402.Client.Policy,
+          X402.Client.SIWX,
           X402.Signer,
           X402.Signer.LocalKey,
           X402.Signer.SolanaKey,
@@ -169,6 +181,7 @@ defmodule X402.MixProject do
           X402.Facilitator.Auth.CDP,
           X402.Facilitator.Error,
           X402.Facilitator.HTTP,
+          X402.Facilitator.Failover,
           X402.Hooks,
           X402.Hooks.Context,
           X402.Hooks.Default,
@@ -176,8 +189,11 @@ defmodule X402.MixProject do
         ],
         "Plug Integration": [
           X402.Plug.PaymentGate,
+          X402.Plug.HTTPSignatureDirectory,
           X402.Paywall,
           X402.Paywall.Default,
+          X402.RateLimiter,
+          X402.RateLimiter.ETS,
           X402.Extension
         ],
         "Payment Schemes": [
@@ -186,6 +202,7 @@ defmodule X402.MixProject do
           X402.Scheme.ExactEVM,
           X402.Scheme.ExactSVM,
           X402.Scheme.UptoEVM,
+          X402.Scheme.AuthCaptureEVM,
           X402.Scheme.EVM
         ],
         "MCP Transport": [
@@ -194,6 +211,7 @@ defmodule X402.MixProject do
           X402.MCP.Client
         ],
         "Local Verification": [
+          X402.Verify.AuthCaptureEVM,
           X402.Verify.EVM,
           X402.Verify.SVM,
           X402.RPC,
@@ -209,6 +227,16 @@ defmodule X402.MixProject do
           X402.RLP,
           X402.Transaction
         ],
+        "Auth-capture": [
+          X402.AuthCapture,
+          X402.AuthCapture.EVM,
+          X402.AuthCapture.Engine,
+          X402.AuthCapture.Resource,
+          X402.AuthCapture.Store,
+          X402.AuthCapture.ETSStore,
+          X402.AuthCapture.Journal,
+          X402.AuthCapture.Receipt
+        ],
         Solana: [
           X402.Solana,
           X402.Solana.RPC,
@@ -218,15 +246,27 @@ defmodule X402.MixProject do
         Utilities: [
           X402.Wallet,
           X402.Telemetry,
+          X402.Telemetry.Metrics,
+          X402.Telemetry.Stats,
           X402.Behaviour,
           X402.Utils
         ],
+        "HTTP Message Signatures": [
+          X402.HTTPSignature,
+          X402.HTTPSignature.Key,
+          X402.HTTPSignature.StructuredField
+        ],
         Extensions: [
+          X402.Extensions.AuthHints,
+          X402.Extensions.AuthHints.Adapter,
           X402.Extensions.Bazaar,
+          X402.Extensions.Bazaar.Metadata,
           X402.Extensions.BuilderCode,
           X402.Extensions.BuilderCode.Adapter,
           X402.Extensions.EIP2612GasSponsoring,
           X402.Extensions.ERC20ApprovalGasSponsoring,
+          X402.Extensions.HTTPMessageSignatures,
+          X402.Extensions.HTTPMessageSignatures.Adapter,
           X402.Extensions.PaymentIdentifier,
           X402.Extensions.PaymentIdentifier.Adapter,
           X402.Extensions.PaymentIdentifier.Cache,

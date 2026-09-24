@@ -10,10 +10,12 @@ defmodule X402.MCP.Client do
   2. Extract the `PaymentRequired` object from the payment-required tool
      result (or from a `402`/`-32042` JSON-RPC error).
   3. With `:siwx` configured and a `sign-in-with-x` challenge advertised,
-     sign it and retry the call with the proof in
+     validate its domain and exact URI pins, obtain `:on_payment_required`
+     consent, then sign it and retry the call with the proof in
      `_meta["x402/sign-in-with-x"]` and no payment; a result that is not
      payment-required is returned as-is.
-  4. Invoke the `:on_payment_required` hook, which may cancel.
+  4. A fresh payment-required result needs fresh consent before either its
+     SIWX proof or payment is signed. Without SIWX, obtain consent before payment.
   5. Build and sign a payment via `X402.Client.build_payment/3`, reserve
      its amount against `:budget` (when given), and retry the tool call once
      with the payload in request `_meta["x402/payment"]`.
@@ -55,17 +57,24 @@ defmodule X402.MCP.Client do
 
   ## Sign-In-With-X
 
-  With `siwx: [chain_id: :auto, domain: "mcp.example.com"]` the client
+  With `siwx: [chain_id: :auto, domain: "mcp.example.com",
+  uri: "https://mcp.example.com/tools/premium_search"]` the client
   answers a `sign-in-with-x` challenge advertised in the payment-required
   result before paying: the tool call is retried with the proof in
   `_meta["x402/sign-in-with-x"]` (see `X402.MCP.put_siwx/2`) and no
   payment. A result that is not payment-required is returned with
   `siwx_authenticated: true`; another payment-required result continues
   with the payment flow, the paid call carrying a proof for the new
-  challenge. MCP resources have no trusted HTTP origin, so `:domain` is
-  required to pin the challenge to the server you expect. Without it,
-  an advertised challenge fails with `{:error, {:siwx, :domain_mismatch}}`
-  before the wallet signs or the call is retried.
+  challenge. The callback does not expose a verifiable transport origin, so
+  both `:domain` and an exact HTTP(S) `:uri` pin are required. Missing or
+  mismatched pins fail with `:domain_mismatch` / `:uri_mismatch` before consent,
+  wallet signing, or retry. Never derive these pins from the challenge.
+
+  The caller must bind `call_fun` to the independently trusted server (for
+  example, a fixed HTTPS endpoint or trusted local process). Pins constrain
+  the signed audience; they cannot authenticate an arbitrary callback or
+  prevent a malicious transport from relaying challenges for that same audience.
+  `:on_payment_required` can veto each challenge before either kind of signature.
   """
 
   alias X402.Client
@@ -131,7 +140,8 @@ defmodule X402.MCP.Client do
       default: nil,
       doc: """
       Automatic Sign-In-With-X: a keyword list of `X402.Client.SIWX`
-      options (`chain_id:` required, or `:auto`; `domain:` required).
+      options (`chain_id:` required, or `:auto`; `domain:` and `uri:` required
+      when a challenge is advertised).
       `nil`/`false` disables it.
       """
     ],
@@ -140,12 +150,17 @@ defmodule X402.MCP.Client do
       default: 60,
       doc: "Clock-skew buffer for the authorization's `validAfter`, in seconds."
     ],
+    auth_capture: [
+      type: {:custom, X402.Scheme.AuthCaptureEVM, :validate_options, []},
+      default: [],
+      doc: "Auth-capture signing options forwarded to `X402.Client.build_payment/3`."
+    ],
     on_payment_required: [
       type: {:or, [{:fun, 1}, nil]},
       default: nil,
       doc: """
       Budget/consent hook invoked with the decoded `PaymentRequired` map
-      before any payment is signed. Return `:cancel` to abort with
+      once per challenge before any SIWX proof or payment is signed. Return `:cancel` to abort with
       `{:error, :payment_cancelled}`; any other return value continues.
       """
     ]
@@ -274,19 +289,22 @@ defmodule X402.MCP.Client do
   @spec pay_and_retry(map(), call_fun(), keyword(), map()) ::
           {:ok, response()} | {:error, call_error()}
   defp pay_and_retry(request, call_fun, opts, payment_required) do
-    with :ok <- ensure_not_already_paid(request),
-         {:ok, outcome} <- try_siwx(request, call_fun, opts, payment_required) do
-      case outcome do
-        {:done, response} -> {:ok, response}
-        {:pay, payment_required, request} -> pay(request, call_fun, opts, payment_required)
-      end
+    with :ok <- ensure_not_already_paid(request) do
+      try_siwx(request, call_fun, opts, payment_required)
     end
   end
 
   @spec pay(map(), call_fun(), keyword(), map()) :: {:ok, response()} | {:error, call_error()}
   defp pay(request, call_fun, opts, payment_required) do
-    with :ok <- consent(opts, payment_required),
-         {:ok, payload} <-
+    with :ok <- consent(opts, payment_required) do
+      pay_approved(request, call_fun, opts, payment_required)
+    end
+  end
+
+  @spec pay_approved(map(), call_fun(), keyword(), map()) ::
+          {:ok, response()} | {:error, call_error()}
+  defp pay_approved(request, call_fun, opts, payment_required) do
+    with {:ok, payload} <-
            Client.build_payment(payment_required, opts[:signer], build_opts(opts)),
          :ok <- reserve_budget(opts, payload),
          {:ok, retry_result} <-
@@ -301,20 +319,16 @@ defmodule X402.MCP.Client do
 
   # -- Sign-In-With-X ---------------------------------------------------------
 
-  # Outcome of the SIWX attempt: `{:done, response}` when the server answered
-  # the proof with anything but a fresh payment challenge, or
-  # `{:pay, payment_required, request}` with the challenge to pay for and the
-  # request (carrying the proof for it) to attach the payment to.
   @spec try_siwx(map(), call_fun(), keyword(), map()) ::
-          {:ok, {:done, response()} | {:pay, map(), map()}} | {:error, call_error()}
+          {:ok, response()} | {:error, call_error()}
   defp try_siwx(request, call_fun, opts, payment_required) do
     case Keyword.fetch!(opts, :siwx) do
       nil ->
-        {:ok, {:pay, payment_required, request}}
+        pay(request, call_fun, opts, payment_required)
 
       siwx_opts ->
         case sign_siwx(opts, payment_required, siwx_opts) do
-          :none -> {:ok, {:pay, payment_required, request}}
+          :none -> pay(request, call_fun, opts, payment_required)
           {:ok, proof} -> authenticate_siwx(request, proof, call_fun, opts, siwx_opts)
           {:error, _reason} = error -> error
         end
@@ -324,16 +338,22 @@ defmodule X402.MCP.Client do
   # Returns a proof for the advertised challenge, or
   # `:none` when the server advertised no challenge.
   @spec sign_siwx(keyword(), map(), keyword()) ::
-          {:ok, ClientSIWX.proof()} | :none | {:error, {:siwx, ClientSIWX.reason()}}
+          {:ok, ClientSIWX.proof()} | :none | {:error, call_error()}
   defp sign_siwx(opts, payment_required, siwx_opts) do
-    ClientSIWX.authenticate(payment_required, opts[:signer], siwx_opts, transport: :mcp)
+    case ClientSIWX.authenticate(payment_required, opts[:signer], siwx_opts,
+           transport: :mcp,
+           before_sign: fn -> consent(opts, payment_required) end
+         ) do
+      {:error, {:siwx, :payment_cancelled}} -> {:error, :payment_cancelled}
+      result -> result
+    end
   end
 
   # A second challenge gets a fresh proof (its nonce differs from the one
   # just used); without one the paid call goes out with no proof at all
   # rather than a stale one.
   @spec authenticate_siwx(map(), ClientSIWX.proof(), call_fun(), keyword(), keyword()) ::
-          {:ok, {:done, response()} | {:pay, map(), map()}} | {:error, call_error()}
+          {:ok, response()} | {:error, call_error()}
   defp authenticate_siwx(request, proof, call_fun, opts, siwx_opts) do
     proving = MCP.put_siwx(request, proof.header)
 
@@ -341,22 +361,27 @@ defmodule X402.MCP.Client do
       case MCP.fetch_payment_required(result) do
         {:ok, payment_required} ->
           emit_siwx(:payment_required, proof.chain_id)
-          pay_with_fresh_proof(request, opts, payment_required, siwx_opts)
+          pay_with_fresh_proof(request, call_fun, opts, payment_required, siwx_opts)
 
         :error ->
           emit_siwx(:authenticated, proof.chain_id)
-          {:ok, {:done, finalize(result, false, true)}}
+          {:ok, finalize(result, false, true)}
       end
     end
   end
 
-  @spec pay_with_fresh_proof(map(), keyword(), map(), keyword()) ::
-          {:ok, {:pay, map(), map()}} | {:error, {:siwx, ClientSIWX.reason()}}
-  defp pay_with_fresh_proof(request, opts, payment_required, siwx_opts) do
+  @spec pay_with_fresh_proof(map(), call_fun(), keyword(), map(), keyword()) ::
+          {:ok, response()} | {:error, call_error()}
+  defp pay_with_fresh_proof(request, call_fun, opts, payment_required, siwx_opts) do
     case sign_siwx(opts, payment_required, siwx_opts) do
-      {:ok, proof} -> {:ok, {:pay, payment_required, MCP.put_siwx(request, proof.header)}}
-      :none -> {:ok, {:pay, payment_required, request}}
-      {:error, _reason} = error -> error
+      {:ok, proof} ->
+        pay_approved(MCP.put_siwx(request, proof.header), call_fun, opts, payment_required)
+
+      :none ->
+        pay(request, call_fun, opts, payment_required)
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -381,8 +406,16 @@ defmodule X402.MCP.Client do
           {:ok, map()} | {:error, term()}
   defp settle_budget(result, opts, payload) do
     case Keyword.fetch!(opts, :budget) do
-      nil -> result
-      budget -> settle_budget(result, budget, payload, accepted?(result))
+      nil ->
+        result
+
+      budget ->
+        settle_budget(
+          result,
+          budget,
+          payload,
+          Budget.retain_after_dispatch?(payload) or accepted?(result)
+        )
     end
   end
 
@@ -457,6 +490,7 @@ defmodule X402.MCP.Client do
         :max_amount,
         :policies,
         :hooks,
+        :auth_capture,
         :valid_after_buffer
       ])
 

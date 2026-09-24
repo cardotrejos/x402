@@ -535,6 +535,37 @@ and accept a bare keyword list to target the default facilitator name.
 typed maps, which the pure `filter_by_network/2`, `filter_by_scheme/2`,
 and `filter_by_max_price/2` helpers narrow client-side.
 
+## Client failover
+
+`X402.Facilitator` can use ordered fallback endpoints:
+
+```elixir
+{X402.Facilitator,
+ name: MyApp.Facilitator,
+ finch: MyApp.Finch,
+ url: "https://primary.example.com",
+ fallbacks: [[url: "https://backup.example.com"]],
+ failover: [max_attempts: 2, cooldown_ms: 30_000]}
+```
+
+Verification and discovery move to the next endpoint after transport errors
+or HTTP 5xx responses, but not HTTP 4xx or protocol-level payment rejections.
+Failed endpoints enter a cooldown. Authentication is configured per endpoint;
+the primary's credentials are not inherited by a fallback.
+
+Settlement is stricter: failover only occurs for errors proving the request
+was not delivered, such as connection refusal or DNS failure. TLS alerts,
+timeouts, and HTTP 5xx are ambiguous and never trigger settlement failover.
+With fallbacks configured, settlement makes only one HTTP attempt per
+endpoint, regardless of `max_retries`, so later errors cannot hide an
+earlier ambiguous attempt. Reconcile with
+the original facilitator rather than sending the same authorization to
+another provider. With no fallbacks configured, existing single-endpoint
+retry behavior is unchanged.
+
+`[:x402, :facilitator, :failover]` reports endpoint transitions.
+See `X402.Facilitator.Failover` for the retry policy and endpoint options.
+
 ## Production notes
 
 * **Authentication** — the scaffold's `:auth_token` is a minimal bearer

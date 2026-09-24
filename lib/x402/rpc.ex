@@ -62,6 +62,9 @@ defmodule X402.RPC do
   @typedoc "Per-request outcome inside a successful batch response."
   @type batch_result :: {:ok, term()} | {:error, {:jsonrpc_error, jsonrpc_error()}}
 
+  @typedoc "A block tag, hex quantity, or EIP-1898 block-hash/number reference."
+  @type block_reference :: String.t() | %{required(String.t()) => String.t() | boolean()}
+
   @config_schema [
     rpc_url: [
       type: :string,
@@ -84,6 +87,29 @@ defmodule X402.RPC do
   ]
 
   @json_headers [{"content-type", "application/json"}, {"accept", "application/json"}]
+
+  @doc since: "0.9.0"
+  @doc """
+  Decodes a canonical, uint256-bounded JSON-RPC hex quantity.
+
+  Rejects signs, empty digits, and leading zeros other than `"0x0"`.
+
+  ## Examples
+
+      iex> X402.RPC.decode_quantity("0x2105")
+      {:ok, 8453}
+
+      iex> X402.RPC.decode_quantity("0x00")
+      {:error, :invalid_quantity}
+  """
+  @spec decode_quantity(term()) :: {:ok, non_neg_integer()} | {:error, :invalid_quantity}
+  def decode_quantity("0x" <> digits) when byte_size(digits) in 1..64 do
+    if Regex.match?(~r/\A(?:0|[1-9a-fA-F][0-9a-fA-F]*)\z/, digits),
+      do: {:ok, String.to_integer(digits, 16)},
+      else: {:error, :invalid_quantity}
+  end
+
+  def decode_quantity(_value), do: {:error, :invalid_quantity}
 
   @doc since: "0.6.0"
   @doc """
@@ -185,9 +211,11 @@ defmodule X402.RPC do
   Performs an `eth_call` against the given block (default `"latest"`).
 
   The call object accepts `:to`, `:data`, and optionally `:from` (atom or
-  string keys). Returns the raw `0x`-prefixed return data.
+  string keys). `block` may also be an EIP-1898 reference such as
+  `%{"blockHash" => hash, "requireCanonical" => true}`.
+  Returns the raw `0x`-prefixed return data.
   """
-  @spec call(t(), map(), String.t()) :: {:ok, String.t()} | {:error, error()}
+  @spec call(t(), map(), block_reference()) :: {:ok, String.t()} | {:error, error()}
   def call(%__MODULE__{} = rpc, call_object, block \\ "latest") when is_map(call_object) do
     request(rpc, "eth_call", [normalize_call_object(call_object), block])
   end
@@ -199,7 +227,7 @@ defmodule X402.RPC do
 
   A plain externally-owned account returns `{:ok, "0x"}`.
   """
-  @spec get_code(t(), String.t(), String.t()) :: {:ok, String.t()} | {:error, error()}
+  @spec get_code(t(), String.t(), block_reference()) :: {:ok, String.t()} | {:error, error()}
   def get_code(%__MODULE__{} = rpc, address, block \\ "latest") when is_binary(address) do
     request(rpc, "eth_getCode", [address, block])
   end
