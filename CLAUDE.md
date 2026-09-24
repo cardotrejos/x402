@@ -2,7 +2,7 @@
 # CLAUDE.md — x402 Elixir SDK
 
 The authoritative contributor guide is [AGENTS.md](AGENTS.md). Read it first; it covers the
-module map, key commands, testing rules, CI readiness, and the protocol reference.
+module map, key commands, testing rules, and the protocol reference.
 
 ## Non-negotiables (from AGENTS.md)
 
