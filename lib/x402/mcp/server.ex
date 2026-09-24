@@ -437,8 +437,11 @@ defmodule X402.MCP.Server do
       "extensions" => config.extensions
     }
 
-    {:ok, result} = MCP.payment_required_result(payment_required)
-    result
+    case MCP.payment_required_result(payment_required) do
+      {:ok, result} -> result
+      # init/1 guarantees encodability; this is a defensive fallback.
+      {:error, _reason} -> internal_error_result()
+    end
   end
 
   # -- Verification -----------------------------------------------------------
