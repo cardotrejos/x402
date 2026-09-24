@@ -164,10 +164,6 @@ defmodule X402.Plug.PaymentGateTest do
   @upto_route Map.put(@route, :scheme, "upto")
   @permit2_route Map.put(@route, :extra, %{"assetTransferMethod" => "permit2"})
 
-  # ---------------------------------------------------------------------------
-  # Route matching
-  # ---------------------------------------------------------------------------
-
   describe "route matching" do
     test "passes through non-gated routes" do
       conn = run_request(conn(:get, "/public"), routes: [@route], facilitator: self())
@@ -260,12 +256,10 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
   # Route matching against path aliases — regression tests for the
   # GHSA-3j63-5h8p-gf7c bug class (route bypass via alternate spellings of a
   # protected path). Matching runs on decoded conn.path_info segments so the
   # gate agrees with what the downstream router serves.
-  # ---------------------------------------------------------------------------
 
   describe "route matching against encoded path aliases" do
     test "gates routes mounted behind a forwarded prefix (script_name)" do
@@ -345,11 +339,6 @@ defmodule X402.Plug.PaymentGateTest do
       assert conn.status == 200
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Local pre-verification checks — cheap payTo/amount/timing validation on the
-  # EIP-3009 authorization object before the facilitator round-trip.
-  # ---------------------------------------------------------------------------
 
   describe "local pre-verification checks" do
     test "rejects a payTo mismatch without calling the facilitator" do
@@ -503,9 +492,7 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # PaymentRequired (402 signaling) — §5.1 + HTTP transport
-  # ---------------------------------------------------------------------------
+  # PaymentRequired: x402 v2 §5.1 and the HTTP transport binding.
 
   describe "PaymentRequired response (402)" do
     test "emits PAYMENT-REQUIRED header with full v2 PaymentRequired schema" do
@@ -578,9 +565,7 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # PaymentPayload structure + accepted matching — §5.2
-  # ---------------------------------------------------------------------------
+  # PaymentPayload structure and accepted matching: x402 v2 §5.2.
 
   describe "PaymentPayload structure" do
     test "requires x402Version 2 (missing version is invalid)" do
@@ -806,10 +791,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Multi-accept routes
-  # ---------------------------------------------------------------------------
-
   describe "multi-accept routes" do
     @solana_accept %{
       scheme: "exact",
@@ -910,10 +891,6 @@ defmodule X402.Plug.PaymentGateTest do
       refute_received {:verify_called, _, _}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Happy path: verify → settle → PAYMENT-RESPONSE + assigns
-  # ---------------------------------------------------------------------------
 
   describe "successful payment flow" do
     test "verifies before the handler and settles only when its response is sent" do
@@ -1091,10 +1068,6 @@ defmodule X402.Plug.PaymentGateTest do
       refute_received {:verify_called, _, _}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Claim ordering relative to facilitator verification
-  # ---------------------------------------------------------------------------
 
   describe "claim_order" do
     test "defaults to :after_verify" do
@@ -1374,10 +1347,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Replay protection through the Cache behaviour
-  # ---------------------------------------------------------------------------
-
   describe "payment identifier cache adapters" do
     test "init/1 wraps a pid or name in the default ETSCache adapter" do
       pid = self()
@@ -1636,10 +1605,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Facilitator failure modes + PAYMENT-RESPONSE
-  # ---------------------------------------------------------------------------
-
   describe "facilitator failures" do
     test "returns 500 when verify has a transport failure" do
       bypass = Bypass.open()
@@ -1823,10 +1788,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Config validation
-  # ---------------------------------------------------------------------------
-
   describe "init/1 validation" do
     test "normalizes :global and :via names to the default ETSCache adapter" do
       global = PaymentGate.init(routes: [@route], payment_identifier_cache: {:global, :my_cache})
@@ -1919,10 +1880,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Telemetry
-  # ---------------------------------------------------------------------------
-
   describe "telemetry" do
     test "emits pass_through, payment_required, payment_verified, payment_rejected" do
       ok = start_mock_facilitator()
@@ -1982,10 +1939,6 @@ defmodule X402.Plug.PaymentGateTest do
                       %{path: "/api/resource"}}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Browser paywall (:paywall option)
-  # ---------------------------------------------------------------------------
 
   defmodule CustomPaywall do
     @moduledoc false
@@ -2222,10 +2175,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Inline local verification (:local_verification option)
-  # ---------------------------------------------------------------------------
-
   @eip712_extra %{"name" => "USDC", "version" => "2"}
 
   describe "local verification" do
@@ -2433,10 +2382,6 @@ defmodule X402.Plug.PaymentGateTest do
       assert_receive {:verify_called, _payload, _requirements}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Canonical replay keys
-  # ---------------------------------------------------------------------------
 
   defmodule NoteScheme do
     @moduledoc false
@@ -2858,10 +2803,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Payment identifier extension surfacing
-  # ---------------------------------------------------------------------------
-
   describe "extension responses sidechannel" do
     test "assigns verify-time outcomes and tags settle telemetry without forwarding them" do
       {:ok, verify_header} =
@@ -3168,10 +3109,6 @@ defmodule X402.Plug.PaymentGateTest do
       assert decode_payment_required!(second)["error"] == "payment_identifier_conflict"
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # payment-identifier extension (spec format)
-  # ---------------------------------------------------------------------------
 
   describe "payment-identifier extension" do
     @spec_id "abcdefghijklmnopqrstuvwxyz012345"
@@ -3639,10 +3576,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # settlement_pending settle retry
-  # ---------------------------------------------------------------------------
-
   describe "settlement_pending settle retry" do
     test "retries the settle once when settlement_pending carries a transaction hash" do
       bypass = Bypass.open()
@@ -3775,10 +3708,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Route and option validation edge cases
-  # ---------------------------------------------------------------------------
-
   describe "route and option validation edge cases" do
     test "validate_route/1 validates a route map against the built-in schemes" do
       assert {:ok, %{path: "/api/resource"}} = PaymentGate.validate_route(@route)
@@ -3825,10 +3754,6 @@ defmodule X402.Plug.PaymentGateTest do
                {:error, ~s(unsupported payment flow: "streaming")}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Advertised requirements normalization
-  # ---------------------------------------------------------------------------
 
   describe "advertised requirements normalization" do
     test "omits empty serviceName and iconUrl from ResourceInfo" do
@@ -3882,10 +3807,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Payment payload rejection edge cases
-  # ---------------------------------------------------------------------------
-
   describe "payment payload rejection edge cases" do
     test "rejects payloads whose accepted object has invalid field types" do
       header =
@@ -3931,10 +3852,6 @@ defmodule X402.Plug.PaymentGateTest do
       assert_receive {:settle_called, _payload, _requirements}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Settlement amount edge cases
-  # ---------------------------------------------------------------------------
 
   describe "settlement amount edge cases" do
     test "put_settlement_amount/2 normalizes integer amounts" do
@@ -3997,10 +3914,8 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
   # Facilitator response shape validation — hook-replaced results exercise the
   # defensive clauses for responses the HTTP transport itself never produces.
-  # ---------------------------------------------------------------------------
 
   describe "facilitator response shape validation" do
     test "rejects verify results without a map body" do
@@ -4083,10 +3998,6 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Facilitator failure reason mapping
-  # ---------------------------------------------------------------------------
-
   describe "facilitator failure reason mapping" do
     test "surfaces a binary settlement failure reason as a PAYMENT-RESPONSE" do
       facilitator = start_mock_facilitator(settle: {:ok, %{status: 500, body: %{}}})
@@ -4139,10 +4050,6 @@ defmodule X402.Plug.PaymentGateTest do
       end
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Helpers
-  # ---------------------------------------------------------------------------
 
   defp run_request(conn, opts) do
     conn

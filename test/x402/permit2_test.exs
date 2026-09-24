@@ -220,8 +220,6 @@ defmodule X402.Permit2Test do
     end
   end
 
-  # -- exact (Permit2 transfer method) ----------------------------------------
-
   @exact_spender "0x402085c248EeA27D92E8b30b2C58ed07f9E20001"
   @exact_witness_type_string "Witness witness)TokenPermissions(address token,uint256 amount)" <>
                                "Witness(address to,uint256 validAfter)"

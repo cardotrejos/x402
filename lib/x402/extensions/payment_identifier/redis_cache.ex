@@ -267,8 +267,6 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCache do
 
   def validate_command_module(other), do: {:error, command_module_error(other)}
 
-  # -- Internal ---------------------------------------------------------------
-
   @spec run(t(), [String.t()]) :: {:ok, term()} | {:error, term()}
   defp run(%__MODULE__{command: command, conn: conn}, redis_command) do
     command.command(conn, redis_command)

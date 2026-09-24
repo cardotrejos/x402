@@ -252,9 +252,7 @@ defmodule X402.Extensions.OfferReceipt do
           | :missing_dependency
           | :invalid_signature
 
-  # ---------------------------------------------------------------------------
-  # Payload construction (server side)
-  # ---------------------------------------------------------------------------
+  # -- Payload construction (server side) -----------------------------------
 
   @doc since: "0.6.0"
   @doc group: :offers
@@ -367,9 +365,7 @@ defmodule X402.Extensions.OfferReceipt do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # EIP-712 signing (server side)
-  # ---------------------------------------------------------------------------
+  # -- EIP-712 signing (server side) ----------------------------------------
 
   @doc since: "0.6.0"
   @doc group: :offers
@@ -435,9 +431,7 @@ defmodule X402.Extensions.OfferReceipt do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # JWS signing (server side)
-  # ---------------------------------------------------------------------------
+  # -- JWS signing (server side) --------------------------------------------
 
   @doc since: "0.6.0"
   @doc group: :offers
@@ -489,9 +483,7 @@ defmodule X402.Extensions.OfferReceipt do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Verification (client side)
-  # ---------------------------------------------------------------------------
+  # -- Verification (client side) -------------------------------------------
 
   @doc since: "0.6.0"
   @doc group: :offers
@@ -571,9 +563,7 @@ defmodule X402.Extensions.OfferReceipt do
   def extract_payload(%{"format" => format}), do: {:error, {:unsupported_format, format}}
   def extract_payload(_envelope), do: {:error, :invalid_envelope}
 
-  # ---------------------------------------------------------------------------
-  # EIP-712 digests
-  # ---------------------------------------------------------------------------
+  # -- EIP-712 digests ------------------------------------------------------
 
   @doc since: "0.6.0"
   @doc group: :offers
@@ -606,9 +596,7 @@ defmodule X402.Extensions.OfferReceipt do
     digest(payload, @receipt_domain_name, @receipt_type, receipt_hash_fields())
   end
 
-  # ---------------------------------------------------------------------------
-  # Extension envelope (declaration)
-  # ---------------------------------------------------------------------------
+  # -- Extension envelope (declaration) -------------------------------------
 
   @doc since: "0.6.0"
   @doc group: :declaration
@@ -768,9 +756,7 @@ defmodule X402.Extensions.OfferReceipt do
 
   def validate_receipt(_envelope), do: {:error, :invalid_envelope}
 
-  # ---------------------------------------------------------------------------
-  # Network conversion
-  # ---------------------------------------------------------------------------
+  # -- Network conversion ---------------------------------------------------
 
   @doc since: "0.6.0"
   @doc """
@@ -808,9 +794,7 @@ defmodule X402.Extensions.OfferReceipt do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Shared verification
-  # ---------------------------------------------------------------------------
+  # -- Shared verification --------------------------------------------------
 
   @spec verify(envelope(), keyword(), :offer | :receipt) ::
           {:ok, verification()} | {:error, verify_error()}
@@ -916,9 +900,7 @@ defmodule X402.Extensions.OfferReceipt do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # EIP-712 hashing
-  # ---------------------------------------------------------------------------
+  # -- EIP-712 hashing ------------------------------------------------------
 
   # {wire key, kind, default} — `kind` selects string-hash vs uint256 word,
   # `default` fills the spec's zero-value for optional fields (§4.3, §5.3).
@@ -1032,9 +1014,7 @@ defmodule X402.Extensions.OfferReceipt do
     }
   end
 
-  # ---------------------------------------------------------------------------
-  # Payload normalization and validation
-  # ---------------------------------------------------------------------------
+  # -- Payload normalization and validation ---------------------------------
 
   @spec normalize_offer_payload(payload()) :: payload()
   defp normalize_offer_payload(payload),
@@ -1206,9 +1186,7 @@ defmodule X402.Extensions.OfferReceipt do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Declaration schemas (§6)
-  # ---------------------------------------------------------------------------
+  # -- Declaration schemas (§6) ---------------------------------------------
 
   @spec uniform_format!([envelope()]) :: String.t()
   defp uniform_format!(offers) do
@@ -1325,9 +1303,7 @@ defmodule X402.Extensions.OfferReceipt do
     }
   end
 
-  # ---------------------------------------------------------------------------
-  # Small helpers
-  # ---------------------------------------------------------------------------
+  # -- Small helpers --------------------------------------------------------
 
   @spec to_amount_string(String.t() | non_neg_integer()) :: String.t()
   defp to_amount_string(amount) when is_binary(amount), do: amount

@@ -65,8 +65,6 @@ defmodule X402.Plug.FacilitatorTest do
     end
   end
 
-  # -- Fixtures ---------------------------------------------------------------
-
   defp requirements(overrides \\ %{}) do
     Map.merge(
       %{
@@ -181,8 +179,6 @@ defmodule X402.Plug.FacilitatorTest do
     FacilitatorPlug.init(engines: [evm_engine, svm_engine(context.finch)])
   end
 
-  # -- init/1 -----------------------------------------------------------------
-
   describe "init/1" do
     test "requires a built engine" do
       assert_raise NimbleOptions.ValidationError, fn ->
@@ -223,8 +219,6 @@ defmodule X402.Plug.FacilitatorTest do
     end
   end
 
-  # -- GET /supported ---------------------------------------------------------
-
   describe "GET /supported" do
     test "returns the engine's supported response", context do
       conn = :get |> conn("/supported") |> FacilitatorPlug.call(plug_options(context))
@@ -241,8 +235,6 @@ defmodule X402.Plug.FacilitatorTest do
              }
     end
   end
-
-  # -- POST /verify -----------------------------------------------------------
 
   describe "POST /verify" do
     test "answers 200 with the verify response for a valid payment", context do
@@ -323,8 +315,6 @@ defmodule X402.Plug.FacilitatorTest do
     end
   end
 
-  # -- POST /settle -----------------------------------------------------------
-
   describe "POST /settle" do
     test "answers 200 with the settle response", context do
       options = plug_options(context)
@@ -354,8 +344,6 @@ defmodule X402.Plug.FacilitatorTest do
       assert %{"success" => false, "transaction" => ""} = json_response(conn)
     end
   end
-
-  # -- EXTENSION-RESPONSES sidechannel -----------------------------------------
 
   describe "extension responses sidechannel" do
     import ExUnit.CaptureLog
@@ -433,8 +421,6 @@ defmodule X402.Plug.FacilitatorTest do
       assert log =~ "unencodable extension responses"
     end
   end
-
-  # -- Body validation --------------------------------------------------------
 
   describe "body validation" do
     test "rejects invalid JSON with 400", context do
@@ -523,8 +509,6 @@ defmodule X402.Plug.FacilitatorTest do
     end
   end
 
-  # -- Authentication ---------------------------------------------------------
-
   describe "authentication" do
     test "requires the bearer token on every endpoint when configured", context do
       options = plug_options(context, auth_token: "secret")
@@ -550,8 +534,6 @@ defmodule X402.Plug.FacilitatorTest do
       assert authorized.status == 200
     end
   end
-
-  # -- Routing ----------------------------------------------------------------
 
   describe "routing" do
     test "unknown paths answer 404", context do
@@ -581,8 +563,6 @@ defmodule X402.Plug.FacilitatorTest do
       end
     end
   end
-
-  # -- Multiple engines ---------------------------------------------------------
 
   describe "multiple engines" do
     test "routes verify by the requirements' network", context do

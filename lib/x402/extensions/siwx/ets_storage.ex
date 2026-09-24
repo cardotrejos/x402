@@ -206,9 +206,7 @@ defmodule X402.Extensions.SIWX.ETSStorage do
 
     # Enforce size cap to prevent unbounded ETS memory growth under spam attacks.
     # An attacker who generates unique (address, resource) pairs would grow the
-    # table without limit until the node OOMs.  We check if the key already
-    # exists (an update never grows the table) and only reject genuinely new
-    # insertions that would push us over the limit.
+    # table without limit until the node OOMs.
     already_exists = :ets.member(state.table, key)
 
     if not already_exists and current_size >= state.max_size do

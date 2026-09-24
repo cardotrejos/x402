@@ -234,10 +234,6 @@ defmodule X402.MCP.ServerTest do
     fn _request -> send(parent, :handler_called) end
   end
 
-  # ---------------------------------------------------------------------------
-  # init/1
-  # ---------------------------------------------------------------------------
-
   describe "init/1" do
     test "compiles accepts, resource, and extensions" do
       config =
@@ -326,10 +322,6 @@ defmodule X402.MCP.ServerTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # PaymentRequired signaling
-  # ---------------------------------------------------------------------------
-
   describe "payment required signaling" do
     test "returns the spec result when no payment is provided" do
       config = config(start_facilitator())
@@ -380,10 +372,6 @@ defmodule X402.MCP.ServerTest do
              }
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # PaymentPayload validation
-  # ---------------------------------------------------------------------------
 
   describe "payment validation" do
     test "rejects non-v2 payloads without contacting the facilitator" do
@@ -531,10 +519,6 @@ defmodule X402.MCP.ServerTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Verify / settle flow
-  # ---------------------------------------------------------------------------
-
   describe "verify and settle" do
     test "verifies, executes, settles, and attaches the receipt to _meta" do
       config = config(start_facilitator())
@@ -656,10 +640,6 @@ defmodule X402.MCP.ServerTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Facilitator response shapes (rewritten through hooks)
-  # ---------------------------------------------------------------------------
-
   describe "unexpected facilitator response shapes" do
     # after_verify/after_settle hooks may replace the operation result, so the
     # server must fail closed on any shape a hook (or future transport) hands
@@ -713,10 +693,6 @@ defmodule X402.MCP.ServerTest do
       assert_received {:handler_called, _request}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Settlement failure
-  # ---------------------------------------------------------------------------
 
   describe "settlement failure" do
     test "returns the payment error without the tool's content" do
@@ -783,10 +759,6 @@ defmodule X402.MCP.ServerTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Handler behavior
-  # ---------------------------------------------------------------------------
-
   describe "handler behavior" do
     test "returns handler error results unchanged without settling" do
       config = config(start_facilitator())
@@ -833,10 +805,6 @@ defmodule X402.MCP.ServerTest do
       assert retry["_meta"]["x402/payment-response"]["success"] == true
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Replay protection
-  # ---------------------------------------------------------------------------
 
   describe "replay protection" do
     setup do
@@ -913,10 +881,6 @@ defmodule X402.MCP.ServerTest do
       assert second["structuredContent"]["error"] =~ "settlement failed"
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # payment-identifier extension
-  # ---------------------------------------------------------------------------
 
   describe "payment-identifier extension" do
     @spec_id "abcdefghijklmnopqrstuvwxyz012345"
@@ -1118,10 +1082,6 @@ defmodule X402.MCP.ServerTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Cache adapter validation and failures
-  # ---------------------------------------------------------------------------
-
   describe "payment identifier cache adapters" do
     test "a claim failure other than a duplicate fails closed as an internal error" do
       config =
@@ -1172,10 +1132,6 @@ defmodule X402.MCP.ServerTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Telemetry
-  # ---------------------------------------------------------------------------
-
   describe "telemetry" do
     test "emits payment lifecycle events" do
       handler_id = "mcp-server-test-#{System.unique_integer([:positive])}"
@@ -1214,10 +1170,6 @@ defmodule X402.MCP.ServerTest do
                        %{tool: "premium_search", reason: :invalid_x402_version}}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Resource-server lifecycle hooks
-  # ---------------------------------------------------------------------------
 
   defmodule LifecycleHooks do
     @moduledoc false
@@ -1405,10 +1357,6 @@ defmodule X402.MCP.ServerTest do
       refute_received {:on_verified_payment_canceled, _context, _metadata}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Builder code
-  # ---------------------------------------------------------------------------
 
   describe "builder-code echo" do
     alias X402.Extensions.BuilderCode

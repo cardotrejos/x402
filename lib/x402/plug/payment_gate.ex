@@ -1148,7 +1148,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       schemes = validated_schemes!(opts)
       validated_opts = NimbleOptions.validate!(opts, options_schema(schemes))
 
-      cache = Keyword.get(validated_opts, :payment_identifier_cache)
+      cache = Keyword.fetch!(validated_opts, :payment_identifier_cache)
 
       if is_nil(cache) do
         IO.warn(
@@ -2534,12 +2534,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     defp ensure_route_schemes(route, allowed_schemes) do
       route_schemes =
-        case Map.get(route, :accepts, []) do
+        case Map.fetch!(route, :accepts) do
           accepts when is_list(accepts) and accepts != [] ->
-            Enum.map(accepts, &Map.get(&1, :scheme, "exact"))
+            Enum.map(accepts, &Map.fetch!(&1, :scheme))
 
           _empty ->
-            [Map.get(route, :scheme, "exact")]
+            [Map.fetch!(route, :scheme)]
         end
 
       case Enum.reject(route_schemes, &(&1 in allowed_schemes)) do
@@ -2578,7 +2578,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    defp ensure_accept_flow(accept), do: ensure_authorization_flow(Map.get(accept, :extra, %{}))
+    defp ensure_accept_flow(accept), do: ensure_authorization_flow(Map.fetch!(accept, :extra))
 
     @spec ensure_authorization_flow(map()) :: :ok | {:error, String.t()}
     defp ensure_authorization_flow(extra) do
@@ -2622,7 +2622,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       matcher = path_matcher(normalized_path)
 
       accepts =
-        case Map.get(route, :accepts, []) do
+        case Map.fetch!(route, :accepts) do
           fun when is_function(fun, 1) ->
             fun
 
@@ -2632,19 +2632,18 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
           _empty ->
             [
               compile_accept(%{
-                scheme: Map.get(route, :scheme, "exact"),
+                scheme: Map.fetch!(route, :scheme),
                 price: Map.fetch!(route, :price),
                 network: Map.fetch!(route, :network),
                 asset: Map.fetch!(route, :asset),
                 pay_to: Map.fetch!(route, :pay_to),
-                max_timeout_seconds:
-                  Map.get(route, :max_timeout_seconds, @default_max_timeout_seconds),
-                extra: Map.get(route, :extra, %{})
+                max_timeout_seconds: Map.fetch!(route, :max_timeout_seconds),
+                extra: Map.fetch!(route, :extra)
               })
             ]
         end
 
-      description = Map.get(route, :description, @default_description)
+      description = Map.fetch!(route, :description)
       dynamic = dynamic_accepts?(accepts) or is_function(description, 1)
 
       %{
@@ -2658,12 +2657,12 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
         dynamic: dynamic,
         requirements: static_requirements(accepts),
         description: description,
-        mime_type: Map.get(route, :mime_type, @default_mime_type),
-        service_name: Map.get(route, :service_name),
-        tags: Map.get(route, :tags, []),
-        icon_url: Map.get(route, :icon_url),
-        extensions: stringify_keys(Map.get(route, :extensions, %{})),
-        bazaar: Map.get(route, :bazaar)
+        mime_type: Map.fetch!(route, :mime_type),
+        service_name: Map.fetch!(route, :service_name),
+        tags: Map.fetch!(route, :tags),
+        icon_url: Map.fetch!(route, :icon_url),
+        extensions: stringify_keys(Map.fetch!(route, :extensions)),
+        bazaar: Map.fetch!(route, :bazaar)
       }
     end
 
@@ -2687,13 +2686,13 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     @spec compile_accept(map()) :: payment_accept()
     defp compile_accept(accept) do
       %{
-        scheme: Map.get(accept, :scheme, "exact"),
+        scheme: Map.fetch!(accept, :scheme),
         price: Map.fetch!(accept, :price),
         network: Map.fetch!(accept, :network),
         asset: Map.fetch!(accept, :asset),
         pay_to: Map.fetch!(accept, :pay_to),
-        max_timeout_seconds: Map.get(accept, :max_timeout_seconds, @default_max_timeout_seconds),
-        extra: Map.get(accept, :extra, %{})
+        max_timeout_seconds: Map.fetch!(accept, :max_timeout_seconds),
+        extra: Map.fetch!(accept, :extra)
       }
     end
 

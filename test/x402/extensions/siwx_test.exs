@@ -770,8 +770,6 @@ defmodule X402.Extensions.SIWXTest do
     end
   end
 
-  # -- Helpers ----------------------------------------------------------------
-
   defp evm_signer do
     {:ok, signer} = LocalKey.new(@private_key)
     signer

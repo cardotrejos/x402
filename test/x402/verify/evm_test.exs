@@ -19,8 +19,6 @@ defmodule X402.Verify.EVMTest do
   @multicall3 "0xca11bde05977b3631167028862be2a173976ca11"
   @smart_wallet "0x4444444444444444444444444444444444444444"
 
-  # -- Fixtures ---------------------------------------------------------------
-
   defp requirements(overrides \\ %{}) do
     Map.merge(
       %{
@@ -90,8 +88,6 @@ defmodule X402.Verify.EVMTest do
     payload = signed_payload(requirements)
     EVM.verify(payload, requirements, level: :full, rpc: rpc)
   end
-
-  # -- JSON-RPC stub ----------------------------------------------------------
 
   defp stub_defaults do
     %{
@@ -343,8 +339,6 @@ defmodule X402.Verify.EVMTest do
     "0x" <> Base.encode16(<<32::unsigned-big-integer-size(256)>> <> array, case: :lower)
   end
 
-  # -- Structural level -------------------------------------------------------
-
   describe "level :structural" do
     test "accepts a well-formed payload" do
       requirements = requirements()
@@ -587,8 +581,6 @@ defmodule X402.Verify.EVMTest do
     end
   end
 
-  # -- Signature level --------------------------------------------------------
-
   describe "level :signature" do
     test "verifies a payload signed by the payer" do
       requirements = requirements()
@@ -689,8 +681,6 @@ defmodule X402.Verify.EVMTest do
                {:error, {:invalid, :invalid_signature}}
     end
   end
-
-  # -- Full level -------------------------------------------------------------
 
   describe "level :full" do
     setup [:setup_bypass, :setup_finch]

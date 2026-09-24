@@ -237,7 +237,7 @@ defmodule X402.Facilitator do
           GenServer.on_start() | {:error, NimbleOptions.ValidationError.t()}
   def start_link(opts) when is_list(opts) do
     with {:ok, validated_opts} <- validated_opts(opts),
-         {:ok, auth} <- Auth.new(Keyword.get(validated_opts, :auth)),
+         {:ok, auth} <- Auth.new(Keyword.fetch!(validated_opts, :auth)),
          {:ok, fallbacks} <- resolve_fallback_auths(Keyword.fetch!(validated_opts, :fallbacks)) do
       name = Keyword.fetch!(validated_opts, :name)
 
@@ -294,7 +294,7 @@ defmodule X402.Facilitator do
 
   defp resolve_fallback_auths(fallbacks) do
     Enum.reduce_while(fallbacks, {:ok, []}, fn fallback, {:ok, acc} ->
-      case normalize_auth(Keyword.get(fallback, :auth)) do
+      case normalize_auth(Keyword.fetch!(fallback, :auth)) do
         {:ok, auth} -> {:cont, {:ok, [Keyword.put(fallback, :auth, auth) | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -632,34 +632,24 @@ defmodule X402.Facilitator do
   @impl true
   @spec init(keyword()) :: {:ok, state()} | {:stop, term()}
   def init(opts) do
-    with {:ok, auth} <- normalize_auth(Keyword.get(opts, :auth)),
-         {:ok, fallbacks} <- resolve_fallback_auths(Keyword.get(opts, :fallbacks, [])) do
-      primary = %{
-        url: Keyword.fetch!(opts, :url),
-        finch: Keyword.fetch!(opts, :finch),
-        auth: auth,
-        max_retries: Keyword.fetch!(opts, :max_retries),
-        retry_backoff_ms: Keyword.fetch!(opts, :retry_backoff_ms),
-        receive_timeout_ms: Keyword.fetch!(opts, :receive_timeout_ms)
-      }
+    primary = %{
+      url: Keyword.fetch!(opts, :url),
+      finch: Keyword.fetch!(opts, :finch),
+      auth: Keyword.fetch!(opts, :auth),
+      max_retries: Keyword.fetch!(opts, :max_retries),
+      retry_backoff_ms: Keyword.fetch!(opts, :retry_backoff_ms),
+      receive_timeout_ms: Keyword.fetch!(opts, :receive_timeout_ms)
+    }
 
-      state =
-        Map.merge(primary, %{
-          hooks: Keyword.fetch!(opts, :hooks),
-          fallbacks: Failover.build_endpoints(primary, fallbacks),
-          failover: failover_policy(Keyword.get(opts, :failover, [])),
-          breaker: %{}
-        })
+    state =
+      Map.merge(primary, %{
+        hooks: Keyword.fetch!(opts, :hooks),
+        fallbacks: Failover.build_endpoints(primary, Keyword.fetch!(opts, :fallbacks)),
+        failover: Keyword.fetch!(opts, :failover),
+        breaker: %{}
+      })
 
-      {:ok, state}
-    else
-      {:error, reason} -> {:stop, {:invalid_auth, reason}}
-    end
-  end
-
-  defp failover_policy(policy) do
-    {:ok, validated} = Failover.validate_policy(policy)
-    validated
+    {:ok, state}
   end
 
   defp normalize_auth(nil), do: {:ok, nil}
@@ -1100,8 +1090,6 @@ defmodule X402.Facilitator do
         :ok
     end
   end
-
-  # --- read-only GET operations (supported / discovery) ---
 
   defp get_with_telemetry(config, operation, path, query, parser) do
     :telemetry.span(

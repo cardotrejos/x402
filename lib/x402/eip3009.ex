@@ -567,7 +567,6 @@ defmodule X402.EIP3009 do
   defp check_recovery_byte(_signature), do: {:error, :invalid_signature}
 
   # -- Optional dependency resolution ----------------------------------------
-  #
   # Modules are resolved at runtime via Module.concat so the library compiles
   # without ex_secp256k1/ex_keccak (same pattern as
   # X402.Extensions.SIWX.Verifier.Default and X402.Facilitator.HTTP).

@@ -262,8 +262,6 @@ defmodule X402.RPC do
   def validate_finch_name(_other),
     do: {:error, "expected a Finch pool name (atom, pid, or {:via, module, term})"}
 
-  # -- Transport --------------------------------------------------------------
-
   @spec post(t(), map() | list()) :: {:ok, term()} | {:error, error()}
   defp post(%__MODULE__{} = rpc, body) do
     with {:ok, finch_module} <- ensure_finch_module(),
@@ -314,8 +312,6 @@ defmodule X402.RPC do
     end
   end
 
-  # -- Response decoding ------------------------------------------------------
-
   @spec decode_single(term()) :: {:ok, term()} | {:error, error()}
   defp decode_single(%{"error" => error}) when is_map(error),
     do: {:error, {:jsonrpc_error, normalize_jsonrpc_error(error)}}
@@ -361,8 +357,6 @@ defmodule X402.RPC do
 
   defp normalize_message(message) when is_binary(message), do: message
   defp normalize_message(_message), do: nil
-
-  # -- Helpers ----------------------------------------------------------------
 
   @spec emit_result({:ok, term()} | {:error, error()}, String.t() | :batch) ::
           {:ok, term()} | {:error, error()}

@@ -82,10 +82,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Hook modules
-  # ---------------------------------------------------------------------------
-
   # Forwards every resource-server callback to the test process, and lets
   # the test pick the on_protected_request result through the process
   # dictionary-free route: the result is stored in the conn's private map.
@@ -172,10 +168,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
     def on_verified_payment_canceled(_context, _metadata), do: raise("cancel boom")
   end
 
-  # ---------------------------------------------------------------------------
-  # Extension adapters
-  # ---------------------------------------------------------------------------
-
   defmodule RecordingAdapter do
     @moduledoc false
     @behaviour X402.Extension
@@ -204,10 +196,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
     def after_settle(_payload, _requirements, response, _opts),
       do: send(self(), {:adapter_after_settle, response.body["transaction"]})
   end
-
-  # ---------------------------------------------------------------------------
-  # Route templates and path params
-  # ---------------------------------------------------------------------------
 
   describe ":param route templates" do
     test "match one non-empty segment per parameter and assign the captures" do
@@ -365,10 +353,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
       end
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Dynamic pricing
-  # ---------------------------------------------------------------------------
 
   describe "dynamic route fields" do
     test "price functions resolve per request, before the 402 and the match" do
@@ -561,10 +545,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Bazaar advertisement
-  # ---------------------------------------------------------------------------
-
   describe ":bazaar route option" do
     test "advertises routeTemplate and pathParams for template routes" do
       facilitator = start_mock_facilitator()
@@ -635,10 +615,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
       end
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # on_protected_request
-  # ---------------------------------------------------------------------------
 
   describe "on_protected_request" do
     test "runs before payment processing with the request context" do
@@ -791,10 +767,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # on_verified_payment_canceled
-  # ---------------------------------------------------------------------------
-
   describe "on_verified_payment_canceled" do
     test "runs with :handler_failed when the handler answers 400 or above" do
       facilitator = start_mock_facilitator()
@@ -884,10 +856,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
       assert log =~ "cancel boom"
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Extension adapters
-  # ---------------------------------------------------------------------------
 
   describe ":extensions adapters" do
     test "advertise on every 402 and are merged over static route extensions" do
@@ -984,10 +952,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
       end
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Builder code
-  # ---------------------------------------------------------------------------
 
   describe "builder-code echo" do
     test "a well-formed echo of the advertised code is forwarded to the facilitator" do
@@ -1086,10 +1050,6 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
                       %{reason: {:invalid_builder_code, :too_many_service_codes}}}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Helpers
-  # ---------------------------------------------------------------------------
 
   defp run_request(conn, opts) do
     conn

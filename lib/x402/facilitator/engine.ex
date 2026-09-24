@@ -1047,10 +1047,8 @@ defmodule X402.Facilitator.Engine do
     # Re-verify already proved the signature parses; the wrapper is retained
     # for counterfactual deployment, while the token contract always
     # receives the inner signature.
-    case ERC6492.parse(signature || "") do
-      {:ok, parsed} -> {:ok, parsed}
-      {:error, reason} -> {:error, {:settle_error, reason}}
-    end
+    {:ok, parsed} = ERC6492.parse(signature)
+    {:ok, parsed}
   end
 
   # Permit2 settlements always pass the raw signature bytes: Permit2 routes

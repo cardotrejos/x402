@@ -116,8 +116,6 @@ defmodule X402.Extensions.SIWX.Verification do
     end
   end
 
-  # -- Normalization ----------------------------------------------------------
-
   # Spec proofs carry their fields; the message is rebuilt from them.
   # Legacy proofs carry the signed text itself, so the signature is checked
   # over that exact text rather than a rebuilt one.
@@ -154,8 +152,6 @@ defmodule X402.Extensions.SIWX.Verification do
   end
 
   defp normalize(_decoded), do: {:error, :invalid_payload}
-
-  # -- Field checks -----------------------------------------------------------
 
   @spec check_domain(map(), String.t()) :: :ok | {:error, :invalid_siwx_domain_mismatch}
   defp check_domain(%{"domain" => domain}, domain), do: :ok
@@ -279,8 +275,6 @@ defmodule X402.Extensions.SIWX.Verification do
       {:error, _reason} -> {:error, :invalid_siwx_nonce}
     end
   end
-
-  # -- Chain and signature ----------------------------------------------------
 
   @spec check_chain(map(), [map()]) ::
           {:ok, Message.family()}

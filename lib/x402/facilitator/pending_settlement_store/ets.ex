@@ -170,7 +170,7 @@ defmodule X402.Facilitator.PendingSettlementStore.ETS do
   @impl true
   @spec init(keyword()) :: {:ok, state()}
   def init(opts) do
-    name = Keyword.get(opts, :name, __MODULE__)
+    name = Keyword.fetch!(opts, :name)
     table_opts = [:set, :protected, read_concurrency: true]
 
     table =

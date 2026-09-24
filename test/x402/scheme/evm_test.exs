@@ -170,8 +170,6 @@ defmodule X402.Scheme.EVMTest do
     end
   end
 
-  # -- permit2_precheck/3 -----------------------------------------------------
-
   @asset "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
   @proxy "0x402085c248EeA27D92E8b30b2C58ed07f9E20001"
 

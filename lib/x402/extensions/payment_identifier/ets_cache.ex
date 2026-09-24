@@ -321,8 +321,6 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
     end
   end
 
-  # Accumulator for foldl — keeps track of the entry with the smallest expiry.
-  # Extracted to avoid nesting depth violations in Credo strict mode.
   @spec pick_soonest_expiry(
           {term(), term(), non_neg_integer()},
           {non_neg_integer(), term()}
