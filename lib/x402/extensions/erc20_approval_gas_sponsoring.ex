@@ -69,7 +69,6 @@ defmodule X402.Extensions.ERC20ApprovalGasSponsoring do
     ],
     amount: [
       type: {:or, [:non_neg_integer, :string]},
-      default: @max_uint256,
       doc: """
       The approval amount declared alongside the transaction, in atomic
       units. Must match the amount in the transaction's calldata. Defaults
@@ -78,7 +77,6 @@ defmodule X402.Extensions.ERC20ApprovalGasSponsoring do
     ],
     spender: [
       type: :string,
-      default: @permit2_address,
       doc: """
       The approved spender declared alongside the transaction. Must match
       the spender in the transaction's calldata. Defaults to the canonical
@@ -271,13 +269,13 @@ defmodule X402.Extensions.ERC20ApprovalGasSponsoring do
 
     from = Keyword.fetch!(opts, :from)
     asset = Keyword.fetch!(opts, :asset)
-    spender = Keyword.fetch!(opts, :spender)
+    spender = Keyword.get(opts, :spender, @permit2_address)
     signed_transaction = Keyword.fetch!(opts, :signed_transaction)
 
     with :ok <- validate_address("from", from),
          :ok <- validate_address("asset", asset),
          :ok <- validate_address("spender", spender),
-         {:ok, amount} <- normalize_amount(Keyword.fetch!(opts, :amount)),
+         {:ok, amount} <- normalize_amount(Keyword.get(opts, :amount, @max_uint256)),
          :ok <- validate_signed_transaction(signed_transaction) do
       {:ok,
        %{
@@ -418,7 +416,7 @@ defmodule X402.Extensions.ERC20ApprovalGasSponsoring do
     if Keyword.has_key?(opts, :asset) do
       {:ok, opts}
     else
-      requirements = Map.fetch!(payload, "accepted")
+      requirements = Utils.map_value(payload, {"accepted", :accepted}) || %{}
 
       case Utils.map_value(requirements, {"asset", :asset}) do
         asset when is_binary(asset) and asset != "" -> {:ok, Keyword.put(opts, :asset, asset)}
