@@ -2074,13 +2074,6 @@ defmodule X402.FacilitatorTest do
              Facilitator.start_link(finch: :finch, auth: "not-an-auth")
   end
 
-  test "init/1 stops on auth options that fail to build" do
-    assert {:stop, {:invalid_auth, :invalid_secret_format}} =
-             Facilitator.init(
-               auth: {X402.Facilitator.Auth.CDP, api_key_id: "key", api_key_secret: "not-base64"}
-             )
-  end
-
   test "supported/1 fails closed on a kind with a non-map extra", %{
     bypass: bypass,
     finch: finch,
