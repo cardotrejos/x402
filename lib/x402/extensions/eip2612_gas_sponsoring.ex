@@ -92,6 +92,7 @@ defmodule X402.Extensions.EIP2612GasSponsoring do
     ],
     spender: [
       type: :string,
+      default: @permit2_address,
       doc: "The approved spender. Defaults to the canonical Permit2 contract."
     ]
   ]
@@ -272,7 +273,7 @@ defmodule X402.Extensions.EIP2612GasSponsoring do
          {:ok, nonce} <- normalize_uint(Keyword.fetch!(opts, :nonce), :invalid_nonce),
          {:ok, deadline} <- resolve_deadline(requirements, opts),
          {:ok, amount} <- resolve_amount(requirements, opts) do
-      spender = Keyword.get(opts, :spender, @permit2_address)
+      spender = Keyword.fetch!(opts, :spender)
 
       permit = %{
         "owner" => owner,
@@ -443,7 +444,7 @@ defmodule X402.Extensions.EIP2612GasSponsoring do
           {:ok, map()} | {:error, sign_error()}
   defp enrich(payload, payment_required, signer, opts) do
     if advertised?(payment_required) do
-      requirements = Utils.map_value(payload, {"accepted", :accepted}) || %{}
+      requirements = Map.fetch!(payload, "accepted")
 
       with {:ok, info} <- sign_permit(requirements, signer, opts) do
         {:ok, put_info(payload, info)}

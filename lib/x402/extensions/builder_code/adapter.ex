@@ -86,7 +86,7 @@ defmodule X402.Extensions.BuilderCode.Adapter do
   def advertise(opts, _context) do
     BuilderCode.extension(
       Keyword.fetch!(opts, :app_code),
-      service_codes: Keyword.get(opts, :service_codes, [])
+      service_codes: Keyword.fetch!(opts, :service_codes)
     )
   end
 

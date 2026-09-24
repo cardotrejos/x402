@@ -79,6 +79,6 @@ defmodule X402.Extensions.PaymentIdentifier.Adapter do
   @impl X402.Extension
   @spec advertise(keyword(), X402.Hooks.RequestContext.t()) :: map()
   def advertise(opts, _context) do
-    PaymentIdentifier.extension(required: Keyword.get(opts, :required, false))
+    PaymentIdentifier.extension(required: Keyword.fetch!(opts, :required))
   end
 end

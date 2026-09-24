@@ -9,8 +9,6 @@ defmodule X402.Extensions.PaymentIdentifier.AdapterTest do
   test "advertise/2 builds the spec declaration with the configured flag" do
     context = RequestContext.new(transport: :http)
 
-    assert Adapter.advertise([], context) == PaymentIdentifier.extension(required: false)
-
     assert Adapter.advertise([required: true], context) ==
              PaymentIdentifier.extension(required: true)
 

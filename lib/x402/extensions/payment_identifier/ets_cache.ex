@@ -184,7 +184,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
     ttl_ms = Keyword.fetch!(opts, :ttl_ms)
     max_size = Keyword.fetch!(opts, :max_size)
     cleanup_interval_ms = Keyword.fetch!(opts, :cleanup_interval_ms)
-    name = Keyword.get(opts, :name, __MODULE__)
+    name = Keyword.fetch!(opts, :name)
 
     table_opts = [:set, :protected, read_concurrency: true]
 
