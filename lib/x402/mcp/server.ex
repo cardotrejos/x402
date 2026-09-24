@@ -439,7 +439,7 @@ defmodule X402.MCP.Server do
 
     case MCP.payment_required_result(payment_required) do
       {:ok, result} -> result
-      # init/1 guarantees encodability; this is a defensive fallback.
+      # on_protected_request/2 or a direct caller can pass accepts/extensions that fail to encode.
       {:error, _reason} -> internal_error_result()
     end
   end

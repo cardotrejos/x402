@@ -36,17 +36,6 @@ defmodule X402.Extensions.AuthHints.Adapter do
     ]
   ]
 
-  @requirement_opts_schema [
-    accept_indexes: [
-      type: {:custom, AuthHints, :validate_indexes, []},
-      required: true
-    ],
-    methods: [
-      type: {:custom, AuthHints, :validate_methods, []},
-      required: true
-    ]
-  ]
-
   @doc since: "0.9.0"
   @doc """
   Returns `"auth-hints"`.
@@ -94,22 +83,11 @@ defmodule X402.Extensions.AuthHints.Adapter do
 
   @doc false
   @spec validate_requirements(term()) :: {:ok, map()} | {:error, String.t()}
-  def validate_requirements([_ | _] = requirements) do
-    requirements
-    |> Enum.reduce_while({:ok, []}, fn requirement, {:ok, acc} ->
-      case NimbleOptions.validate(requirement, @requirement_opts_schema) do
-        {:ok, validated} -> {:cont, {:ok, [validated | acc]}}
-        {:error, error} -> {:halt, {:error, error}}
-      end
-    end)
-    |> case do
-      {:ok, validated} -> {:ok, AuthHints.extension(Enum.reverse(validated))}
-      {:error, error} -> {:error, Exception.message(error)}
-    end
+  def validate_requirements(requirements) do
+    {:ok, AuthHints.extension(requirements)}
+  rescue
+    error in NimbleOptions.ValidationError -> {:error, Exception.message(error)}
   end
-
-  def validate_requirements(other),
-    do: {:error, "expected a non-empty list of auth requirements, got: #{inspect(other)}"}
 
   @doc since: "0.9.0"
   @doc """

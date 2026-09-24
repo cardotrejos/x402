@@ -657,27 +657,6 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
       ]
     ]
 
-    @bazaar_http_schema [
-      method: [type: :any],
-      input: [type: :any],
-      input_schema: [type: {:custom, Bazaar, :validate_map, []}],
-      body_type: [type: :string],
-      headers: [type: {:custom, Bazaar, :validate_map, []}],
-      path_params: [type: {:custom, Bazaar, :validate_map, []}],
-      path_params_schema: [type: {:custom, Bazaar, :validate_map, []}],
-      route_template: [type: {:custom, Bazaar, :validate_route_template, []}],
-      output: [type: {:custom, Bazaar, :validate_output, []}]
-    ]
-
-    @bazaar_mcp_schema [
-      tool_name: [type: :string, required: true],
-      description: [type: :string],
-      transport: [type: :string],
-      input_schema: [type: {:custom, Bazaar, :validate_map, []}, required: true],
-      example: [type: :any],
-      output: [type: {:custom, Bazaar, :validate_output, []}]
-    ]
-
     @options_schema [
       auth_capture: [
         type: {:custom, AuthCapturePlug, :validate, []},
@@ -1043,22 +1022,15 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
 
     def validate_bazaar(opts) when is_list(opts) do
       if Keyword.keyword?(opts) do
-        schema =
-          if Keyword.has_key?(opts, :tool_name),
-            do: @bazaar_mcp_schema,
-            else: @bazaar_http_schema
-
-        case NimbleOptions.validate(opts, schema) do
-          {:ok, _validated} ->
-            _extension = Bazaar.build_extension(opts)
-            {:ok, opts}
-
-          {:error, error} ->
-            {:error, Exception.message(error)}
-        end
+        # Built once here so misconfiguration surfaces at init rather than
+        # on the first 402; the request-time build adds template and params.
+        _extension = Bazaar.build_extension(opts)
+        {:ok, opts}
       else
         {:error, "expected a keyword list of X402.Extensions.Bazaar.build_extension/1 options"}
       end
+    rescue
+      error in NimbleOptions.ValidationError -> {:error, Exception.message(error)}
     end
 
     def validate_bazaar(_opts),
