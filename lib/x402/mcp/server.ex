@@ -320,7 +320,7 @@ defmodule X402.MCP.Server do
       tool: tool,
       facilitator: Keyword.fetch!(validated, :facilitator),
       hooks: Keyword.fetch!(validated, :hooks),
-      payment_identifier_cache: Keyword.get(validated, :payment_identifier_cache),
+      payment_identifier_cache: Keyword.fetch!(validated, :payment_identifier_cache),
       accepts: accepts,
       resource: resource,
       extensions: extensions
@@ -437,11 +437,8 @@ defmodule X402.MCP.Server do
       "extensions" => config.extensions
     }
 
-    case MCP.payment_required_result(payment_required) do
-      {:ok, result} -> result
-      # init/1 guarantees encodability; this is a defensive fallback.
-      {:error, _reason} -> internal_error_result()
-    end
+    {:ok, result} = MCP.payment_required_result(payment_required)
+    result
   end
 
   # -- Verification -----------------------------------------------------------
@@ -1013,17 +1010,16 @@ defmodule X402.MCP.Server do
 
   defp compile_accepts(accepts) do
     Enum.map(accepts, fn accept ->
-      extra = stringify_keys(Map.get(accept, :extra, %{}))
-      ensure_supported_payment_flow!(Map.get(accept, :scheme, "exact"), extra)
+      extra = stringify_keys(Map.fetch!(accept, :extra))
+      ensure_supported_payment_flow!(Map.fetch!(accept, :scheme), extra)
 
       %{
-        "scheme" => Map.get(accept, :scheme, "exact"),
+        "scheme" => Map.fetch!(accept, :scheme),
         "network" => Map.fetch!(accept, :network),
         "amount" => Map.fetch!(accept, :price),
         "asset" => Map.fetch!(accept, :asset),
         "payTo" => Map.fetch!(accept, :pay_to),
-        "maxTimeoutSeconds" =>
-          Map.get(accept, :max_timeout_seconds, @default_max_timeout_seconds),
+        "maxTimeoutSeconds" => Map.fetch!(accept, :max_timeout_seconds),
         "extra" => extra
       }
     end)
@@ -1048,13 +1044,13 @@ defmodule X402.MCP.Server do
   @spec compile_resource(String.t(), keyword()) :: map()
   defp compile_resource(tool, validated) do
     %{
-      "url" => Keyword.get(validated, :resource_url) || "mcp://tool/#{tool}",
-      "description" => Keyword.get(validated, :description) || "Tool: #{tool}",
+      "url" => Keyword.fetch!(validated, :resource_url) || "mcp://tool/#{tool}",
+      "description" => Keyword.fetch!(validated, :description) || "Tool: #{tool}",
       "mimeType" => Keyword.fetch!(validated, :mime_type)
     }
-    |> maybe_put("serviceName", Keyword.get(validated, :service_name))
+    |> maybe_put("serviceName", Keyword.fetch!(validated, :service_name))
     |> maybe_put_tags(Keyword.fetch!(validated, :tags))
-    |> maybe_put("iconUrl", Keyword.get(validated, :icon_url))
+    |> maybe_put("iconUrl", Keyword.fetch!(validated, :icon_url))
   end
 
   @spec ensure_json_encodable!(map()) :: :ok

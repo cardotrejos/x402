@@ -362,15 +362,6 @@ defmodule X402.MCP.ServerTest do
 
       assert result["structuredContent"]["error"] == "Payment required to access this tool"
     end
-
-    test "payment_required_result/2 falls back to an internal error for corrupt configs" do
-      config = %{config(start_facilitator()) | extensions: %{"bad" => {:not, :json}}}
-
-      assert Server.payment_required_result(config) == %{
-               "isError" => true,
-               "content" => [%{"type" => "text", "text" => "Internal server error"}]
-             }
-    end
   end
 
   describe "payment validation" do
