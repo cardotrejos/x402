@@ -138,7 +138,7 @@ defmodule X402.Permit2 do
   @spec permit2_address() :: String.t()
   def permit2_address, do: @permit2_address
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the `x402ExactPermit2Proxy` contract address — the spender of
   `exact` payments using the Permit2 transfer method.
@@ -167,7 +167,7 @@ defmodule X402.Permit2 do
   @spec upto_proxy_address() :: String.t()
   def upto_proxy_address, do: @upto_proxy_address
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Signs the `exact` Permit2 scheme payload for the given requirements.
 
@@ -259,7 +259,7 @@ defmodule X402.Permit2 do
 
   def sign_upto(_requirements, _signer), do: {:error, :invalid_requirements}
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Derives the canonical Permit2 EIP-712 domain from v2 payment requirements.
 
@@ -345,7 +345,7 @@ defmodule X402.Permit2 do
 
   def facilitator_address(_requirements), do: {:error, {:missing_extra, "facilitatorAddress"}}
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Builds an exact `PermitWitnessTransferFrom` authorization in wire shape.
 
@@ -437,7 +437,7 @@ defmodule X402.Permit2 do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Computes the EIP-712 digest of a `PermitWitnessTransferFrom`.
 
@@ -485,7 +485,7 @@ defmodule X402.Permit2 do
     32 |> :crypto.strong_rand_bytes() |> :binary.decode_unsigned() |> Integer.to_string()
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc group: :settlement
   @doc """
   Builds the `x402ExactPermit2Proxy.settle` calldata for an exact
@@ -533,7 +533,7 @@ defmodule X402.Permit2 do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc group: :settlement
   @doc """
   Builds the `x402UptoPermit2Proxy.settle` calldata for an upto

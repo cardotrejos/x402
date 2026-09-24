@@ -18,7 +18,7 @@ is one of four roles the SDK covers end to end:
 ```elixir
 def deps do
   [
-    {:x402, "~> 0.6.1"},
+    {:x402, "~> 0.9.0"},
     {:finch, "~> 0.19"},
     {:plug, "~> 1.14"}
   ]

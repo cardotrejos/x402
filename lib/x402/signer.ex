@@ -220,7 +220,7 @@ defmodule X402.Signer do
 
   def sign_ed25519(_signer, _message), do: {:error, :invalid_signer}
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Signs a message with EIP-191 `personal_sign`, dispatching on the signer's
   struct module.

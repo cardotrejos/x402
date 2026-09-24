@@ -99,7 +99,7 @@ defmodule X402.Client.Budget do
 
   @type reserve_error :: {:budget_exceeded, exceeded()} | :invalid_amount
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Starts a budget process.
 
@@ -117,7 +117,7 @@ defmodule X402.Client.Budget do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Reserves `amount` of `asset` against the budget.
 
@@ -142,7 +142,7 @@ defmodule X402.Client.Budget do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Releases a previous reservation of `amount` of `asset`.
 
@@ -166,7 +166,7 @@ defmodule X402.Client.Budget do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the amounts currently reserved or spent.
 

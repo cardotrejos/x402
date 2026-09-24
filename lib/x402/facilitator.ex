@@ -578,7 +578,7 @@ defmodule X402.Facilitator do
         )
   """
   @doc group: :discovery
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @spec search_resources(server() | keyword(), keyword()) ::
           {:ok, discovery_search_response()}
           | {:error, Error.t() | NimbleOptions.ValidationError.t()}

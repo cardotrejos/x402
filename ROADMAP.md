@@ -1,13 +1,14 @@
 # x402 Elixir SDK — Roadmap
 
-> Living document. Last refreshed 2026-09-17 from a comparison of this SDK
+> Living document. Release status refreshed 2026-09-24. Baseline comparison
+> from 2026-09-17 of this SDK
 > against upstream [x402-foundation/x402](https://github.com/x402-foundation/x402)
 > (v2 specification, HTTP/MCP transports, extension specs, and the SDK
 > feature matrix at that date).
 
 ## Where we are
 
-The latest release is `0.6.1`. It supports the primary v2 authorization-flow roles:
+The latest release is `0.9.0`. It supports the primary v2 authorization-flow roles:
 
 - Protocol primitives: `PAYMENT-REQUIRED` / `PAYMENT-SIGNATURE` /
   `PAYMENT-RESPONSE` codecs with 8 KB header caps, CAIP-2 networks.
@@ -24,12 +25,19 @@ The latest release is `0.6.1`. It supports the primary v2 authorization-flow rol
 - Quality: 95 % coverage floor, dialyzer/credo clean, optional-dependency
   build, downstream consumer check, live CDP smoke tests.
 
-As of 2026-09-21, the 0.7 and 0.8 changes are merged through
+Version 0.9.0 combines the spec-conformance and ecosystem-parity changes from
 [PR #85](https://github.com/cardotrejos/x402/pull/85) and
-[PR #86](https://github.com/cardotrejos/x402/pull/86), respectively. They have not
-been released. Tier C is in progress. ERC-7710 remains unsupported.
+[PR #86](https://github.com/cardotrejos/x402/pull/86) with EVM auth-capture,
+authentication extensions, and operations controls from
+[PR #87](https://github.com/cardotrejos/x402/pull/87), plus the documentation
+and code cleanup in [PR #90](https://github.com/cardotrejos/x402/pull/90).
+Versions 0.7.0 and 0.8.0 were planning milestones, not separate releases.
+ERC-7710, batch settlement, and `upto` on Solana remain unsupported.
 
 ## Gap analysis from the 0.6.1 baseline
+
+The original target versions below record the plan. Implemented work ships
+together in 0.9.0; deferred items are listed separately below.
 
 | Area | Upstream x402 | 0.6.1 baseline | Plan |
 |------|---------------|----------|------|
@@ -56,7 +64,7 @@ been released. Tier C is in progress. ERC-7710 remains unsupported.
 
 ## Release train
 
-### 0.7.0 — spec conformance (implemented, unreleased)
+### 0.7.0 milestone — spec conformance (released in 0.9.0)
 
 - [x] CI hardening: pinned actions, `contents: read` token
 - [x] Client rejects requirements whose `extra.paymentFlow` is not `authorization`
@@ -71,7 +79,7 @@ been released. Tier C is in progress. ERC-7710 remains unsupported.
   `X402.Extensions.SIWX.Server`, gate `siwx:` option; legacy header deprecated
 - [x] Docs: CHANGELOG, guides, README
 
-### 0.8.0 — ecosystem parity (implemented, unreleased)
+### 0.8.0 milestone — ecosystem parity (released in 0.9.0)
 
 - [x] `exact` via Permit2 on EVM (client signing, local verification, engine settlement)
 - [x] Client spend controls: configurable per-request policies and session budgets;
@@ -85,17 +93,15 @@ been released. Tier C is in progress. ERC-7710 remains unsupported.
 
 ### 0.9.0 — advanced schemes, extensions, and operations
 
-- [ ] EVM bindings for the `batch-settlement` and `auth-capture` schemes
-- [x] `auth-hints` and `http-message-signatures` extensions (unreleased)
-- [ ] `upto` on Solana
-- [x] Metrics for LiveDashboard's Metrics page, without a Phoenix dependency (unreleased)
-- [x] Per-wallet rate limiting in the gate (unreleased)
-- [x] Multi-facilitator failover for `X402.Facilitator` (unreleased)
+- [x] EVM auth-capture signing, verification, explicit-consent execution, and Plug/MCP resources
+- [x] `auth-hints` and `http-message-signatures` extensions
+- [x] Metrics for LiveDashboard's Metrics page, without a Phoenix dependency
+- [x] Per-wallet rate limiting in the gate
+- [x] Multi-facilitator failover for `X402.Facilitator`
 
-Auth-capture local execution and transport integration are under validation.
-See its [support and recovery limits](guides/auth-capture.md). The combined
-advanced-scheme milestone remains open until integration, validation, and
-publication are complete; local implementation is not a release.
+Auth-capture includes local execution and transport integration. See its
+[support and recovery limits](guides/auth-capture.md): production storage,
+recovery scheduling, and refund funding remain application-owned.
 
 ### 1.0.0 — stable API
 
@@ -115,6 +121,8 @@ publication are complete; local implementation is not a release.
 
 ## Deferred support
 
+- [ ] `batch-settlement` and `upto` on Solana remain unsupported. No target
+  release is assigned.
 - [ ] ERC-7710 delegated EVM payments remain unsupported. No target release is
   assigned. Add client signing, local verification, facilitator settlement, and
   end-to-end coverage before advertising support; unsupported transfer methods
@@ -122,7 +130,7 @@ publication are complete; local implementation is not a release.
 
 ## Compatibility policy
 
-`0.7.x` accepts both the spec wire formats and the pre-0.7.0 formats. Legacy
+`0.9.x` accepts both the spec wire formats and the legacy 0.6.x formats. Legacy
 input emits `[:x402, :payment_identifier, :legacy]` / `[:x402, :siwx, :legacy]`
 telemetry plus a one-time warning. `1.0.0` removes:
 

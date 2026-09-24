@@ -101,7 +101,7 @@ defmodule X402.Client.Hooks do
 
   @required_callbacks [before_payment: 2, after_payment: 2, on_payment_failure: 2]
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Validates that a value is a module implementing `X402.Client.Hooks`.
 

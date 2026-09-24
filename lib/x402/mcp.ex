@@ -82,7 +82,7 @@ defmodule X402.MCP do
   @spec payment_response_meta_key() :: String.t()
   def payment_response_meta_key, do: @payment_response_meta_key
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the request `_meta` key carrying a Sign-In-With-X proof.
 
@@ -94,7 +94,7 @@ defmodule X402.MCP do
   @spec siwx_meta_key() :: String.t()
   def siwx_meta_key, do: @siwx_meta_key
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Attaches a Sign-In-With-X proof (the Base64 `SIGN-IN-WITH-X` header
   value) to a tool-call request's `_meta`.
@@ -110,7 +110,7 @@ defmodule X402.MCP do
     put_meta_entry(request, @siwx_meta_key, proof)
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Fetches the Sign-In-With-X proof from a tool-call request's `_meta`.
 

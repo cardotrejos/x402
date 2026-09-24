@@ -27,7 +27,7 @@ facilitator, chain, or web framework.
 - Extension adapters (`X402.Extension`) that advertise, validate, and observe an extension from a single gate option
 - Authentication hints and HTTP message signature advertisements, with bounded RFC 9421 signing/verification and an optional public key-directory Plug. Applications enforce authentication, key trust, and replay policy
 - Optional verified-payer rate limits, telemetry metric definitions, and local statistics, without a Phoenix dependency
-- Unreleased [EVM auth-capture](guides/auth-capture.md): explicit-consent execution, durable-store contracts, escrow resources, and local Plug/MCP adapters with synchronous or deferred metering. Production storage and recovery scheduling remain application-owned
+- [EVM auth-capture](guides/auth-capture.md): explicit-consent execution, durable-store contracts, escrow resources, and local Plug/MCP adapters with synchronous or deferred metering. Production storage and recovery scheduling remain application-owned
 - Optional Finch, Plug, Redix, and cryptography dependencies
 
 ## Installation
@@ -37,7 +37,7 @@ Add the library and only the optional integrations your application uses:
 ```elixir
 def deps do
   [
-    {:x402, "~> 0.6.1"},
+    {:x402, "~> 0.9.0"},
     {:finch, "~> 0.19"}, # facilitator HTTP calls
     {:plug, "~> 1.14"}   # PaymentGate
   ]

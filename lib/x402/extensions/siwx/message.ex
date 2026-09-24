@@ -30,7 +30,7 @@ defmodule X402.Extensions.SIWX.Message do
   @typedoc "Errors returned by `build/1`."
   @type build_error :: :invalid_fields | :invalid_chain_id | :unsupported_chain
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the chain family of a CAIP-2 chain id.
 
@@ -65,7 +65,7 @@ defmodule X402.Extensions.SIWX.Message do
 
   def family(_chain_id), do: {:error, :unsupported_chain}
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the signature `type` a chain family authenticates with.
 
@@ -81,7 +81,7 @@ defmodule X402.Extensions.SIWX.Message do
   def signature_type(:eip155), do: "eip191"
   def signature_type(:solana), do: "ed25519"
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Builds the CAIP-122 message text for a fields map.
 
@@ -175,7 +175,7 @@ defmodule X402.Extensions.SIWX.Message do
   defp resource_lines([]), do: []
   defp resource_lines(resources), do: ["Resources:" | Enum.map(resources, &("- " <> &1))]
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Returns the chain reference rendered on the `Chain ID` line.
 

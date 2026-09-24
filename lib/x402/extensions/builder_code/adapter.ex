@@ -31,7 +31,7 @@ defmodule X402.Extensions.BuilderCode.Adapter do
     ]
   ]
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Returns `"builder-code"`.
 
@@ -44,7 +44,7 @@ defmodule X402.Extensions.BuilderCode.Adapter do
   @spec key() :: String.t()
   def key, do: BuilderCode.extension_key()
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Validates the adapter options.
 
@@ -71,7 +71,7 @@ defmodule X402.Extensions.BuilderCode.Adapter do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Advertises the configured codes.
 
@@ -90,7 +90,7 @@ defmodule X402.Extensions.BuilderCode.Adapter do
     )
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Validates the echoed value with `X402.Extensions.BuilderCode.validate_echo/2`.
 

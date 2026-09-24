@@ -56,7 +56,7 @@ defmodule X402.Hooks.RequestContext do
           matched_requirements: map() | nil
         }
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Builds a request context from a keyword list of fields.
 
@@ -76,7 +76,7 @@ defmodule X402.Hooks.RequestContext do
     struct(__MODULE__, fields)
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Checks that a value returned by a hook is a well-formed request context.
 

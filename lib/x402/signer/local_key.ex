@@ -101,7 +101,7 @@ defmodule X402.Signer.LocalKey do
     end
   end
 
-  @doc since: "0.7.0"
+  @doc since: "0.9.0"
   @doc """
   Signs `message` with EIP-191 `personal_sign` using the local key.
 

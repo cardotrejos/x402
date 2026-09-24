@@ -107,7 +107,7 @@ defmodule X402.Scheme.EVM do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Runs cheap local checks on a Permit2 `payload.permit2Authorization`.
 

@@ -94,7 +94,7 @@ Add the optional dependencies and a Finch pool:
 ```elixir
 def deps do
   [
-    {:x402, "~> 0.6.1"},
+    {:x402, "~> 0.9.0"},
     {:finch, "~> 0.19"},
     {:ex_secp256k1, "~> 0.8"},
     {:ex_keccak, "~> 0.7"}

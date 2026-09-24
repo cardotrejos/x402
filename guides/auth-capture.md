@@ -1,8 +1,7 @@
 # Auth-capture on EVM
 
 `auth-capture` separates a payer's authorization from the amount eventually
-charged. This guide describes the unreleased implementation, not the published
-0.6.1 package. Read the canonical
+charged. Available since x402 0.9.0. Read the canonical
 [EVM binding](https://github.com/x402-foundation/x402/blob/main/specs/schemes/auth-capture/scheme_auth_capture_evm.md)
 before configuring an operator.
 

@@ -27,7 +27,7 @@ defmodule X402.Extensions.PaymentIdentifier.Adapter do
     ]
   ]
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Returns `"payment-identifier"`.
 
@@ -40,7 +40,7 @@ defmodule X402.Extensions.PaymentIdentifier.Adapter do
   @spec key() :: String.t()
   def key, do: PaymentIdentifier.extension_key()
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Validates the adapter options.
 
@@ -66,7 +66,7 @@ defmodule X402.Extensions.PaymentIdentifier.Adapter do
     end
   end
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Advertises the extension with the configured `required` flag.
 

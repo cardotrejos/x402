@@ -199,7 +199,7 @@ defmodule X402.Hooks do
 
   def validate_module(_invalid), do: {:error, "expected a module implementing X402.Hooks"}
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Invokes the optional `c:on_protected_request/2` callback of a hook module.
 
@@ -267,7 +267,7 @@ defmodule X402.Hooks do
   defp normalize_protected_result(invalid),
     do: {:error, {:hook_invalid_return, :on_protected_request, invalid}}
 
-  @doc since: "0.8.0"
+  @doc since: "0.9.0"
   @doc """
   Invokes the optional `c:on_verified_payment_canceled/2` callback of a hook
   module.
