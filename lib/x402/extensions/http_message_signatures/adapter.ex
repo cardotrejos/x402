@@ -23,6 +23,25 @@ defmodule X402.Extensions.HTTPMessageSignatures.Adapter do
   alias X402.Extensions.HTTPMessageSignatures
   alias X402.Hooks.RequestContext
 
+  @opts_schema [
+    registration_url: [
+      type: {:custom, HTTPMessageSignatures, :validate_url, []},
+      required: true
+    ],
+    signature_schemes: [
+      type: {:custom, HTTPMessageSignatures, :validate_strings, ["signature scheme"]},
+      required: true
+    ],
+    tags: [
+      type: {:custom, HTTPMessageSignatures, :validate_strings, ["tag"]},
+      default: []
+    ],
+    include_schema: [
+      type: :boolean,
+      default: true
+    ]
+  ]
+
   @doc since: "0.9.0"
   @doc """
   Returns `"http-message-signatures"`.
@@ -55,9 +74,10 @@ defmodule X402.Extensions.HTTPMessageSignatures.Adapter do
   @impl X402.Extension
   @spec init(keyword()) :: {:ok, keyword()} | {:error, String.t()}
   def init(opts) when is_list(opts) do
-    {:ok, [extension: HTTPMessageSignatures.extension(opts)]}
-  rescue
-    error in NimbleOptions.ValidationError -> {:error, Exception.message(error)}
+    case NimbleOptions.validate(opts, @opts_schema) do
+      {:ok, validated} -> {:ok, [extension: HTTPMessageSignatures.extension(validated)]}
+      {:error, error} -> {:error, Exception.message(error)}
+    end
   end
 
   @doc since: "0.9.0"

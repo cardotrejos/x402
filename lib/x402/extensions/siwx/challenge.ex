@@ -189,7 +189,7 @@ defmodule X402.Extensions.SIWX.Challenge do
   @spec build(keyword()) :: map()
   def build(opts) when is_list(opts) do
     opts = NimbleOptions.validate!(opts, @opts_schema)
-    issued_at = Keyword.get(opts, :issued_at) || DateTime.utc_now()
+    issued_at = Keyword.fetch!(opts, :issued_at) || DateTime.utc_now()
     expiration = DateTime.add(issued_at, Keyword.fetch!(opts, :expiration_seconds), :second)
 
     info =
@@ -197,13 +197,13 @@ defmodule X402.Extensions.SIWX.Challenge do
         "domain" => Keyword.fetch!(opts, :domain),
         "uri" => Keyword.fetch!(opts, :uri),
         "version" => Keyword.fetch!(opts, :version),
-        "nonce" => Keyword.get(opts, :nonce) || generate_nonce(),
+        "nonce" => Keyword.fetch!(opts, :nonce) || generate_nonce(),
         "issuedAt" => format_datetime(issued_at),
         "expirationTime" => format_datetime(expiration)
       }
-      |> maybe_put("statement", Keyword.get(opts, :statement))
-      |> maybe_put("notBefore", format_optional_datetime(Keyword.get(opts, :not_before)))
-      |> maybe_put("requestId", Keyword.get(opts, :request_id))
+      |> maybe_put("statement", Keyword.fetch!(opts, :statement))
+      |> maybe_put("notBefore", format_optional_datetime(Keyword.fetch!(opts, :not_before)))
+      |> maybe_put("requestId", Keyword.fetch!(opts, :request_id))
       |> maybe_put_resources(Keyword.fetch!(opts, :resources))
 
     %{
