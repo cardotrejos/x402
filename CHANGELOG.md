@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their deprecated functions, are now scheduled for removal in 0.9.5 instead
   of 1.0.0. Deprecation warnings, docs, and guides name the new version.
 
+### Fixed
+
+- `X402.RateLimiter.ETS.hit/4` no longer returns `{:error, :contention}` when
+  short windows expire while concurrent hits retry. A hit now judges windows
+  by the time it arrived and replaces a window only if it is still closed at
+  that time, so it can no longer lose its retries to newer hits. Under the
+  default `on_error: :allow`, that error let the affected hit bypass the
+  limit.
+
 ## [0.9.0] - 2026-09-24
 
 This release includes all changes merged since 0.6.1: the spec-conformance
