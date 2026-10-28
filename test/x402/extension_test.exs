@@ -85,6 +85,15 @@ defmodule X402.ExtensionTest do
                "full" => %{"info" => %{"mode" => :loud}}
              }
     end
+
+    test "loads an adapter that is not loaded yet before checking for advertise/2" do
+      adapter = X402.TestUnloaded.unload!(X402.TestUnloaded.ExtensionAdvertise)
+      context = RequestContext.new(transport: :http)
+
+      assert Extension.advertise_all([{adapter, []}], context, %{}) == %{
+               "unloaded-advertise" => %{"info" => %{"loaded" => true}}
+             }
+    end
   end
 
   describe "validate_all/3" do
@@ -125,6 +134,19 @@ defmodule X402.ExtensionTest do
       assert log =~ "verify boom"
       assert log =~ "after_settle/4 failed"
       assert log =~ "settle_boom"
+    end
+
+    test "load an adapter that is not loaded yet before checking for the callback" do
+      adapter = X402.TestUnloaded.ExtensionNotify
+      entries = [{adapter, test_pid: self()}]
+
+      X402.TestUnloaded.unload!(adapter)
+      assert :ok = Extension.after_verify_all(entries, %{}, %{}, %{})
+      assert_received {:unloaded_after_verify, ^adapter}
+
+      X402.TestUnloaded.unload!(adapter)
+      assert :ok = Extension.after_settle_all(entries, %{}, %{}, %{})
+      assert_received {:unloaded_after_settle, ^adapter}
     end
   end
 end

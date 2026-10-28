@@ -40,6 +40,7 @@ defmodule X402.Extension do
   `:bazaar` route option because it depends on the matched route pattern.
   """
 
+  alias X402.Behaviour
   alias X402.Hooks.RequestContext
 
   require Logger
@@ -104,7 +105,7 @@ defmodule X402.Extension do
 
   @spec init_entry(module(), keyword()) :: {:ok, entry()} | {:error, String.t()}
   defp init_entry(module, opts) do
-    if function_exported?(module, :init, 1) do
+    if Behaviour.implements?(module, init: 1) do
       case module.init(opts) do
         {:ok, validated} when is_list(validated) -> {:ok, {module, validated}}
         {:error, message} when is_binary(message) -> {:error, "#{inspect(module)}: #{message}"}
@@ -146,7 +147,7 @@ defmodule X402.Extension do
 
   @spec advertise(module(), keyword(), RequestContext.t()) :: map() | nil
   defp advertise(module, opts, context) do
-    case function_exported?(module, :advertise, 2) do
+    case Behaviour.implements?(module, advertise: 2) do
       true -> module.advertise(opts, context)
       false -> nil
     end
@@ -185,7 +186,7 @@ defmodule X402.Extension do
 
   @spec validate(module(), keyword(), term(), term()) :: :ok | {:error, term()}
   defp validate(module, opts, echoed_value, advertised_value) do
-    case function_exported?(module, :validate, 3) do
+    case Behaviour.implements?(module, validate: 3) do
       true -> module.validate(echoed_value, advertised_value, opts)
       false -> :ok
     end
@@ -238,7 +239,7 @@ defmodule X402.Extension do
   @spec notify_all([entry()], :after_verify | :after_settle, [term()]) :: :ok
   defp notify_all(entries, callback, args) do
     Enum.each(entries, fn {module, opts} ->
-      if function_exported?(module, callback, 4) do
+      if Behaviour.implements?(module, [{callback, 4}]) do
         notify(module, callback, args ++ [opts])
       end
     end)

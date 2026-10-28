@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that time, so it can no longer lose its retries to newer hits. Under the
   default `on_error: :allow`, that error let the affected hit bypass the
   limit.
+- Load extension adapters and hook modules before checking for their optional
+  callbacks. Where modules load on demand (anything not run as a release,
+  such as dev, test, or `mix phx.server` in production), a module that was
+  not loaded yet looked like it lacked the callback. So
+  `X402.Extension.advertise_all/3` skipped its `advertise/2`,
+  `after_verify_all/4` and `after_settle_all/4` skipped its notifications, and
+  `X402.Hooks.run_protected_request/3` and `run_verified_payment_canceled/3`
+  skipped the hook. Whether it happened depended on module load order.
 
 ### Documentation
 

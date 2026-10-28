@@ -220,7 +220,7 @@ defmodule X402.Hooks do
           protected_request_result() | {:error, hook_error()}
   def run_protected_request(hooks_module, %RequestContext{} = context, metadata)
       when is_atom(hooks_module) and is_map(metadata) do
-    case function_exported?(hooks_module, :on_protected_request, 2) do
+    case X402.Behaviour.implements?(hooks_module, on_protected_request: 2) do
       true ->
         invoke_protected_request(
           hooks_module,
@@ -288,7 +288,7 @@ defmodule X402.Hooks do
   @spec run_verified_payment_canceled(module(), RequestContext.t(), map()) :: :ok
   def run_verified_payment_canceled(hooks_module, %RequestContext{} = context, metadata)
       when is_atom(hooks_module) and is_map(metadata) do
-    if function_exported?(hooks_module, :on_verified_payment_canceled, 2) do
+    if X402.Behaviour.implements?(hooks_module, on_verified_payment_canceled: 2) do
       try do
         _ignored =
           hooks_module.on_verified_payment_canceled(
