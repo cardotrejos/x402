@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- The legacy `paymentIdentifier` and SIWX `{message, signature}` formats, and
+  their deprecated functions, are now scheduled for removal in 0.9.5 instead
+  of 1.0.0. Deprecation warnings, docs, and guides name the new version.
+
 ## [0.9.0] - 2026-09-24
 
 This release includes all changes merged since 0.6.1: the spec-conformance
