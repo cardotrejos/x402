@@ -288,7 +288,7 @@ if Code.ensure_loaded?(Plug) and Code.ensure_loaded?(Plug.Conn) do
     `{"paymentId": ...}` string or a `%{"paymentId" => ...}` map, optionally
     wrapped in `%{"info" => ...}`) is still accepted, with the same assign,
     telemetry, and fingerprint binding, but is **deprecated** and removed in
-    1.0.0: each legacy id emits `[:x402, :payment_identifier, :legacy]` and
+    0.9.5: each legacy id emits `[:x402, :payment_identifier, :legacy]` and
     the first one logs a warning. Legacy ids satisfy `required: true` and are
     not subject to the spec's length and character rules.
 

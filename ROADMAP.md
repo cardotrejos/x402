@@ -43,8 +43,8 @@ together in 0.9.0; deferred items are listed separately below.
 |------|---------------|----------|------|
 | Core v2 protocol, HTTP transport | stable | complete | — |
 | `EXTENSION-RESPONSES` facilitator sidechannel | HTTP transport §7.2.1 | missing | **0.7.0** |
-| `payment-identifier` extension | `payment-identifier` key, `info.id`/`info.required`, 409 on fingerprint mismatch | legacy `paymentIdentifier` only | **0.7.0** (dual format), legacy removed in 1.0.0 |
-| `sign-in-with-x` extension | CAIP-122 header, challenge advertisement, `invalid_siwx_*` codes, EVM + Solana | legacy `{message, signature}` header, EVM only, no gate integration | **0.7.0** (dual format), legacy removed in 1.0.0 |
+| `payment-identifier` extension | `payment-identifier` key, `info.id`/`info.required`, 409 on fingerprint mismatch | legacy `paymentIdentifier` only | **0.7.0** (dual format), legacy removed in 0.9.5 |
+| `sign-in-with-x` extension | CAIP-122 header, challenge advertisement, `invalid_siwx_*` codes, EVM + Solana | legacy `{message, signature}` header, EVM only, no gate integration | **0.7.0** (dual format), legacy removed in 0.9.5 |
 | Bazaar discovery metadata | sanitised service name / tags / icon URL, `routeTemplate` | unvalidated | **0.7.0** |
 | Client `paymentFlow` rule | only `authorization` (or absent) is payable | any value accepted | **0.7.0** |
 | Supply chain | pinned actions, least-privilege tokens | floating action tags | **0.7.0** |
@@ -103,7 +103,7 @@ Auth-capture includes local execution and transport integration. See its
 [support and recovery limits](guides/auth-capture.md): production storage,
 recovery scheduling, and refund funding remain application-owned.
 
-### 1.0.0 — stable API
+### 0.9.5 — stable API
 
 - [ ] Remove the legacy `paymentIdentifier` and SIWX `{message, signature}` formats and the
   deprecated functions listed under "Compatibility policy"
@@ -117,7 +117,7 @@ recovery scheduling, and refund funding remain application-owned.
   there is no universal base-unit ceiling across assets
 - [ ] Guides ("Build a paid API in 5 minutes", "x402 for AI agents", deployment),
   example Phoenix app, `mix x402.gen.paywall`
-- [ ] Hex 1.0.0 publish
+- [ ] Hex 0.9.5 publish
 
 ## Deferred support
 
@@ -130,9 +130,9 @@ recovery scheduling, and refund funding remain application-owned.
 
 ## Compatibility policy
 
-`0.9.x` accepts both the spec wire formats and the legacy 0.6.x formats. Legacy
-input emits `[:x402, :payment_identifier, :legacy]` / `[:x402, :siwx, :legacy]`
-telemetry plus a one-time warning. `1.0.0` removes:
+`0.9.x` releases before `0.9.5` accept both the spec wire formats and the legacy
+0.6.x formats. Legacy input emits `[:x402, :payment_identifier, :legacy]` /
+`[:x402, :siwx, :legacy]` telemetry plus a one-time warning. `0.9.5` removes:
 
 | Deprecated | Replacement |
 |------------|-------------|

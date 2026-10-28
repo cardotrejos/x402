@@ -115,7 +115,7 @@ reusing it for a different tool or different requirements yields
 A binding is released whenever the tool result is not settled (handler
 error, verification or settlement failure), so the client can retry with
 the same id. The pre-0.7.0 `"paymentIdentifier"` format is still accepted
-but deprecated (removed in 1.0.0) and emits
+but deprecated (removed in 0.9.5) and emits
 `[:x402, :payment_identifier, :legacy]`.
 
 ### Builder codes

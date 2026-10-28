@@ -602,7 +602,7 @@ carrying a Base64 JSON `{"paymentId": ...}` string or a
 The gate still accepts it with the same assign, telemetry, and fingerprint
 binding — each legacy id emits `[:x402, :payment_identifier, :legacy]` and
 the first logs a warning — but the format is **deprecated** and will be
-removed in 1.0.0. Legacy ids satisfy `required: true` and are exempt from
+removed in 0.9.5. Legacy ids satisfy `required: true` and are exempt from
 the spec's length and character rules; a malformed one is rejected with
 400.
 
@@ -712,7 +712,7 @@ Error responses:
 The pre-0.7.0 header format — a Base64 JSON `{"message", "signature"}`
 object carrying the signed EIP-4361 text — is still accepted and verified
 under the same rules, emitting `[:x402, :siwx, :legacy]` per proof and a
-one-time warning; it is deprecated and removed in 1.0.0.
+one-time warning; it is deprecated and removed in 0.9.5.
 
 ## Extension responses
 
