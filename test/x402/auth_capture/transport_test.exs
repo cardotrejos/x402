@@ -68,7 +68,7 @@ defmodule X402.AuthCapture.TransportTest do
     assert result.halted
     assert {201, headers, <<0, 255, 1>>} = Plug.Test.sent_resp(result)
     assert {"x-paid", "yes"} in headers
-    assert length(Enum.filter(headers, &(elem(&1, 0) == "set-cookie"))) == 1
+    assert Enum.count(headers, &(elem(&1, 0) == "set-cookie")) == 1
     assert_received :callback
     refute_received :callback
     assert Agent.get(ctx.node, & &1.sends) == 3

@@ -5,7 +5,7 @@ defmodule FacilitatorExample.MixProject do
     [
       app: :x402_facilitator_example,
       version: "0.1.0",
-      elixir: "~> 1.15",
+      elixir: "~> 1.19",
       start_permanent: false,
       deps: deps()
     ]

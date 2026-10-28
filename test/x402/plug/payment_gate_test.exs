@@ -825,7 +825,7 @@ defmodule X402.Plug.PaymentGateTest do
         |> run_request(routes: [@multi_route], facilitator: self())
         |> decode_payment_required!()
 
-      assert length(required["accepts"]) == 2
+      assert [_, _] = required["accepts"]
 
       assert Enum.any?(
                required["accepts"],
@@ -1876,7 +1876,7 @@ defmodule X402.Plug.PaymentGateTest do
           facilitator: self()
         )
 
-      assert length(hd(opts.routes).accepts) == 1
+      assert [_] = hd(opts.routes).accepts
     end
   end
 

@@ -42,7 +42,7 @@ defmodule X402.Extensions.SIWX.Storage do
   """
   @spec validate_module(term()) :: {:ok, module()} | {:error, String.t()}
   def validate_module(module) when is_atom(module) do
-    case implementation?(module) do
+    case X402.Behaviour.implements?(module, @required_callbacks) do
       true -> {:ok, module}
       false -> {:error, "expected a module implementing X402.Extensions.SIWX.Storage"}
     end
@@ -50,7 +50,4 @@ defmodule X402.Extensions.SIWX.Storage do
 
   def validate_module(_invalid),
     do: {:error, "expected a module implementing X402.Extensions.SIWX.Storage"}
-
-  @spec implementation?(module()) :: boolean()
-  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
 end

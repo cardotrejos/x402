@@ -19,6 +19,9 @@ defmodule X402.AuthCapture.Receipt do
   alias X402.RPC
   alias X402.Verify.AuthCaptureEVM
 
+  # Bounds the scan of a node-supplied receipt log list.
+  @max_receipt_logs 4096
+
   @type event :: %{address: String.t(), topics: [String.t()], data: String.t()}
   @type identity :: %{hash: String.t(), from: String.t(), to: String.t()}
   @type inclusion :: %{
@@ -167,14 +170,13 @@ defmodule X402.AuthCapture.Receipt do
   @spec outcome(map(), event()) :: {:ok, :confirmed | :reverted} | :error
   defp outcome(%{"status" => "0x0", "logs" => []}, _event), do: {:ok, :reverted}
 
-  defp outcome(%{"status" => "0x1", "logs" => logs} = receipt, event)
-       when is_list(logs) and length(logs) <= 4096 do
-    case Enum.filter(logs, &event_identity?(&1, event)) do
-      [log] ->
-        if valid_log?(log, receipt, event), do: {:ok, :confirmed}, else: :error
-
-      _other ->
-        :error
+  defp outcome(%{"status" => "0x1", "logs" => logs} = receipt, event) when is_list(logs) do
+    with true <- Enum.count_until(logs, @max_receipt_logs + 1) <= @max_receipt_logs,
+         [log] <- Enum.filter(logs, &event_identity?(&1, event)),
+         true <- valid_log?(log, receipt, event) do
+      {:ok, :confirmed}
+    else
+      _other -> :error
     end
   end
 

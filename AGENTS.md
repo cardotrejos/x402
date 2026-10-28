@@ -76,12 +76,12 @@ mix compile --no-optional-deps  # Must compile without Finch
 - `{:ok, result} | {:error, atom}` — never raise for expected failures
 - Flat module naming: `X402.Wallet` not `X402.Utils.Validators.Wallet`
 - Behaviours for extensibility (`@callback`), not app env config
-- No GenServer unless stateful (only Facilitator uses it)
+- No GenServer unless the process owns state
 
 ## Testing
-- Mox for behaviour mocking (`X402.Facilitator.HTTPBehaviour`)
+- Mox for behaviour mocks, defined in `test/test_helper.exs` (`X402.PaymentIdentifierCacheMock`, `X402.RedisCommandMock`)
 - Bypass for HTTP tests — never hit real services
-- Live smoke tests are tagged `:smoke` and excluded by default (`ExUnit.start(exclude: [:smoke])`). The CDP live test (`test/x402/facilitator/auth/cdp_live_test.exs`) is tiered: the negative control always runs; auth needs `CDP_API_KEY_ID` / `CDP_API_KEY_SECRET`; end-to-end verify additionally needs `X402_PAYER_KEY`; settle needs `X402_SETTLE=1`. Payment config is built by `X402.TestPayments.from_env/1` from the facilitator-agnostic `X402_*` vars (`X402_PAYER_KEY`, `X402_NETWORK`, `X402_CONTRACT`, `X402_RESOURCE`, `X402_MAX_TIMEOUT`, `X402_TOKEN_NAME`, `X402_TOKEN_VERSION`) — no receiver/payer address vars: end-to-end receivers default to a fresh burner wallet (never the payer itself, and never the zero address — USDC reverts on transfers to `address(0)`). Credentials stay facilitator-specific (`CDP_*`; `X402_FACILITATOR_URL` defaults to CDP). Defaults target USDC on Base Sepolia (`eip155:84532`, amount fixed at 1 cent). Run:
+- Live smoke tests are tagged `:smoke` and Redis live tests are tagged `:redis`; both are excluded by default (`ExUnit.start(exclude: [:smoke, :redis])`). Redis live tests need a server: `REDIS_URL=redis://localhost:6379 mix test --only redis`. The CDP live test (`test/x402/facilitator/auth/cdp_live_test.exs`) is tiered: the negative control always runs; auth needs `CDP_API_KEY_ID` / `CDP_API_KEY_SECRET`; end-to-end verify additionally needs `X402_PAYER_KEY`; settle needs `X402_SETTLE=1`. Payment config is built by `X402.TestPayments.from_env/1` from the facilitator-agnostic `X402_*` vars (`X402_PAYER_KEY`, `X402_NETWORK`, `X402_CONTRACT`, `X402_RESOURCE`, `X402_MAX_TIMEOUT`, `X402_TOKEN_NAME`, `X402_TOKEN_VERSION`) — no receiver/payer address vars: end-to-end receivers default to a fresh burner wallet (never the payer itself, and never the zero address — USDC reverts on transfers to `address(0)`). Credentials stay facilitator-specific (`CDP_*`; `X402_FACILITATOR_URL` defaults to CDP). Defaults target USDC on Base Sepolia (`eip155:84532`, amount fixed at 1 cent). Run:
   ```bash
   CDP_API_KEY_ID=... CDP_API_KEY_SECRET=... \
     X402_PAYER_KEY=... X402_SETTLE=1 \

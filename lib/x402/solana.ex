@@ -284,7 +284,7 @@ defmodule X402.Solana do
   @spec validate_seeds([term()]) :: :ok | {:error, :invalid_seeds}
   defp validate_seeds(seeds) do
     valid? =
-      length(seeds) <= 16 and
+      Enum.count_until(seeds, 17) <= 16 and
         Enum.all?(seeds, &(is_binary(&1) and byte_size(&1) <= 32))
 
     case valid? do
