@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their deprecated functions, are now scheduled for removal in 0.9.5 instead
   of 1.0.0. Deprecation warnings, docs, and guides name the new version.
 
+### Fixed
+
+- Load extension adapters and hook modules before checking for their optional
+  callbacks. Where modules load on demand (anything not run as a release,
+  such as dev, test, or `mix phx.server` in production), a module that was
+  not loaded yet looked like it lacked the callback. So
+  `X402.Extension.advertise_all/3` skipped its `advertise/2`,
+  `after_verify_all/4` and `after_settle_all/4` skipped its notifications, and
+  `X402.Hooks.run_protected_request/3` and `run_verified_payment_canceled/3`
+  skipped the hook. Whether it happened depended on module load order.
+
 ## [0.9.0] - 2026-09-24
 
 This release includes all changes merged since 0.6.1: the spec-conformance

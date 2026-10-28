@@ -79,6 +79,12 @@ defmodule X402.HooksTest do
 
     @context RequestContext.new(transport: :http, requirements: [%{"scheme" => "exact"}])
 
+    test "loads a hook module that is not loaded yet before checking for the callback" do
+      hooks = X402.TestUnloaded.unload!(X402.TestUnloaded.HooksProtectedRequest)
+
+      assert {:halt, :skip_payment} = Hooks.run_protected_request(hooks, @context, %{})
+    end
+
     test "continues untouched for modules without the callback" do
       assert {:cont, @context} = Hooks.run_protected_request(ValidHooks, @context, %{})
       assert {:cont, @context} = Hooks.run_protected_request(Hooks.Default, @context, %{})
@@ -122,6 +128,14 @@ defmodule X402.HooksTest do
     alias X402.Hooks.RequestContext
 
     @context RequestContext.new(transport: :mcp, tool: "search")
+
+    test "loads a hook module that is not loaded yet before checking for the callback" do
+      hooks = X402.TestUnloaded.unload!(X402.TestUnloaded.HooksPaymentCanceled)
+      metadata = %{reason: :handler_failed, test_pid: self()}
+
+      assert :ok = Hooks.run_verified_payment_canceled(hooks, @context, metadata)
+      assert_received {:unloaded_canceled, ^hooks}
+    end
 
     test "is a no-op for modules without the callback" do
       assert :ok = Hooks.run_verified_payment_canceled(ValidHooks, @context, %{reason: :x})
