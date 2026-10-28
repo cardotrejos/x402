@@ -26,3 +26,7 @@ x402-*.tar
 priv/plts/
 
 .envrc
+
+# Editor and OS metadata
+.elixir_ls/
+.DS_Store

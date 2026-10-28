@@ -149,7 +149,7 @@ defmodule X402.Solana.TransactionTest do
       assert {:ok, decoded} = Transaction.decode(wire)
       assert decoded.version == :legacy
       assert decoded.address_table_lookups == 0
-      assert length(decoded.instructions) == 4
+      assert [_, _, _, _] = decoded.instructions
     end
 
     test "rejects malformed wires" do

@@ -34,7 +34,7 @@ defmodule X402.Plug.EscrowBufferTest do
     refute_received {:plug_conn, :sent}
     result = Plug.Conn.send_resp(result)
     assert {201, headers, "paid result"} = Plug.Test.sent_resp(result)
-    assert length(Enum.filter(headers, &(elem(&1, 0) == "set-cookie"))) == 1
+    assert Enum.count(headers, &(elem(&1, 0) == "set-cookie")) == 1
     refute_received :callback
   end
 

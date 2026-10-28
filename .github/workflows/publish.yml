@@ -5,16 +5,22 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      ELIXIR_VERSION: "1.20"
+      OTP_VERSION: "29"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
-          elixir-version: "1.20"
-          otp-version: "29"
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
@@ -22,8 +28,8 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
-          restore-keys: ${{ runner.os }}-mix-
+          key: ${{ runner.os }}-mix-v3-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-v3-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - run: mix deps.get
       - run: mix compile --warnings-as-errors

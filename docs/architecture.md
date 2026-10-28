@@ -46,6 +46,7 @@ replace transports, signing, payment schemes, and storage.
 | `X402.Scheme.Registry` | Resolves `(scheme, network)` pairs to scheme modules |
 | `X402.Scheme.ExactEVM`, `X402.Scheme.UptoEVM` | Built-in `exact` / `upto` schemes for `eip155:*` |
 | `X402.Scheme.ExactSVM` | Built-in `exact` scheme for `solana:*` |
+| `X402.Scheme.AuthCaptureEVM` | Built-in `auth-capture` scheme for `eip155:*` |
 | `X402.Scheme.EVM` | Shared local pre-checks for EVM authorization payloads |
 | `X402.Signer` | Behaviour for client-side signers |
 | `X402.Signer.LocalKey`, `X402.Signer.SolanaKey` | In-memory secp256k1 and Ed25519 signers |
@@ -61,6 +62,7 @@ fail closed rather than falling back to another authorization.
 |--------|------|
 | `X402.Verify.EVM` | Local verify checklist for EVM `exact` (EIP-3009, Permit2) and `upto`: EIP-712 recovery, ERC-1271/6492, balance, simulation |
 | `X402.Verify.SVM` | Local verify checklist for SVM `exact`: Ed25519 signatures, fee-payer isolation, instruction whitelist |
+| `X402.Verify.AuthCaptureEVM` | Local verification of EVM `auth-capture` payments: structure, signatures, pinned-RPC checks |
 
 ### Facilitator
 
@@ -87,6 +89,23 @@ fail closed rather than falling back to another authorization.
 | `X402.Extension` | Behaviour for extension adapters run by `PaymentGate` |
 | `X402.Paywall`, `X402.Paywall.Default` | Browser-facing HTML 402 page behaviour and default renderer |
 | `X402.RateLimiter`, `.ETS` | Verified-request rate-limit behaviour and per-node fixed-window store |
+
+### Auth-capture
+
+| Module | Role |
+|--------|------|
+| `X402.AuthCapture` | `auth-capture` flows, operations, deadlines, lifecycle payloads, reason strings |
+| `X402.AuthCapture.EVM` | EVM binding primitives: commerce-payments deployments, `PaymentInfo` hashing, authorizer typed data |
+| `X402.AuthCapture.Engine` | Explicit-consent transaction execution and reconciliation |
+| `X402.AuthCapture.Resource` | Durable hold-before-handler orchestration for escrow resources |
+| `X402.AuthCapture.Store`, `X402.AuthCapture.ETSStore` | Atomic storage contract, and a volatile store for development and tests |
+| `X402.AuthCapture.Journal` | Durable signer-scope fencing for transactions |
+| `X402.AuthCapture.Receipt` | Strict receipt identity and escrow-event checks |
+
+Escrow routes are enabled with the `auth_capture:` option of
+`X402.Plug.PaymentGate`. Production storage, recovery scheduling, and refund
+funding remain application-owned. See the
+[auth-capture guide](../guides/auth-capture.md).
 
 ### Payer client
 

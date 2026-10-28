@@ -4,7 +4,7 @@
 # Boots the real server supervision tree against a stub facilitator and
 # asserts the harness wire contract (402 + PAYMENT-REQUIRED without payment,
 # 200 + PAYMENT-RESPONSE with a well-formed PAYMENT-SIGNATURE, /health,
-# /close). Run from anywhere; requires Elixir >= 1.15 with Hex installed.
+# /close). Run from anywhere; requires Elixir >= 1.19 with Hex installed.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 

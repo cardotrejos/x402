@@ -4,7 +4,11 @@ The test suite ships with a live smoke test that exercises the real x402
 wire format against Coinbase's hosted facilitator at
 `https://api.cdp.coinbase.com/platform/v2/x402`. It is tagged `:smoke` and
 excluded from the default test run
-(`ExUnit.start(exclude: [:smoke])` in `test/test_helper.exs`).
+(`ExUnit.start(exclude: [:smoke, :redis])` in `test/test_helper.exs`).
+The Redis cache live tests
+(`test/x402/extensions/payment_identifier/redis_cache_live_test.exs`) are a
+separate tier tagged `:redis`, also excluded by default; run them with
+`REDIS_URL=redis://localhost:6379 mix test --only redis`.
 
 ## What the tests verify
 

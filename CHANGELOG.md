@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Hex package now ships `SECURITY.md`, and HexDocs lists it as
+  "Security Policy". Auth-capture functions are grouped by topic in HexDocs
+  (requirements, deadlines, reason codes, lifecycle payloads, calldata, fees).
+- Receipt-log and Solana seed bounds use `Enum.count_until/2` instead of
+  `length/1`. No behavior change.
+
 ### Deprecated
 
 - The legacy `paymentIdentifier` and SIWX `{message, signature}` formats, and
@@ -29,6 +37,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `after_verify_all/4` and `after_settle_all/4` skipped its notifications, and
   `X402.Hooks.run_protected_request/3` and `run_verified_payment_canceled/3`
   skipped the hook. Whether it happened depended on module load order.
+
+### Documentation
+
+- `docs/architecture.md` covers the auth-capture modules. The live smoke-test
+  guide and `AGENTS.md` list the `:redis` live-test tag and the Mox mocks the
+  suite defines.
+
+### Development
+
+- Credo now runs the [ExSlop](https://hex.pm/packages/ex_slop) checks
+  (`.credo.exs`): the recommended set, plus opt-in checks the code already
+  passes. CI enforces them through `mix credo --strict`.
+- Test files mirror their modules (`test/x402_test.exs`; the payment
+  identifier ETS cache tests are in one file).
+- The publish workflow runs with a read-only token and a toolchain-scoped
+  cache. The example and integration projects require Elixir `~> 1.19`,
+  matching the library.
 
 ## [0.9.0] - 2026-09-24
 

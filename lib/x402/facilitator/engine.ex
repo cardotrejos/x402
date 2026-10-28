@@ -1474,8 +1474,6 @@ defmodule X402.Facilitator.Engine do
         true -> :ok
         false -> :mismatch
       end
-    else
-      :unparseable -> :unparseable
     end
   end
 

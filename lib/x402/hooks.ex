@@ -191,7 +191,7 @@ defmodule X402.Hooks do
   """
   @spec validate_module(term()) :: {:ok, term()} | {:error, String.t()}
   def validate_module(module) when is_atom(module) do
-    case implementation?(module) do
+    case X402.Behaviour.implements?(module, @required_callbacks) do
       true -> {:ok, module}
       false -> {:error, "expected a module implementing X402.Hooks"}
     end
@@ -314,7 +314,4 @@ defmodule X402.Hooks do
         inspect(failure)
     )
   end
-
-  @spec implementation?(module()) :: boolean()
-  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
 end
