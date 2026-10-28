@@ -110,7 +110,7 @@ defmodule X402.AuthCapture.JournalTest do
       |> Enum.map(fn {:ok, result} -> result end)
 
     assert [{:ok, {:reserved, entry}}] = Enum.filter(results, &match?({:ok, {:reserved, _}}, &1))
-    assert length(Enum.filter(results, &match?({:ok, {:existing, _}}, &1))) == 31
+    assert Enum.count(results, &match?({:ok, {:existing, _}}, &1)) == 31
     assert byte_size(entry.owner) == 32
     assert Journal.active(journal) == {:ok, entry}
     assert Journal.reserve(journal, "other", @intent) == {:error, :signer_busy}
@@ -150,8 +150,8 @@ defmodule X402.AuthCapture.JournalTest do
       )
       |> Enum.map(fn {:ok, result} -> result end)
 
-    assert length(Enum.filter(results, &match?({:ok, %{phase: :dispatched}}, &1))) == 1
-    assert length(Enum.filter(results, &(&1 == {:error, :invalid_phase}))) == 31
+    assert Enum.count(results, &match?({:ok, %{phase: :dispatched}}, &1)) == 1
+    assert Enum.count(results, &(&1 == {:error, :invalid_phase})) == 31
     assert {:ok, %{transaction: transaction}} = Journal.active(journal)
     assert transaction == prepared.transaction
   end

@@ -86,7 +86,7 @@ defmodule X402.Extensions.PaymentIdentifierTest do
 
       assert Enum.all?(ids, &PaymentIdentifier.valid_id?/1)
       assert Enum.all?(ids, &(String.length(&1) == 32))
-      assert length(Enum.uniq(ids)) == 50
+      assert ids |> Enum.uniq() |> Enum.count() == 50
     end
   end
 

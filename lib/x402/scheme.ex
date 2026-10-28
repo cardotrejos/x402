@@ -130,7 +130,7 @@ defmodule X402.Scheme do
   @type t :: module()
 
   @doc """
-  The x402 scheme name this module implements (for example `"exact"`).
+  Returns the x402 scheme name, for example `"exact"`.
   """
   @callback scheme() :: String.t()
 
