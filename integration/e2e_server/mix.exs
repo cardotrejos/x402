@@ -5,7 +5,7 @@ defmodule X402.E2EServer.MixProject do
     [
       app: :x402_e2e_server,
       version: "0.1.0",
-      elixir: "~> 1.15",
+      elixir: "~> 1.19",
       start_permanent: false,
       deps: deps(),
       elixirc_paths: elixirc_paths(Mix.env())

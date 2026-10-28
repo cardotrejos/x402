@@ -124,7 +124,7 @@ defmodule X402.MixProject do
       },
       maintainers: ["Ricardo Trejos"],
       files:
-        ~w(lib guides docs/architecture.md .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
+        ~w(lib guides docs/architecture.md .formatter.exs mix.exs README.md LICENSE CHANGELOG.md SECURITY.md)
     ]
   end
 
@@ -137,6 +137,7 @@ defmodule X402.MixProject do
         "README.md": [title: "Overview"],
         "CHANGELOG.md": [title: "Changelog"],
         LICENSE: [title: "License"],
+        "SECURITY.md": [title: "Security Policy"],
         "guides/getting-started.md": [title: "Getting Started"],
         "guides/client.md": [title: "Paying for Resources"],
         "guides/authentication.md": [title: "Authentication Extensions"],
@@ -296,7 +297,17 @@ defmodule X402.MixProject do
         "Facilitator Discovery": &(&1[:group] == :discovery),
         "Signed Offers": &(&1[:group] == :offers),
         "Signed Receipts": &(&1[:group] == :receipts),
-        "Extension Declaration": &(&1[:group] == :declaration)
+        "Extension Declaration": &(&1[:group] == :declaration),
+        "Payment Requirements": &(&1[:group] == :requirements),
+        Deadlines: &(&1[:group] == :deadlines),
+        "Reason Codes": &(&1[:group] == :reasons),
+        "Lifecycle Payloads": &(&1[:group] == :lifecycle),
+        Deployments: &(&1[:group] == :deployments),
+        "Payment Info": &(&1[:group] == :payment_info),
+        "Client Signing": &(&1[:group] == :client),
+        Calldata: &(&1[:group] == :calldata),
+        "Authorizer Consent": &(&1[:group] == :authorizer),
+        Fees: &(&1[:group] == :fees)
       ]
     ]
   end

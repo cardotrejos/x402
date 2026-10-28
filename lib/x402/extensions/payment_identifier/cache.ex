@@ -172,7 +172,7 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   """
   @spec validate_adapter(term()) :: :ok | {:error, String.t()}
   def validate_adapter({module, _cache}) when is_atom(module) do
-    case implementation?(module) do
+    case X402.Behaviour.implements?(module, @required_callbacks) do
       true -> :ok
       false -> {:error, @adapter_error}
     end
@@ -237,7 +237,4 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   end
 
   def delete(_adapter, _payment_id), do: {:error, :invalid_adapter}
-
-  @spec implementation?(module()) :: boolean()
-  defp implementation?(module), do: X402.Behaviour.implements?(module, @required_callbacks)
 end

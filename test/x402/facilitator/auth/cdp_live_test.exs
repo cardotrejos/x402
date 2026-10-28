@@ -7,7 +7,7 @@ defmodule X402.Facilitator.Auth.CDPLiveTest do
   Live smoke tests against Coinbase's hosted x402 facilitator.
 
   These tests make real network calls to `https://api.cdp.coinbase.com/` and
-  are excluded from the default test run (`ExUnit.start(exclude: [:smoke])`).
+  are excluded from the default test run (`ExUnit.start(exclude: [:smoke, :redis])`).
   They prove that the JWT built by `X402.Facilitator.Auth.CDP` is accepted by
   the real service and that the v2 payment wire format round-trips end to end.
 
