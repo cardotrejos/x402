@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `X402.RateLimiter.ETS.hit/4` no longer returns `{:error, :contention}` when
+  short windows expire while concurrent hits retry. A hit now judges windows
+  by the time it arrived and replaces a window only if it is still closed at
+  that time, so it can no longer lose its retries to newer hits. Under the
+  default `on_error: :allow`, that error let the affected hit bypass the
+  limit.
 - Load extension adapters and hook modules before checking for their optional
   callbacks. Where modules load on demand (anything not run as a release,
   such as dev, test, or `mix phx.server` in production), a module that was

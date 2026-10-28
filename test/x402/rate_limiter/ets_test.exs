@@ -107,13 +107,17 @@ defmodule X402.RateLimiter.ETSTest do
               result = ETS.hit(table, :shared, 10, 1)
 
               assert match?({:allow, remaining} when remaining in 0..9, result) or
-                       match?({:deny, retry} when retry > 0, result)
+                       match?({:deny, retry} when retry > 0, result),
+                     "got: #{inspect(result)}"
             end
           end
         end)
       end
 
-    Enum.each(tasks, &Task.await/1)
+    # Every hit contends on one ETS row, so this takes about a second on an
+    # idle machine and several under CPU oversubscription. The test checks
+    # results, not latency, so give it more than `Task.await/1`'s 5 seconds.
+    Task.await_many(tasks, 30_000)
   end
 
   test "reset/1 clears every counter", %{table: table} do
