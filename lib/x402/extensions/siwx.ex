@@ -47,7 +47,7 @@ defmodule X402.Extensions.SIWX do
   itself. `decode_signed/1` still understands that shape — reporting it as
   `{:legacy, proof}` — and `verify/2` applies the same rules to it.
   `encode_header/1` and `decode_header/1` produce and consume it directly,
-  are deprecated, and will be removed in 1.0.0; `encode/1` and `decode/1`
+  are deprecated, and will be removed in 0.9.5; `encode/1` and `decode/1`
   remain as the EIP-4361 text codec they always were. Servers emit a
   `[:x402, :siwx, :legacy]` telemetry event (and a one-time warning log)
   when they receive the legacy format.
@@ -732,7 +732,7 @@ defmodule X402.Extensions.SIWX do
       Logger.warning(
         "[X402.Extensions.SIWX] received a SIGN-IN-WITH-X header in the deprecated " <>
           "{message, signature} format. Clients should send the spec proof fields; " <>
-          "legacy support is removed in 1.0.0."
+          "legacy support is removed in 0.9.5."
       )
     end
 
@@ -833,7 +833,7 @@ defmodule X402.Extensions.SIWX do
   def decode(_message), do: {:error, :invalid_message}
 
   @doc since: "0.3.0", group: :headers
-  @deprecated "Use the spec proof format (sign/3, encode_signed/1); removed in 1.0.0"
+  @deprecated "Use the spec proof format (sign/3, encode_signed/1); removed in 0.9.5"
   @doc """
   Encodes a legacy SIWX header payload with `message` and `signature` fields.
 
@@ -860,7 +860,7 @@ defmodule X402.Extensions.SIWX do
   def encode_header(_payload), do: {:error, :invalid_payload}
 
   @doc since: "0.3.0", group: :headers
-  @deprecated "Use decode_signed/1, which also understands this format; removed in 1.0.0"
+  @deprecated "Use decode_signed/1, which also understands this format; removed in 0.9.5"
   @doc """
   Decodes a legacy `SIGN-IN-WITH-X` header into its `message` and `signature`.
 

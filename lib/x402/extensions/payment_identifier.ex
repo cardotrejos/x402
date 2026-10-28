@@ -27,7 +27,7 @@ defmodule X402.Extensions.PaymentIdentifier do
   still understands that format — reporting it as `{:legacy, id}` — and
   `encode/1`, `decode/1`, and `fetch_payment_id/1` still produce and
   consume it. Every legacy function is deprecated and will be removed in
-  1.0.0; servers emit a `[:x402, :payment_identifier, :legacy]` telemetry
+  0.9.5; servers emit a `[:x402, :payment_identifier, :legacy]` telemetry
   event (and a one-time warning log) when they see it.
   """
 
@@ -562,7 +562,7 @@ defmodule X402.Extensions.PaymentIdentifier do
       Logger.warning(
         "[X402.Extensions.PaymentIdentifier] received a payment identifier in the " <>
           "deprecated `paymentIdentifier` format. Clients should send the spec " <>
-          "`payment-identifier` extension; legacy support is removed in 1.0.0."
+          "`payment-identifier` extension; legacy support is removed in 0.9.5."
       )
     end
 
@@ -572,7 +572,7 @@ defmodule X402.Extensions.PaymentIdentifier do
   # -- Legacy format (deprecated) ---------------------------------------------
 
   @doc since: "0.1.0"
-  @deprecated "Use the spec `payment-identifier` format (extension/1, extract_id/1); removed in 1.0.0"
+  @deprecated "Use the spec `payment-identifier` format (extension/1, extract_id/1); removed in 0.9.5"
   @doc """
   Encodes a legacy payment identifier to a Base64 JSON payload.
 
@@ -592,7 +592,7 @@ defmodule X402.Extensions.PaymentIdentifier do
   def encode(_payment_id), do: {:error, :invalid_payment_id}
 
   @doc since: "0.1.0"
-  @deprecated "Use the spec `payment-identifier` format (extension/1, extract_id/1); removed in 1.0.0"
+  @deprecated "Use the spec `payment-identifier` format (extension/1, extract_id/1); removed in 0.9.5"
   @doc """
   Decodes a legacy Base64 JSON payload and returns the payment identifier.
 
@@ -620,7 +620,7 @@ defmodule X402.Extensions.PaymentIdentifier do
   def decode(_value), do: {:error, :invalid_base64}
 
   @doc since: "0.1.0"
-  @deprecated "Use the spec `payment-identifier` format (extension/1, extract_id/1); removed in 1.0.0"
+  @deprecated "Use the spec `payment-identifier` format (extension/1, extract_id/1); removed in 0.9.5"
   @doc """
   Extracts and validates `"paymentId"` from a decoded legacy payload map.
 

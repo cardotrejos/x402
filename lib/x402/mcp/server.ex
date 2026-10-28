@@ -63,7 +63,7 @@ defmodule X402.MCP.Server do
   (`X402.Extensions.PaymentIdentifier.fingerprint/2`) under a `"pid:"` key:
   reusing it for a different request yields `payment_identifier_conflict`,
   the same request proceeds normally. The pre-0.7.0 `"paymentIdentifier"`
-  format is still accepted but deprecated (removed in 1.0.0) and emits
+  format is still accepted but deprecated (removed in 0.9.5) and emits
   `[:x402, :payment_identifier, :legacy]`.
 
   ## Builder code
