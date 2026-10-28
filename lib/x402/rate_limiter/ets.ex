@@ -41,7 +41,7 @@ defmodule X402.RateLimiter.ETS do
 
   ## Examples
 
-      iex> table = String.to_atom("rate_limiter_doctest_#{System.unique_integer([:positive])}")
+      iex> table = String.to_atom("rate_limiter_doctest_\#{System.unique_integer([:positive])}")
       iex> X402.RateLimiter.ETS.hit(table, {:payer, "0xabc"}, 2, 60_000)
       {:allow, 1}
       iex> X402.RateLimiter.ETS.hit(table, {:payer, "0xabc"}, 2, 60_000)
@@ -60,7 +60,7 @@ defmodule X402.RateLimiter.ETS do
     # Binary keys bind directly in match heads without interpreting arbitrary
     # user terms as match-spec variables or colliding with the sweep counter.
     key = :erlang.term_to_binary(key, [:deterministic])
-    do_hit(table, key, limit, window_ms, 0)
+    do_hit(table, key, limit, window_ms, now_ms(), 0)
   end
 
   @doc since: "0.9.0"
@@ -92,12 +92,13 @@ defmodule X402.RateLimiter.ETS do
     :ok
   end
 
-  defp do_hit(_table, _key, _limit, _window_ms, @max_cas_attempts),
+  defp do_hit(_table, _key, _limit, _window_ms, _now, @max_cas_attempts),
     do: {:error, :contention}
 
-  defp do_hit(table, key, limit, window_ms, attempts) do
-    now = now_ms()
-
+  # `now` is read once per hit, not per attempt. A retry judges windows by
+  # the time the hit arrived, so windows opened by later hits stay open to
+  # it and a short window cannot keep expiring underneath its retries.
+  defp do_hit(table, key, limit, window_ms, now, attempts) do
     # Increment and read the window atomically; the default row also handles
     # a concurrent sweep without a lookup/update race that could fail open.
     [count, window_end] =
@@ -106,16 +107,22 @@ defmodule X402.RateLimiter.ETS do
     if now < window_end do
       result(count, limit, window_end - now)
     else
-      # Only one hit replaces the expired window. Counts in that expired
-      # window no longer matter; a losing hit retries against the new one.
+      # Replace the window only if it is still closed as of `now`, so a hit
+      # never clobbers a window that is open to it: when several hits roll
+      # over at once, the first opens the new window and the rest count into
+      # it. A replace fails only when a concurrent hit opened a window that
+      # is open as of `now`, which the retry counts into, or a sweep deleted
+      # the row, which the retry recreates. Counts in the closed window no
+      # longer matter.
       replaced =
         :ets.select_replace(table, [
-          {{key, :_, :_, window_end}, [], [{:const, {key, 1, now, now + window_ms}}]}
+          {{key, :_, :_, :"$1"}, [{:"=<", :"$1", now}],
+           [{:const, {key, 1, now, now + window_ms}}]}
         ])
 
       case replaced do
         1 -> {:allow, limit - 1}
-        0 -> do_hit(table, key, limit, window_ms, attempts + 1)
+        0 -> do_hit(table, key, limit, window_ms, now, attempts + 1)
       end
     end
   end
