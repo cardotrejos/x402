@@ -46,7 +46,7 @@ address is deliberately avoided as a recipient because USDC's
 
 Defaults target USDC on Base Sepolia (`eip155:84532`) at a fixed amount of
 1 cent. Payment configuration is built by `X402.TestPayments.from_env/1`
-from the facilitator-agnostic `X402_*` variables; facilitator credentials
+(a test helper in `test/support`, not part of the published package) from the facilitator-agnostic `X402_*` variables; facilitator credentials
 stay facilitator-specific (`CDP_*`).
 
 | Variable | Default | Purpose |
