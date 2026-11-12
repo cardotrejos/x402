@@ -33,6 +33,7 @@ jobs:
           key: ${{ runner.os }}-mix-v3-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-v3-${{ matrix.elixir }}-${{ matrix.otp }}-
       - run: mix deps.get
+      - run: mix deps.audit
       - run: mix compile --warnings-as-errors
       - run: mix format --check-formatted
       - run: mix credo --strict
@@ -53,8 +54,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        elixir: ["1.20"]
-        otp: ["29"]
+        include:
+          - elixir: "1.19"
+            otp: "27"
+          - elixir: "1.20"
+            otp: "29"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
