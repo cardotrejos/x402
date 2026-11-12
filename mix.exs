@@ -35,7 +35,8 @@ defmodule X402.MixProject do
       docs: docs(),
 
       # Testing
-      test_coverage: [tool: ExCoveralls, minimum_coverage: 95],
+      # The 95% floor lives in coveralls.json (ExCoveralls reads it only there).
+      test_coverage: [tool: ExCoveralls],
 
       # Dialyzer. The PLT filename carries the OTP/Elixir versions: a
       # toolchain bump then builds a fresh PLT instead of updating the old

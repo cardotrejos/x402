@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (requirements, deadlines, reason codes, lifecycle payloads, calldata, fees).
 - Receipt-log and Solana seed bounds use `Enum.count_until/2` instead of
   `length/1`. No behavior change.
+- CI enforces the 95% coverage floor through `coveralls.json`, runs
+  `mix hex.audit` and `mix deps.audit` in a separate advisory job, and runs
+  Dialyzer on Elixir 1.19 / OTP 27 as well as 1.20 / OTP 29. No package
+  code changes.
 
 
 ### Deprecated

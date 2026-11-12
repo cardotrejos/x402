@@ -62,7 +62,7 @@ lib/x402/telemetry.ex          — Telemetry event definitions
 ## Key Commands
 ```bash
 mix test                   # Run test suite
-mix coveralls              # CI coverage; threshold is configured in mix.exs
+mix coveralls              # CI coverage; threshold is configured in coveralls.json
 mix dialyzer               # Type checking
 mix docs                   # Generate ExDoc
 MIX_ENV=test mix coveralls # ExCoveralls report

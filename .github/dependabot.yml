@@ -6,6 +6,21 @@ updates:
     schedule:
       interval: weekly
 
+  - package-ecosystem: mix
+    directory: "/examples/facilitator"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: mix
+    directory: "/integration/consumer"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: mix
+    directory: "/integration/e2e_server"
+    schedule:
+      interval: weekly
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
