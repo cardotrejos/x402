@@ -9,17 +9,25 @@ permissions:
   contents: read
 
 jobs:
+  # Read from main, not the tagged commit, so a tag cannot weaken its own gate.
+  # The tagged commit is still the one tested: reusable workflows check out github.sha.
   ci:
-    uses: ./.github/workflows/ci.yml
+    uses: cardotrejos/x402/.github/workflows/ci.yml@main
 
   publish:
     needs: [ci]
     runs-on: ubuntu-latest
+    environment: hex
     env:
       ELIXIR_VERSION: "1.20"
       OTP_VERSION: "29"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify tagged commit is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
