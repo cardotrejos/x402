@@ -49,10 +49,10 @@ jobs:
           mix compile --warnings-as-errors
           mix run smoke.exs
 
-  # Advisory only. mix_audit reads a local clone of the advisory database and
-  # can miss current advisories, and `mix hex.audit` flags locked packages
-  # that are awaiting an owner decision (bump or ignore). Neither result gates
-  # PRs or Hex publish, so this job is non-blocking until that is resolved.
+  # Advisory only: this job gates neither PRs nor Hex publish. mix_audit reads
+  # a local clone of the advisory database and can miss current advisories,
+  # so treat `mix hex.audit` as the authoritative result. `mix deps.audit`
+  # runs even when `mix hex.audit` fails, so one report never hides the other.
   audit:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -65,6 +65,7 @@ jobs:
       - run: mix deps.get
       - run: mix hex.audit
       - run: mix deps.audit
+        if: ${{ !cancelled() }}
 
   dialyzer:
     runs-on: ubuntu-latest
