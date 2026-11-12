@@ -91,6 +91,11 @@ limit that holds across the cluster, pass a shared store as `store:`, using
 `X402.RateLimiter` or a `{module, ref}` pair. A denied request answers 429 with
 `Retry-After` and is never settled.
 
+`on_error` decides what happens when the store fails. It defaults to `:allow`,
+so a store failure admits the request. Set `on_error: :deny` to refuse requests
+while the store is unavailable. See the `rate_limit:` options in the
+[Plug/Phoenix Integration](plug-integration.html) guide.
+
 ## Observability
 
 x402 emits telemetry events under the `[:x402, ...]` prefix. The gate emits
@@ -102,8 +107,9 @@ events for each step of a payment:
 - `[:x402, :client, :request]`
 - `[:x402, :client, :build]`
 
-`X402.Telemetry` lists every event and defines metric definitions for
-`telemetry_metrics`, which needs the optional `telemetry_metrics` dependency.
+`X402.Telemetry` lists every event. `X402.Telemetry.Metrics` builds the
+`telemetry_metrics` definitions for them, and is compiled only when the optional
+`telemetry_metrics` dependency is present.
 Attach a handler to log rejections:
 
 ```elixir
@@ -130,6 +136,9 @@ settlement on a live network.
 - Facilitator URLs use HTTPS, and Finch uses `secure_pool_opts/0`.
 - Credentials come from runtime configuration, not from source or compile-time
   config.
+- `payment_identifier_cache:` is set on every gated route. Without it, the gate
+  logs a warning and concurrent identical requests can settle the same payment
+  twice.
 - Multi-node deployments use a shared replay cache, and Redis uses
   `maxmemory-policy noeviction`.
 - Rate limits use a store that matches your node count.

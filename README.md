@@ -263,9 +263,9 @@ Facilitator requests use the v2 wire object:
 ## Documentation
 
 - [Getting Started](https://hexdocs.pm/x402/getting-started.html)
-- [Build a Paid API in 5 Minutes](https://hexdocs.pm/x402/paid-api-5-minutes.html)
-- [x402 for AI Agents](https://hexdocs.pm/x402/ai-agents.html)
-- [Deployment](https://hexdocs.pm/x402/deployment.html)
+- [Build a Paid API in 5 Minutes](guides/paid-api-5-minutes.md)
+- [x402 for AI Agents](guides/ai-agents.md)
+- [Deployment](guides/deployment.md)
 - [Paying for Resources](https://hexdocs.pm/x402/client.html)
 - [Authentication Extensions](https://hexdocs.pm/x402/authentication.html)
 - [Plug/Phoenix Integration](https://hexdocs.pm/x402/plug-integration.html)

@@ -20,7 +20,7 @@ def deps do
 end
 ```
 
-The server needs only these. The client in step 5 also needs `ex_secp256k1`
+The server needs only these. The client in step 6 also needs `ex_secp256k1`
 and `ex_keccak` to sign EVM payments.
 
 ## 2. Start the payment processes

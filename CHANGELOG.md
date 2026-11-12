@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Receipt-log and Solana seed bounds use `Enum.count_until/2` instead of
   `length/1`. No behavior change.
 
+
 ### Deprecated
 
 - The legacy `paymentIdentifier` and SIWX `{message, signature}` formats, and
@@ -40,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- New guides: "Build a Paid API in 5 Minutes", "x402 for AI Agents", and
+  "Deploying x402 in Production". The README lists them, corrects the optional
+  `ex_secp256k1` and `ex_keccak` note (needed for EVM payment signing), and adds
+  the 409 row to the HTTP outcomes table.
 - `docs/architecture.md` covers the auth-capture modules. The live smoke-test
   guide and `AGENTS.md` list the `:redis` live-test tag and the Mox mocks the
   suite defines.

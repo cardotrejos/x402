@@ -28,8 +28,10 @@ below compose:
 
 - `:max_amount` caps one payment in atomic units. Options above it are never
   selected.
-- `:policies` restricts which options are acceptable, for example by network,
-  asset, scheme, or receiver. `X402.Client.Policy` provides common policies.
+- `:policies` restricts which options are acceptable. `X402.Client.Policy`
+  provides `max_amount/1`, `networks/1`, `assets/1`, and `schemes/1`. To filter
+  by receiver (`payTo`), write a custom policy function, as the module's
+  examples show.
 - `:budget` caps total spend across requests. Create the budget process with
   `X402.Client.Budget.start_link/1`, which takes a total `:limit` and optional
   `:per_asset` limits in atomic units:
