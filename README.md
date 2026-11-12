@@ -44,8 +44,9 @@ def deps do
 end
 ```
 
-Add `ex_secp256k1` and `ex_keccak` only when using the default EVM SIWX
-signature verifier.
+Add `ex_secp256k1` and `ex_keccak` when your application signs EVM payments
+(the payer client, EIP-3009 and Permit2) or uses the default EVM SIWX signature
+verifier.
 
 ## Phoenix quick start
 
@@ -255,12 +256,16 @@ Facilitator requests use the v2 wire object:
 |--------|---------|
 | 400 | Malformed or invalid payment input |
 | 402 | Payment required, unmatched terms, or verification/settlement failure |
+| 409 | A payment-identifier id reused for a different request |
 | 429 | Verified payment exceeds the configured request rate limit |
 | 500 | Facilitator transport failure, malformed facilitator response, or internal payment-processing error |
 
 ## Documentation
 
 - [Getting Started](https://hexdocs.pm/x402/getting-started.html)
+- [Build a Paid API in 5 Minutes](https://hexdocs.pm/x402/paid-api-5-minutes.html)
+- [x402 for AI Agents](https://hexdocs.pm/x402/ai-agents.html)
+- [Deployment](https://hexdocs.pm/x402/deployment.html)
 - [Paying for Resources](https://hexdocs.pm/x402/client.html)
 - [Authentication Extensions](https://hexdocs.pm/x402/authentication.html)
 - [Plug/Phoenix Integration](https://hexdocs.pm/x402/plug-integration.html)
