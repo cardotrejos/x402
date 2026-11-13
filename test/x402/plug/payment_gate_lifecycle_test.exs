@@ -1051,6 +1051,72 @@ defmodule X402.Plug.PaymentGateLifecycleTest do
     end
   end
 
+  describe "dynamic route errors and extension edge cases" do
+    test "an {:error, reason} from an accepts function fails closed with the accepts field" do
+      facilitator = start_mock_facilitator()
+      attach_telemetry()
+
+      route = %{
+        method: :get,
+        path: "/api/resource",
+        accepts: fn _conn -> {:error, :catalog_down} end
+      }
+
+      conn = run_request(conn(:get, "/api/resource"), routes: [route], facilitator: facilitator)
+
+      assert conn.status == 500
+      assert conn.halted
+      assert get_resp_header(conn, "payment-required") == []
+
+      assert_receive {:telemetry_event, [:x402, :plug, :payment_rejected], _measurements,
+                      %{reason: {:dynamic_route_error, {:accepts, :catalog_down}}}}
+    end
+
+    test "an {:error, reason} from a pay_to function fails closed with the pay_to field" do
+      facilitator = start_mock_facilitator()
+      attach_telemetry()
+
+      route = Map.put(@route, :pay_to, fn _conn -> {:error, :ledger_down} end)
+
+      conn = run_request(conn(:get, "/api/resource"), routes: [route], facilitator: facilitator)
+
+      assert conn.status == 500
+      assert get_resp_header(conn, "payment-required") == []
+
+      assert_receive {:telemetry_event, [:x402, :plug, :payment_rejected], _measurements,
+                      %{reason: {:dynamic_route_error, {:pay_to, :ledger_down}}}}
+    end
+
+    test "invalid static accepts entries are reported by validate_route/1" do
+      route = %{method: :get, path: "/api/resource", accepts: [%{price: 1}]}
+
+      assert {:error, message} = PaymentGate.validate_route(route)
+      assert message =~ "invalid list element at position 0 in :accepts option"
+    end
+
+    test "init rejects :bazaar on templates that are not bazaar-compatible" do
+      route = Map.put(%{@route | path: "/api/:id/.."}, :bazaar, method: :get)
+
+      assert_raise NimbleOptions.ValidationError, ~r/bazaar-compatible route template/, fn ->
+        PaymentGate.init(routes: [route], facilitator: Facilitator)
+      end
+    end
+
+    test "adapter validation treats a payment without an extensions field as an empty echo" do
+      facilitator = start_mock_facilitator()
+      opts = [routes: [@route], facilitator: facilitator, extensions: [RecordingAdapter]]
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", payment_header(extensions: nil))
+        |> run_request(opts)
+
+      assert conn.status == 200
+      assert_receive {:adapter_validate, nil, %{"info" => %{"path" => "/api/resource"}}}
+      assert_receive {:verify_called, _payload, _requirements}
+    end
+  end
+
   defp run_request(conn, opts) do
     conn
     |> gate_request(opts)

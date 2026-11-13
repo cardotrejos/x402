@@ -36,6 +36,25 @@ defmodule X402.Scheme.ExactEVMTest do
     end
   end
 
+  describe "explicit transfer method selection" do
+    test "an explicit eip3009 selection matches the default and stays signable" do
+      explicit = put_in(@requirements, ["extra", "assetTransferMethod"], "eip3009")
+
+      assert ExactEVM.transfer_method(explicit) == {:ok, :eip3009}
+      assert ExactEVM.transfer_method(@requirements) == {:ok, :eip3009}
+      assert ExactEVM.signable?(explicit)
+    end
+
+    test "unknown methods and non-map extras are told apart" do
+      assert ExactEVM.transfer_method(
+               put_in(@requirements, ["extra", "assetTransferMethod"], "x")
+             ) ==
+               {:error, {:unsupported_transfer_method, "x"}}
+
+      assert ExactEVM.transfer_method(Map.put(@requirements, "extra", "USDC")) == {:ok, :eip3009}
+    end
+  end
+
   describe "sign/3" do
     test "produces the EIP-3009 scheme payload" do
       assert {:ok, %{"signature" => "0x" <> _sig, "authorization" => authorization}} =

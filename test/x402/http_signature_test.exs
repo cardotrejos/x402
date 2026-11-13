@@ -704,6 +704,189 @@ defmodule X402.HTTPSignatureTest do
     end
   end
 
+  describe "signature expiry options" do
+    test "ttl without created expires relative to the signing time" do
+      key = generated("ed25519")
+
+      before_signing = System.os_time(:second)
+
+      assert {:ok, [{"signature-input", input}, _signature] = headers} =
+               HTTPSignature.sign(request(), key, created: false, ttl: 60)
+
+      after_signing = System.os_time(:second)
+
+      refute input =~ "created="
+      assert [_, expires] = Regex.run(~r/;expires=(\d+);/, input)
+      expires = String.to_integer(expires)
+      assert expires in (before_signing + 60)..(after_signing + 60)
+
+      message = request(headers: request().headers ++ headers)
+
+      assert {:ok, %{params: %{"expires" => ^expires}}} =
+               HTTPSignature.verify(message,
+                 keys: [key],
+                 required_params: ["expires"],
+                 now: expires
+               )
+
+      assert {:error, :signature_expired} =
+               HTTPSignature.verify(message, keys: [key], now: expires + 1)
+    end
+
+    test "an explicit expires wins over ttl" do
+      key = generated("ed25519")
+
+      assert {:ok, [{"signature-input", input}, _signature] = headers} =
+               HTTPSignature.sign(request(), key,
+                 created: 1_700_000_000,
+                 expires: 1_700_000_500,
+                 ttl: 60
+               )
+
+      assert input =~ ";created=1700000000;expires=1700000500;"
+
+      message = request(headers: request().headers ++ headers)
+      assert {:ok, _verified} = HTTPSignature.verify(message, keys: [key], now: 1_700_000_500)
+
+      assert {:error, :signature_expired} =
+               HTTPSignature.verify(message, keys: [key], now: 1_700_000_501)
+    end
+  end
+
+  describe "verify/2 on unusual signature inputs" do
+    test "tag selection ignores dictionary members that are not inner lists" do
+      key = generated("ed25519")
+
+      {:ok, [{"signature-input", input}, signature]} =
+        HTTPSignature.sign(request(), key, created: 1_700_000_000, tag: "web-bot-auth")
+
+      message =
+        request(
+          headers: request().headers ++ [{"signature-input", "junk=1, " <> input}, signature]
+        )
+
+      assert {:ok, %{label: "sig1"}} =
+               HTTPSignature.verify(message, keys: [key], tag: "web-bot-auth")
+
+      # Without a tag the stray item counts as a second candidate.
+      assert {:error, :ambiguous_signature} = HTTPSignature.verify(message, keys: [key])
+    end
+
+    test "unregistered signature parameters are tolerated and covered by the signature" do
+      key = generated("ed25519")
+      components = ["@method", "@authority", "@path"]
+      params = [{"created", 1_700_000_000}, {"keyid", key.kid}, {"foo", 42}]
+
+      {:ok, base} = HTTPSignature.signature_base(request(), components, params)
+      {:ok, raw_signature} = Key.sign(key, base)
+
+      input =
+        ~s|sig1=("@method" "@authority" "@path");created=1700000000;keyid="#{key.kid}";foo=42|
+
+      signature = "sig1=:" <> Base.encode64(raw_signature) <> ":"
+
+      message =
+        request(headers: [{"signature-input", input}, {"signature", signature}])
+
+      assert {:ok, %{params: %{"foo" => 42, "created" => 1_700_000_000}}} =
+               HTTPSignature.verify(message, keys: [key])
+
+      forged = String.replace(input, "foo=42", "foo=43")
+
+      assert {:error, :invalid_signature} =
+               HTTPSignature.verify(
+                 request(headers: [{"signature-input", forged}, {"signature", signature}]),
+                 keys: [key]
+               )
+    end
+
+    test "a key without a kid is accepted for any keyid parameter, a list lookup is not" do
+      key = generated("ed25519")
+      {:ok, headers} = HTTPSignature.sign(request(), key, created: 1_700_000_000)
+      message = request(headers: request().headers ++ headers)
+      anonymous = %{key | kid: nil}
+
+      assert {:ok, %{key: %Key{kid: nil}}} = HTTPSignature.verify(message, keys: anonymous)
+      assert {:ok, _verified} = HTTPSignature.verify(message, keys: fn _keyid -> anonymous end)
+      assert {:error, :unknown_key} = HTTPSignature.verify(message, keys: [anonymous])
+    end
+
+    test "headers that are neither a list nor a map count as absent" do
+      key = generated("ed25519")
+
+      assert {:error, :missing_signature} =
+               HTTPSignature.verify(request(headers: nil), keys: [key])
+
+      assert {:error, :missing_signature} =
+               HTTPSignature.verify(request(headers: "signature: x"), keys: [key])
+
+      assert {:ok, [{"signature-input", input}, _signature]} =
+               HTTPSignature.sign(request(headers: nil), key, created: 1_700_000_000)
+
+      assert input =~ ~S|sig1=("@method" "@authority" "@path");created=1700000000;|
+    end
+  end
+
+  describe "signature_base/3 component edge cases" do
+    test "@request-target omits the query separator when the URL has no query" do
+      assert {:ok, base} =
+               HTTPSignature.signature_base(
+                 request(url: "https://example.com/a/b"),
+                 ["@request-target"],
+                 []
+               )
+
+      assert base =~ ~s|"@request-target": /a/b\n|
+
+      assert {:ok, base} =
+               HTTPSignature.signature_base(
+                 request(url: "https://example.com"),
+                 ["@request-target"],
+                 []
+               )
+
+      assert base =~ ~s|"@request-target": /\n|
+    end
+
+    test "@query-param treats a bare key as an empty value" do
+      assert {:ok, base} =
+               HTTPSignature.signature_base(
+                 request(url: "https://example.com/?flag&x=1"),
+                 [{"@query-param", name: "flag"}, {"@query-param", name: "x"}],
+                 []
+               )
+
+      assert [flag_line, x_line | _rest] = String.split(base, "\n")
+      assert flag_line == ~S|"@query-param";name="flag": |
+      assert x_line == ~S|"@query-param";name="x": 1|
+    end
+
+    test "parameters that do not belong to the component are invalid" do
+      key = generated("ed25519")
+
+      assert {:error, {:invalid_component, ~S|"@method";foo|}} =
+               HTTPSignature.sign(request(), key, components: [{"@method", foo: true}])
+
+      assert {:error, {:invalid_component, ~S|"payment-signature";name="x"|}} =
+               HTTPSignature.sign(request(), key, components: [{"payment-signature", name: "x"}])
+    end
+
+    test "duplicate components whose names cannot be serialized are reported with inspect" do
+      assert {:error, {:duplicate_component, ~S|{"héader", []}|}} =
+               HTTPSignature.signature_base(request(), ["héader", "héader"], [])
+    end
+  end
+
+  describe "normalize_components/1" do
+    test "rejects a parameter list that is not made of key/value pairs" do
+      assert {:error, {:invalid_component, "@path"}} =
+               HTTPSignature.normalize_components([{"@path", [:req]}])
+
+      assert {:error, {:invalid_component, "@path"}} =
+               HTTPSignature.normalize_components([{"@path", [{1, true}]}])
+    end
+  end
+
   describe "directory/1" do
     test "publishes public JWKs with kid, alg and use" do
       ed = generated("ed25519")

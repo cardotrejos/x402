@@ -263,6 +263,61 @@ defmodule X402.Solana.TransactionTest do
     end
   end
 
+  describe "account ordering with many accounts" do
+    # More than 32 distinct accounts: the merged account map is then
+    # hash-ordered rather than key-ordered, so the comparator sees case-fold
+    # pairs in either argument order. The result must not depend on it.
+    @case_group [
+      "9fqXgrwWsBPkaXj1GYZLxGnBKqeNZYJ1TxR8MxZ1Wyzk",
+      "9FqXgrwWsBPkaXj1GYZLxGnBKqeNZYJ1TxR8MxZ1Wyzk",
+      "9fQXgrwWsBPkaXj1GYZLxGnBKqeNZYJ1TxR8MxZ1Wyzk"
+    ]
+
+    test "sorts case-fold ties lowercase-first regardless of map ordering" do
+      generated =
+        for byte <- 1..40 do
+          {public, _private} =
+            :crypto.generate_key(:eddsa, :ed25519, :binary.copy(<<byte + 10>>, 32))
+
+          X402.Base58.encode(public)
+        end
+
+      group = @case_group ++ generated
+
+      instruction = %{
+        program: Solana.memo_program(),
+        accounts:
+          Enum.map(group, fn address ->
+            %{address: address, signer?: false, writable?: true}
+          end),
+        data: "x"
+      }
+
+      {:ok, compiled} = Transaction.compile(@fee_payer, [instruction], @blockhash)
+      {:ok, decoded} = Transaction.decode(Transaction.serialize(compiled, %{}))
+
+      decoded_accounts =
+        Enum.map(decoded.static_accounts, fn pubkey -> X402.Base58.encode(pubkey) end)
+
+      # Case-insensitive primary order; on a tie the lowercase letter sorts
+      # first, which is plain byte order once the case is swapped.
+      expected = Enum.sort_by(group, &{String.downcase(&1), swap_case(&1)})
+
+      assert decoded_accounts == [@fee_payer] ++ expected ++ [Solana.memo_program()]
+    end
+  end
+
+  defp swap_case(address) do
+    address
+    |> String.to_charlist()
+    |> Enum.map(fn
+      char when char in ?a..?z -> char - 32
+      char when char in ?A..?Z -> char + 32
+      char -> char
+    end)
+    |> List.to_string()
+  end
+
   describe "attach_signature/3" do
     test "splices the fee-payer signature preserving the other slots" do
       client_seed = :binary.copy(<<1>>, 32)

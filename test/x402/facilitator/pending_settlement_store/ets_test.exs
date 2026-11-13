@@ -97,6 +97,21 @@ defmodule X402.Facilitator.PendingSettlementStore.ETSTest do
     end
   end
 
+  describe "pid-addressed stores" do
+    test "a read of an expired entry purges it from the table" do
+      store = start_supervised!(%{ETSStore.child_spec(name: nil, ttl_ms: 0) | id: :expiring})
+      %{table: table} = :sys.get_state(store)
+
+      assert ETSStore.put(store, "key", entry()) == :ok
+      assert [{"key", _entry, _expires_at_ms}] = :ets.lookup(table, "key")
+
+      # Unnamed stores serve reads through the server, which drops the
+      # expired row as it answers.
+      assert ETSStore.get(store, "key") == :miss
+      assert :ets.lookup(table, "key") == []
+    end
+  end
+
   describe "delete/2" do
     test "removes entries and tolerates absent keys" do
       store = start_store()

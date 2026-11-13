@@ -9,6 +9,7 @@ defmodule X402.Extensions.SIWXTest do
   alias X402.Base58
   alias X402.Extensions.PaymentIdentifier.ETSCache
   alias X402.Extensions.SIWX
+  alias X402.Extensions.SIWX.Message
   alias X402.Signer.LocalKey
   alias X402.Signer.SolanaKey
 
@@ -768,6 +769,69 @@ defmodule X402.Extensions.SIWXTest do
       missing_signature = Base.encode64(Jason.encode!(%{"message" => "ok"}))
       assert legacy.decode_header(missing_signature) == {:error, :invalid_payload}
     end
+  end
+
+  describe "sign/3 with hand-built challenges" do
+    test "reads advertised chains given as keyword lists and ignores malformed entries" do
+      info = challenge()["info"]
+
+      listed = %{"info" => info, "supportedChains" => ["junk", 42, [chain_id: @evm_chain]]}
+      assert {:ok, signed} = SIWX.sign(listed, evm_signer(), chain_id: @evm_chain)
+      assert signed["chainId"] == @evm_chain
+      assert {:ok, _identity} = SIWX.verify({:spec, signed}, verify_opts())
+
+      only_junk = %{"info" => info, "supportedChains" => ["junk", 42, [other: @evm_chain]]}
+
+      assert SIWX.sign(only_junk, evm_signer(), chain_id: @evm_chain) ==
+               {:error, :unsupported_chain}
+    end
+  end
+
+  describe "verify/2 with hand-built decoded values" do
+    test "rejects spec proofs whose fields are not a map" do
+      assert SIWX.verify({:spec, "not a map"}, verify_opts()) == {:error, :invalid_payload}
+      assert SIWX.verify({:spec, nil}, verify_opts()) == {:error, :invalid_payload}
+      assert SIWX.verify({:spec, [signed_evm()]}, verify_opts()) == {:error, :invalid_payload}
+    end
+
+    test "rejects legacy proofs that lack a message or a signature" do
+      assert SIWX.verify({:legacy, %{"other" => "x"}}, verify_opts()) ==
+               {:error, :invalid_payload}
+
+      assert SIWX.verify({:legacy, %{"message" => "only a message"}}, verify_opts()) ==
+               {:error, :invalid_payload}
+
+      assert SIWX.verify({:legacy, "not a map"}, verify_opts()) == {:error, :invalid_payload}
+    end
+
+    test "accepts a signed proof that carries no expirationTime" do
+      info = Map.delete(challenge()["info"], "expirationTime")
+
+      fields =
+        Map.merge(info, %{"address" => @address, "chainId" => @evm_chain, "type" => "eip191"})
+
+      {:ok, message} = Message.build(fields)
+      {:ok, signature} = LocalKey.sign_message(evm_signer(), message)
+      proof = Map.put(fields, "signature", signature)
+
+      assert {:ok, %{address: @address, chain_id: @evm_chain, fields: verified}} =
+               SIWX.verify({:spec, proof}, verify_opts())
+
+      refute Map.has_key?(verified, "expirationTime")
+      assert verified["nonce"] == info["nonce"]
+
+      # The signature still binds the fields: adding an expiry afterwards breaks it.
+      tampered = Map.put(proof, "expirationTime", DateTime.to_iso8601(DateTime.utc_now()))
+      assert SIWX.verify({:spec, tampered}, verify_opts()) == {:error, :invalid_siwx_expired}
+
+      later = Map.put(proof, "expirationTime", info["issuedAt"] |> add_seconds(600))
+      assert SIWX.verify({:spec, later}, verify_opts()) == {:error, :invalid_siwx_signature}
+    end
+  end
+
+  defp add_seconds(iso8601, seconds) do
+    {:ok, datetime, 0} = DateTime.from_iso8601(iso8601)
+    datetime |> DateTime.add(seconds, :second) |> DateTime.to_iso8601()
   end
 
   defp evm_signer do

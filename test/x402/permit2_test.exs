@@ -325,6 +325,16 @@ defmodule X402.Permit2Test do
 
       assert Permit2.digest(domain, broken) == {:error, {:missing_field, "validAfter"}}
     end
+
+    test "reports a witness that is not a map as missing" do
+      {:ok, domain} = Permit2.domain(@exact_requirements)
+
+      for witness <- ["nope", [], 7] do
+        broken = Map.put(@exact_authorization, "witness", witness)
+
+        assert Permit2.digest(domain, broken) == {:error, {:missing_field, "witness"}}
+      end
+    end
   end
 
   describe "sign_exact/2" do

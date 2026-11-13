@@ -1132,6 +1132,144 @@ defmodule X402.MCP.ServerTest do
     end
   end
 
+  defmodule StagedVerifyErrorHooks do
+    @moduledoc false
+    # Replaces a failed verification's error with the reason the test stages
+    # in its process dictionary — hooks run in the calling (test) process.
+    @behaviour X402.Hooks
+
+    alias X402.Hooks.Context
+
+    def before_verify(%Context{} = context, _metadata), do: {:cont, context}
+    def after_verify(%Context{} = context, _metadata), do: {:cont, context}
+
+    def on_verify_failure(%Context{} = context, _metadata),
+      do: {:cont, %Context{context | error: Process.get(:staged_verify_error, context.error)}}
+
+    def before_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def after_settle(%Context{} = context, _metadata), do: {:cont, context}
+    def on_settle_failure(%Context{} = context, _metadata), do: {:cont, context}
+  end
+
+  defmodule BoundCache do
+    @moduledoc false
+    # A Cache adapter on which every payment-identifier binding already
+    # exists; reading the existing binding answers what the test stages in
+    # the process dictionary. Replay claims succeed.
+    @behaviour X402.Extensions.PaymentIdentifier.Cache
+
+    @impl true
+    def get(_cache, _key), do: Process.get(:bound_cache_get, :miss)
+
+    @impl true
+    def put(_cache, _key, _value), do: :ok
+
+    @impl true
+    def put_new(_cache, "pid:" <> _id, _value), do: {:error, :already_exists}
+    def put_new(_cache, _key, _value), do: :ok
+
+    @impl true
+    def delete(_cache, _key), do: :ok
+  end
+
+  describe "rejection reasons normalized by hooks" do
+    setup do
+      handler_id = "mcp-rejections-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:x402, :mcp, :payment_rejected],
+        fn _event, _measurements, metadata, _config -> send(parent, {:rejected, metadata}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+    end
+
+    test "structural and requirement failures answer invalid_payload" do
+      for reason <- [
+            {:invalid_format, [:payload]},
+            :invalid_payment_requirements,
+            {:invalid_exact_payment, :amount_mismatch}
+          ] do
+        facilitator = start_facilitator(verify: {:ok, %{status: 500, body: %{}}})
+        Process.put(:staged_verify_error, reason)
+
+        config = config(facilitator, hooks: StagedVerifyErrorHooks)
+        result = Server.call(request(payment()), config, refute_handler())
+
+        assert result["isError"] == true
+        assert result["structuredContent"]["error"] == "invalid_payload"
+        assert_received {:rejected, %{tool: "premium_search", reason: ^reason}}
+      end
+    end
+
+    test "a Permit2 amount that differs from the advertised amount is rejected locally" do
+      extra = %{"name" => "USDC", "version" => "2", "assetTransferMethod" => "permit2"}
+      config = config(start_facilitator(), accepts: [%{@accept | extra: extra}])
+
+      mismatched =
+        payment(%{
+          "accepted" => %{@requirements | "extra" => extra},
+          "payload" => %{
+            "signature" => "0xsignature",
+            "permit2Authorization" => %{"permitted" => %{"token" => @asset, "amount" => "9999"}}
+          }
+        })
+
+      result = Server.call(request(mismatched), config, refute_handler())
+
+      assert result["isError"] == true
+      assert result["structuredContent"]["error"] == "invalid_payload"
+      assert_received {:rejected, %{reason: {:invalid_exact_payment, :amount_mismatch}}}
+      refute_received {:verify_called, _payload, _requirements, _hooks}
+    end
+  end
+
+  describe "payment-identifier bindings that already exist" do
+    test "a binding whose entry expired in between is treated as free" do
+      config =
+        config(start_facilitator(),
+          extensions: @advertised,
+          payment_identifier_cache: {BoundCache, :backend}
+        )
+
+      Process.put(:bound_cache_get, :miss)
+
+      result = Server.call(request(spec_id_payment(@spec_id)), config, ok_handler())
+
+      assert result["_meta"]["x402/payment-response"]["success"] == true
+      assert_received {:handler_called, _request}
+    end
+
+    test "a failure while reading the existing binding fails closed as an internal error" do
+      config =
+        config(start_facilitator(),
+          extensions: @advertised,
+          payment_identifier_cache: {BoundCache, :backend}
+        )
+
+      Process.put(:bound_cache_get, {:error, :backend_unreachable})
+
+      assert Server.call(request(spec_id_payment(@spec_id)), config, refute_handler()) ==
+               @internal_error
+
+      refute_received {:verify_called, _payload, _requirements, _hooks}
+      refute_received :handler_called
+    end
+  end
+
+  describe "auth-capture accepts" do
+    test "init requires the explicit escrow payment flow" do
+      accept = %{@accept | extra: %{"paymentFlow" => "authorization"}}
+
+      assert_raise ArgumentError, ~r/auth-capture routes require explicit escrow flow/, fn ->
+        Server.init(tool: "premium_search", accepts: [Map.put(accept, :scheme, "auth-capture")])
+      end
+    end
+  end
+
   describe "telemetry" do
     test "emits payment lifecycle events" do
       handler_id = "mcp-server-test-#{System.unique_integer([:positive])}"

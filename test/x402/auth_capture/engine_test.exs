@@ -3,12 +3,30 @@ defmodule X402.AuthCapture.EngineTest do
 
   alias X402.AuthCapture
   alias X402.AuthCapture.Engine
+  alias X402.AuthCapture.ETSStore
   alias X402.AuthCapture.Journal
   alias X402.AuthCapture.Receipt
+  alias X402.RPC
   alias X402.Signer.LocalKey
   alias X402.TestAuthCapture, as: Fixture
   alias X402.TestAuthCaptureNode, as: Node
   alias X402.Verify.AuthCaptureEVM, as: Verify
+
+  defmodule FailingWriteStore do
+    @moduledoc false
+    @behaviour X402.AuthCapture.Store
+
+    @impl true
+    def fetch(%{inner: inner}, key), do: ETSStore.fetch(inner, key)
+
+    @impl true
+    def transact_many(%{inner: inner, writes: writes, fail_on: fail_on}, keys, mutation) do
+      case Agent.get_and_update(writes, &{&1 + 1, &1 + 1}) do
+        ^fail_on -> {:error, :disk_full}
+        _call -> ETSStore.transact_many(inner, keys, mutation)
+      end
+    end
+  end
 
   setup do: Node.setup(__MODULE__)
 
@@ -171,6 +189,49 @@ defmodule X402.AuthCapture.EngineTest do
     end
   end
 
+  for operation <- [:charge, :refund] do
+    @operation operation
+    test "a confirmed #{@operation} moves the escrow balances it reports", ctx do
+      operation = @operation
+      {envelope, state} = lifecycle(ctx, operation)
+      requirements = envelope["accepted"]
+
+      {:ok, proof} =
+        Verify.verify(envelope, requirements,
+          now: Fixture.fixture()["now"],
+          level: :signature,
+          refund_funding: true
+        )
+
+      {:ok, event} = Receipt.expected_event(%{proof | level: :full, payment_state: state})
+
+      Agent.update(
+        ctx.node,
+        &%{
+          &1
+          | event: event,
+            advance_state: true,
+            payment_state: <<1::256, state.capturable_amount::256, state.refundable_amount::256>>
+        }
+      )
+
+      {:ok, engine} =
+        Engine.new(
+          Keyword.put(ctx.opts, :refund_authorize, fn _proof, _envelope, _req -> :ok end)
+        )
+
+      assert {:ok, %{status: :confirmed, operation: ^operation}} =
+               Engine.execute(engine, envelope, requirements)
+
+      expected = %{
+        charge: <<1::256, 0::256, 750_000::256>>,
+        refund: <<1::256, 250_000::256, 500_000::256>>
+      }
+
+      assert Agent.get(ctx.node, & &1.payment_state) == Map.fetch!(expected, operation)
+    end
+  end
+
   test "refund funding is separate from a valid receiver consent", ctx do
     {envelope, _state} = lifecycle(ctx, :refund)
 
@@ -237,6 +298,104 @@ defmodule X402.AuthCapture.EngineTest do
     assert Engine.acknowledge(ctx.engine, result.id) == {:ok, result}
     assert Engine.execute(ctx.engine, ctx.envelope, ctx.requirements) == {:ok, result}
     refute_received {:auth_rpc, _, _}
+  end
+
+  test "a failed cancellation leaves the preparation owned and uncertain", ctx do
+    inner = start_supervised!(%{id: :flaky_ets, start: {ETSStore, :start_link, []}})
+    writes = start_supervised!({Agent, fn -> 0 end})
+
+    # fetch (1) and reserve (2) succeed; cancelling the failed build (3) does not.
+    store = {FailingWriteStore, %{inner: inner, writes: writes, fail_on: 3}}
+    {:ok, engine} = Engine.new(Keyword.put(ctx.opts, :store, store))
+    Agent.update(ctx.node, &%{&1 | gas: "0xffffff"})
+
+    assert Engine.execute(engine, ctx.envelope, ctx.requirements) ==
+             {:error, {:preparation_uncertain, :disk_full}}
+
+    assert {:ok, %{phase: :preparing, id: id}} = Journal.active(engine.journal)
+    assert Agent.get(ctx.node, & &1.sends) == 0
+
+    assert Engine.execute(engine, ctx.envelope, ctx.requirements) ==
+             {:ok,
+              %{
+                id: id,
+                status: :pending,
+                transaction: nil,
+                operation: :authorize,
+                payer: ctx.envelope["payload"]["authorization"]["from"],
+                amount: 1_000_000,
+                payment_info_hash: ctx.payment_info_hash,
+                receipt: nil
+              }}
+
+    assert Agent.get(ctx.node, & &1.sends) == 0
+  end
+
+  test "a hold must still hold the exact maximum before a handler may run", ctx do
+    {envelope, _state} = lifecycle(ctx, :void)
+    requirements = envelope["accepted"]
+    Agent.update(ctx.node, &%{&1 | payment_state: <<1::256, 1_000_000::256, 0::256>>})
+
+    assert Engine.verify_hold(ctx.engine, envelope, requirements, 1_000_000) == :ok
+
+    assert Engine.verify_hold(ctx.engine, envelope, requirements, 999_999) ==
+             {:error, :unexpected_payment_state}
+
+    assert Agent.get(ctx.node, & &1.sends) == 0
+  end
+
+  test "a capture that also voids the remainder needs separate orchestration", ctx do
+    {:ok, proof} =
+      Verify.verify(ctx.envelope, ctx.requirements,
+        now: Fixture.fixture()["now"],
+        level: :signature
+      )
+
+    {:ok, envelope} =
+      AuthCapture.capture_payload(ctx.requirements, proof.payment_info,
+        authorizer: ctx.authorizer,
+        salt_nonce: ctx.envelope["payload"]["saltNonce"],
+        amount: 750_000,
+        expected_capturable_amount: 1_000_000,
+        expected_refundable_amount: 0,
+        void_remainder: true
+      )
+
+    assert Map.has_key?(envelope["payload"], "voidAuthorizerSignature")
+    Agent.update(ctx.node, &%{&1 | payment_state: <<1::256, 1_000_000::256, 0::256>>})
+
+    # The shared node does not implement the sequential capture-then-void
+    # simulation, so this server answers it and defers everything else.
+    bypass = Bypass.open()
+
+    Bypass.stub(bypass, "POST", "/", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = Jason.decode!(body)
+
+      if request["method"] == "eth_simulateV1" do
+        [_params, parent] = request["params"]
+        ok = %{"status" => "0x1", "returnData" => "0x"}
+        result = [%{"parentHash" => parent, "calls" => [ok, ok]}]
+
+        Plug.Conn.resp(
+          conn,
+          200,
+          Jason.encode!(%{"jsonrpc" => "2.0", "id" => request["id"], "result" => result})
+        )
+      else
+        delegated = Node.handle(Plug.Test.conn(:post, "/", body), ctx.node)
+        Plug.Conn.resp(conn, delegated.status, delegated.resp_body)
+      end
+    end)
+
+    {:ok, rpc} = RPC.new(rpc_url: "http://localhost:#{bypass.port}", finch: __MODULE__)
+    {:ok, engine} = Engine.new(Keyword.put(ctx.opts, :rpc, rpc))
+
+    assert Engine.execute(engine, envelope, ctx.requirements) ==
+             {:error, :multi_leg_requires_orchestration}
+
+    assert Journal.active(engine.journal) == {:ok, nil}
+    assert Agent.get(ctx.node, & &1.sends) == 0
   end
 
   @spec drain_rpc() :: :ok

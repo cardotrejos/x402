@@ -268,6 +268,44 @@ defmodule X402.HTTPSignature.KeyTest do
     end
   end
 
+  describe "keys without identifiers and unusual PEM or scalar input" do
+    test "to_jwk omits kid when the key has none" do
+      {:ok, key} = Key.generate("ed25519")
+
+      jwk = Key.to_jwk(%{key | kid: nil})
+
+      refute Map.has_key?(jwk, "kid")
+      assert jwk == Map.delete(Key.to_jwk(key), "kid")
+      assert jwk["alg"] == "ed25519"
+      assert jwk["use"] == "sig"
+    end
+
+    test "PEM text must hold exactly one entry" do
+      pem = Vectors.public_pems()["test-key-ed25519"]
+
+      assert {:error, :invalid_key} = Key.new(alg: "ed25519", public_key: pem <> pem)
+      assert {:error, :invalid_key} = Key.new(alg: "ed25519", private_key: pem <> pem)
+      assert {:ok, %Key{alg: "ed25519"}} = Key.new(alg: "ed25519", public_key: pem)
+    end
+
+    test "short ECDSA private scalars are left-padded to 32 bytes" do
+      entry =
+        {:ECPrivateKey, 1, <<1>>, {:namedCurve, {1, 2, 840, 10_045, 3, 1, 7}}, :asn1_NOVALUE,
+         :asn1_NOVALUE}
+
+      assert {:ok, key} = Key.new(alg: "ecdsa-p256-sha256", private_key: entry)
+      assert key.private == <<0::248, 1>>
+
+      # The public key of scalar 1 is the P-256 base point.
+      assert Base.encode16(key.public, case: :lower) ==
+               "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296" <>
+                 "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+
+      assert {:ok, signature} = Key.sign(key, "data")
+      assert Key.verify(key, "data", signature)
+    end
+  end
+
   describe "from_jwk/1" do
     test "rejects malformed and unsupported JWKs" do
       assert {:error, :invalid_key} =

@@ -72,6 +72,66 @@ defmodule X402.Verify.EVMPermit2Test do
     X402.TestRPCStub.stub_rpc(bypass, finch, overrides)
   end
 
+  # A node whose settle simulation reverts with an unrecognised reason and
+  # whose diagnostic batch (recognised by its PERMIT2() probe) fails at the
+  # transport level.
+  defp stub_unexplained_revert_without_diagnosis(%{bypass: bypass, finch: finch}) do
+    test_pid = self()
+
+    Bypass.stub(bypass, "POST", "/", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      respond_without_diagnosis(conn, Jason.decode!(body), test_pid)
+    end)
+
+    {:ok, rpc} = X402.RPC.new(rpc_url: "http://localhost:#{bypass.port}", finch: finch)
+    rpc
+  end
+
+  defp respond_without_diagnosis(conn, requests, test_pid) when is_list(requests) do
+    case Enum.any?(requests, &permit2_probe?/1) do
+      true ->
+        send(test_pid, :diagnosis_requested)
+        Plug.Conn.resp(conn, 500, "boom")
+
+      false ->
+        respond_json(conn, Enum.map(requests, &node_response/1))
+    end
+  end
+
+  defp respond_without_diagnosis(conn, request, _test_pid),
+    do: respond_json(conn, node_response(request))
+
+  defp permit2_probe?(%{"method" => "eth_call", "params" => [%{"data" => data} | _rest]}),
+    do: data == "0x6afdd850"
+
+  defp permit2_probe?(_request), do: false
+
+  defp respond_json(conn, body) do
+    conn
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> Plug.Conn.resp(200, Jason.encode!(body))
+  end
+
+  defp node_response(%{"id" => id, "method" => method, "params" => params}) do
+    case node_result(method, params) do
+      {:ok, result} -> %{"jsonrpc" => "2.0", "id" => id, "result" => result}
+      {:error, error} -> %{"jsonrpc" => "2.0", "id" => id, "error" => error}
+    end
+  end
+
+  defp node_result("eth_chainId", []), do: {:ok, "0x14a34"}
+
+  defp node_result("eth_getCode", [address, _block]) do
+    deployed = [String.downcase(@asset), String.downcase(@exact_proxy)]
+    {:ok, if(String.downcase(address) in deployed, do: "0x6001", else: "0x")}
+  end
+
+  defp node_result("eth_call", [%{"data" => "0x70a08231" <> _} | _rest]),
+    do: {:ok, "0x" <> Base.encode16(<<1_000_000::256>>, case: :lower)}
+
+  defp node_result("eth_call", _params),
+    do: {:error, %{"code" => 3, "message" => "execution reverted: something odd"}}
+
   defp full(payload, requirements, rpc, opts \\ []) do
     EVM.verify(payload, requirements, [level: :full, rpc: rpc] ++ opts)
   end
@@ -238,6 +298,21 @@ defmodule X402.Verify.EVMPermit2Test do
                {:error, {:invalid, :invalid_permit2_signature}}
     end
 
+    test "rejects an exact witness whose extra facilitator cannot be hashed" do
+      requirements = exact_requirements()
+      payload = signed_payload(requirements)
+
+      unhashable =
+        put_in(
+          payload,
+          ["payload", "permit2Authorization", "witness", "facilitator"],
+          "not-an-address"
+        )
+
+      assert EVM.verify(unhashable, requirements, level: :signature) ==
+               {:error, {:invalid, :invalid_authorization}}
+    end
+
     test "cannot prove smart-wallet signatures without RPC" do
       requirements = exact_requirements()
       payload = signed_payload(requirements)
@@ -333,6 +408,17 @@ defmodule X402.Verify.EVMPermit2Test do
 
       assert full(payload, requirements, rpc) ==
                {:error, {:invalid, :permit2_proxy_not_deployed}}
+    end
+
+    test "a failing diagnosis batch reports the generic Permit2 simulation failure", context do
+      requirements = exact_requirements()
+      payload = signed_payload(requirements)
+      rpc = stub_unexplained_revert_without_diagnosis(context)
+
+      assert full(payload, requirements, rpc) ==
+               {:error, {:invalid, :permit2_simulation_failed}}
+
+      assert_received :diagnosis_requested
     end
 
     test "maps Permit2 and proxy custom errors from selectors and messages", context do

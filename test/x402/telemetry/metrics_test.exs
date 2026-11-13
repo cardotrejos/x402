@@ -128,6 +128,19 @@ if Code.ensure_loaded?(Telemetry.Metrics) do
                Metrics.tag_values(%{status: "weird", success: true})
     end
 
+    test "tag_values maps a non-boolean success flag to :none" do
+      assert %{success: :none} = Metrics.tag_values(%{success: "yes"})
+      assert %{success: :none} = Metrics.tag_values(%{success: nil})
+      assert %{success: :none} = Metrics.tag_values(%{success: 1})
+    end
+
+    test "reason_tag passes string reasons through" do
+      assert Metrics.reason_tag("insufficient_funds") == "insufficient_funds"
+
+      assert Metrics.tag_values(%{reason: "invalid_exact_evm_payload"}).reason ==
+               "invalid_exact_evm_payload"
+    end
+
     test "reason_tag handles tuples headed by non-atoms" do
       assert Metrics.reason_tag({"string", 1}) == :other
       assert Metrics.reason_tag(%URI{}) == URI

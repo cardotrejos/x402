@@ -196,4 +196,178 @@ defmodule X402.AuthCapture.EVMTest do
                {:error, {:invalid_payment_info, field}}
     end
   end
+
+  test "deployment resolution rejects a non-string escrow selector" do
+    assert EVM.resolve_deployment(%{"authCaptureEscrow" => 123}) == {:error, :invalid_escrow}
+
+    assert EVM.resolve_deployment(%{"extra" => %{"authCaptureEscrow" => ["0x1"]}}) ==
+             {:error, :invalid_escrow}
+  end
+
+  test "the PaymentInfo and salt-binding type strings pin their field lists" do
+    assert "PaymentInfo(" <> fields = EVM.payment_info_type()
+    assert String.ends_with?(fields, "uint256 salt)")
+    assert Enum.count_until(String.split(fields, ","), 13) == 12
+    assert String.starts_with?(fields, "address operator,address payer,address receiver,")
+
+    assert EVM.salt_binding_type() ==
+             "x402AuthCaptureSaltBinding(address receiverAuthorizer,address policy,uint256 saltNonce)"
+  end
+
+  test "bytes32 spelling accepts decimal strings and rejects other terms" do
+    assert EVM.bytes32_hex("255") ==
+             {:ok, "0x00000000000000000000000000000000000000000000000000000000000000ff"}
+
+    assert EVM.bytes32_hex("0xzz") == {:error, :invalid_bytes32}
+    assert EVM.bytes32_hex("-1") == {:error, :invalid_bytes32}
+
+    for invalid <- [nil, -1, 1.5, :atom, %{}, Integer.pow(2, 256)] do
+      assert EVM.bytes32_hex(invalid) == {:error, :invalid_bytes32}
+    end
+  end
+
+  test "Permit2 digests surface the first malformed field" do
+    vector = Fixture.vector("v1_1_bound_permit2")
+    {:ok, domain} = Permit2.domain(vector["requirements"])
+    authorization = vector["payload"]["permit2Authorization"]
+
+    assert {:ok, _digest} = EVM.permit_transfer_digest(domain, authorization)
+
+    for {path, value} <- [
+          {["permitted", "token"], "0x1"},
+          {["permitted", "amount"], "-1"},
+          {["spender"], "bad"},
+          {["nonce"], "x"},
+          {["deadline"], %{}}
+        ] do
+      assert {:error, reason} =
+               EVM.permit_transfer_digest(domain, put_in(authorization, path, value))
+
+      assert reason in [:invalid_address, :invalid_amount]
+    end
+  end
+
+  test "custom error table is the single source for revert classification" do
+    errors = EVM.custom_errors()
+    assert map_size(errors) == 21
+
+    for {selector, {name, reason}} <- errors do
+      assert byte_size(selector) == 4
+      data = Fixture.hex(selector <> <<0::256>>)
+
+      assert EVM.classify_revert(%{code: 3, message: "execution reverted", data: data}) == reason
+      assert EVM.classify_revert(%{code: 3, message: "reverted: #{name}(1)", data: nil}) == reason
+    end
+
+    assert EVM.custom_errors()[<<0xAD, 0x7C, 0x14, 0x5A>>] ==
+             {"PaymentAlreadyCollected", :payment_already_collected}
+  end
+
+  test "revert classification ignores unmapped selectors and malformed data or messages" do
+    for data <- ["0xdeadbeef", "0xab", "0xzz", "0x", "nope", nil, 7] do
+      assert EVM.classify_revert(%{code: 3, message: "execution reverted", data: data}) == nil
+    end
+
+    for message <- [nil, 7, %{}, ["AfterRefundExpiry"]] do
+      assert EVM.classify_revert(%{code: 3, message: message, data: nil}) == nil
+    end
+
+    assert EVM.classify_revert(%{}) == nil
+
+    assert EVM.classify_revert(%{
+             message: "reverted: AfterRefundExpiry(1, 2)",
+             data: "0xdeadbeef"
+           }) == :refund_deadline_expired
+  end
+
+  test "payment info reconstruction accepts the full envelope as well as the inner payload" do
+    vector = Fixture.vector()
+
+    assert {:ok, from_envelope} =
+             EVM.payment_info_from_payload(Fixture.envelope(vector), vector["requirements"])
+
+    assert {:ok, from_inner} =
+             EVM.payment_info_from_payload(vector["payload"], vector["requirements"])
+
+    assert from_envelope == from_inner
+    assert EVM.encode_payment_info(from_envelope) == EVM.encode_payment_info(vector["info"])
+  end
+
+  test "authorizer consent and calldata name the field that is missing" do
+    vector = Fixture.vector()
+    domain = EVM.operator_domain(8453, vector["info"]["operator"])
+    hash = vector["payment_info_hash"]
+
+    assert EVM.consent_digest(:void, %{}, domain, :v1_1) ==
+             {:error, {:missing_field, "paymentInfoHash"}}
+
+    assert EVM.consent_digest(:refund, %{"paymentInfoHash" => hash}, domain, :v1_1) ==
+             {:error, {:missing_field, "amount"}}
+
+    assert EVM.consent_digest(
+             :capture,
+             %{"paymentInfoHash" => hash, "amount" => "1"},
+             domain,
+             :v1_0
+           ) == {:error, {:missing_field, "fee"}}
+
+    assert EVM.consent_digest(
+             :charge,
+             %{
+               "paymentInfoHash" => hash,
+               "amount" => "1",
+               "tokenCollector" => EVM.deployment(:v1_1).eip3009_collector,
+               "collectorDataHash" => hash
+             },
+             domain,
+             :v1_1
+           ) == {:error, {:missing_field, "fee"}}
+
+    info = vector["info"]
+
+    assert EVM.capture_calldata(:v1_1, info, "1", nil, info["feeReceiver"]) ==
+             {:error, {:missing_field, "fee"}}
+
+    assert EVM.charge_calldata(
+             :v1_0,
+             info,
+             "1",
+             EVM.deployment(:v1_0).eip3009_collector,
+             <<>>,
+             nil,
+             info["feeReceiver"]
+           ) == {:error, {:missing_field, "fee"}}
+  end
+
+  test "a signed fee receiver never matches a missing submitted receiver" do
+    signed = "0x2222222222222222222222222222222222222222"
+
+    assert EVM.check_fee(:v1_1, 750_000, 0, nil, 0, 0, signed) == {:error, :fee_receiver}
+    assert EVM.check_fee(:v1_1, 750_000, 0, 7, 0, 0, signed) == {:error, :fee_receiver}
+    assert EVM.check_fee(:v1_1, 750_000, 0, signed, 0, 0, signed) == :ok
+
+    assert EVM.check_fee(:v1_1, 750_000, 0, String.upcase(signed), 0, 0, signed) == :ok
+  end
+
+  test "client authorization typed data matches the independent JSON for both transfer methods" do
+    for vector <- Fixture.fixture()["vectors"] do
+      requirements = vector["requirements"]
+
+      {method, authorization, domain} =
+        case vector["method"] do
+          "eip3009" ->
+            {:ok, domain} = EIP712.domain(requirements)
+            {:eip3009, vector["payload"]["authorization"], domain}
+
+          "permit2" ->
+            {:ok, domain} = Permit2.domain(requirements)
+            {:permit2, vector["payload"]["permit2Authorization"], domain}
+        end
+
+      typed_data = EVM.authorization_typed_data(method, domain, authorization)
+
+      assert Fixture.normalize_typed_data(typed_data) ==
+               Fixture.normalize_typed_data(vector["typed_data"])
+    end
+  end
 end

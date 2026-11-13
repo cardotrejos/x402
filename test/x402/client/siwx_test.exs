@@ -131,6 +131,16 @@ defmodule X402.Client.SIWXTest do
                {:error, {:siwx, :unsupported_chain}}
     end
 
+    test "reports proofs that cannot be encoded as {:siwx, reason}" do
+      # A statement that is not valid UTF-8 signs fine but cannot become JSON.
+      unencodable = put_in(challenge(), ["info", "statement"], <<255, 254>>)
+
+      assert ClientSIWX.authenticate(payment_required(unencodable), evm_signer(),
+               chain_id: @evm_chain,
+               domain: "api.example.com"
+             ) == {:error, {:siwx, :invalid_json}}
+    end
+
     test "rejects challenges without an info map" do
       payment_required = payment_required(%{"supportedChains" => []})
 
@@ -419,6 +429,17 @@ defmodule X402.Client.SIWXTest do
                resource_url: "premium"
              ) ==
                {:error, {:siwx, :domain_mismatch}}
+    end
+
+    test "a challenge uri that is not an absolute URL never matches the resource" do
+      relative = put_in(challenge(), ["info", "uri"], "/relative/path")
+
+      assert ClientSIWX.authenticate(
+               payment_required(relative),
+               evm_signer(),
+               [chain_id: @evm_chain],
+               resource_url: @resource
+             ) == {:error, {:siwx, :uri_mismatch}}
     end
 
     test "a resource URL without a default port matches the bare host only" do
