@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `X402.Facilitator.Auth.CDP` sends the SDK version in the
+  `Correlation-Context` header. It always sent `sourceVersion=unknown`,
+  because the version lookup returns a charlist and the code expected a
+  binary.
 - `X402.RateLimiter.ETS.hit/4` no longer returns `{:error, :contention}` when
   short windows expire while concurrent hits retry. A hit now judges windows
   by the time it arrived and replaces a window only if it is still closed at
