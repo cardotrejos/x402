@@ -128,7 +128,12 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
 
   @doc since: "0.1.0"
   @doc """
-  Stores a payment identifier result in the cache.
+  Stores a payment identifier result in the cache, resetting its TTL.
+
+  Updating an existing key always succeeds. When the table is at `:max_size`,
+  a new key is stored only if purging expired entries frees a slot; otherwise
+  the call returns `{:error, :cache_full}`. A live entry is never evicted,
+  because it can be another payment's replay lock.
   """
   @impl Cache
   @spec put(server(), Cache.key(), Cache.value()) :: Cache.write_result()
@@ -228,17 +233,26 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   end
 
   def handle_call({:put, payment_id, value}, _from, state) do
-    if :ets.info(state.table, :size) >= state.max_size and
-         not :ets.member(state.table, payment_id) do
-      # Evict the entry nearest to expiry (not ets.first, which is hash-order
-      # and effectively random — an attacker could flood with unique IDs to
-      # evict legitimate in-flight records and reopen replay windows).
-      evict_soonest_expiry(state.table)
+    now = now_ms()
+
+    # Same capacity rule as put_new: a live entry may be another payment's
+    # replay lock, so a new key never evicts one. Purge expired entries; if
+    # the table is still full, refuse the write.
+    if at_capacity?(state, payment_id) do
+      delete_expired_entries(state.table, now)
     end
 
-    expires_at_ms = now_ms() + state.ttl_ms
-    true = :ets.insert(state.table, {payment_id, value, expires_at_ms})
-    {:reply, :ok, state}
+    reply =
+      case at_capacity?(state, payment_id) do
+        true ->
+          {:error, :cache_full}
+
+        false ->
+          true = :ets.insert(state.table, {payment_id, value, now + state.ttl_ms})
+          :ok
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:put_new, payment_id, value}, _from, state) do
@@ -304,29 +318,6 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCache do
   defp at_capacity?(state, payment_id) do
     :ets.info(state.table, :size) >= state.max_size and
       not :ets.member(state.table, payment_id)
-  end
-
-  @spec evict_soonest_expiry(:ets.tid() | atom()) :: true
-  defp evict_soonest_expiry(table) do
-    # Find the key whose TTL expires soonest and evict it. O(n) but eviction
-    # is rare (only at max_size) and prevents cache-flooding attacks.
-    case :ets.first(table) do
-      :"$end_of_table" ->
-        true
-
-      first_key ->
-        [{_, _, first_exp}] = :ets.lookup(table, first_key)
-        {_min_exp, oldest_key} = :ets.foldl(&pick_soonest_expiry/2, {first_exp, first_key}, table)
-        :ets.delete(table, oldest_key)
-    end
-  end
-
-  @spec pick_soonest_expiry(
-          {term(), term(), non_neg_integer()},
-          {non_neg_integer(), term()}
-        ) :: {non_neg_integer(), term()}
-  defp pick_soonest_expiry({key, _val, expires}, {min_exp, min_key}) do
-    if expires < min_exp, do: {expires, key}, else: {min_exp, min_key}
   end
 
   @spec delete_expired_entries(:ets.tid() | atom(), non_neg_integer()) :: non_neg_integer()

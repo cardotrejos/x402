@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `X402.Extensions.PaymentIdentifier.ETSCache.put/3` no longer evicts an entry
+  when the table is at `:max_size`. It purges expired entries and, if the
+  table is still full, returns `{:error, :cache_full}` for a new key, as
+  `put_new/3` does. Updating an existing key is unchanged. The evicted entry
+  could be a live replay claim. The SDK itself never writes new keys with
+  `put/3`; applications that call it directly must handle the error. The
+  `X402.Extensions.PaymentIdentifier.Cache` behaviour documents the same rule
+  for custom adapters.
 - The Hex package now ships `SECURITY.md`, and HexDocs lists it as
   "Security Policy". Auth-capture functions are grouped by topic in HexDocs
   (requirements, deadlines, reason codes, lifecycle payloads, calldata, fees).
@@ -23,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `X402.Verify.EVM` no longer hex-decodes a decoded signature a second time.
+  A wire signature whose bytes spelled another signature as `0x` text passed
+  the `:signature` level, although the token contract receives the bytes
+  as sent. Such a payload is now rejected.
+- `X402.Facilitator.Engine` records a pending settlement for an EIP-3009
+  authorization passed with atom keys (`:valid_after`, `:valid_before`). The
+  pending key read `:validAfter` and `:validBefore`, found nothing, and the
+  entry was not stored, so a retry broadcast again instead of reconciling.
+  Payloads decoded from JSON were not affected.
 - `X402.Facilitator.Auth.CDP` sends the SDK version in the
   `Correlation-Context` header. It always sent `sourceVersion=unknown`,
   because the version lookup returns a charlist and the code expected a
