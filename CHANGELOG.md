@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-11-13
+
 ### Changed
 
 - `X402.Extensions.PaymentIdentifier.ETSCache.put/3` no longer evicts an entry
@@ -26,13 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mix hex.audit` and `mix deps.audit` in a separate advisory job, and runs
   Dialyzer on Elixir 1.19 / OTP 27 as well as 1.20 / OTP 29. No package
   code changes.
-
-
-### Deprecated
-
-- The legacy `paymentIdentifier` and SIWX `{message, signature}` formats, and
-  their deprecated functions, are now scheduled for removal in 0.9.5 instead
-  of 1.0.0. Deprecation warnings, docs, and guides name the new version.
 
 ### Fixed
 
