@@ -80,6 +80,61 @@ defmodule X402.Solana.RPCTest do
       assert {:error, {:invalid_response, _value}} =
                Solana.RPC.get_latest_blockhash(rpc(context))
     end
+
+    test "rejects a non-string blockhash", context do
+      wrong_type = %{"blockhash" => 12_345, "lastValidBlockHeight" => 350_000}
+      expect_rpc(context.bypass, {:result, value_envelope(wrong_type)})
+
+      assert Solana.RPC.get_latest_blockhash(rpc(context)) ==
+               {:error, {:invalid_response, wrong_type}}
+    end
+
+    test "rejects a negative last valid block height", context do
+      negative = %{"blockhash" => @blockhash, "lastValidBlockHeight" => -1}
+      expect_rpc(context.bypass, {:result, value_envelope(negative)})
+
+      assert Solana.RPC.get_latest_blockhash(rpc(context)) ==
+               {:error, {:invalid_response, negative}}
+    end
+
+    test "reads the blockhash the scripted Solana node serves", context do
+      rpc =
+        X402.TestSolanaRPCStub.stub_rpc(context.bypass, context.finch, %{
+          blockhash: @blockhash,
+          last_valid_block_height: 4_242
+        })
+
+      assert Solana.RPC.get_latest_blockhash(rpc) ==
+               {:ok, %{blockhash: @blockhash, last_valid_block_height: 4_242}}
+
+      assert_received {:solana_rpc, "getLatestBlockhash", [%{"commitment" => "confirmed"}]}
+    end
+  end
+
+  describe "batched Solana requests" do
+    test "the scripted node answers a batch in request order", context do
+      rpc =
+        X402.TestSolanaRPCStub.stub_rpc(context.bypass, context.finch, %{
+          blockhash: @blockhash,
+          last_valid_block_height: 77
+        })
+
+      assert {:ok, [{:ok, blockhash_result}, {:ok, statuses_result}]} =
+               RPC.batch(rpc, [
+                 {"getLatestBlockhash", [%{"commitment" => "confirmed"}]},
+                 {"getSignatureStatuses", [[@signature], %{"searchTransactionHistory" => true}]}
+               ])
+
+      assert blockhash_result["value"] == %{
+               "blockhash" => @blockhash,
+               "lastValidBlockHeight" => 77
+             }
+
+      assert statuses_result["value"] == [%{"confirmationStatus" => "confirmed", "err" => nil}]
+
+      assert_received {:solana_rpc, "getLatestBlockhash", _params}
+      assert_received {:solana_rpc, "getSignatureStatuses", _params}
+    end
   end
 
   describe "simulate_transaction/3" do
@@ -117,6 +172,13 @@ defmodule X402.Solana.RPCTest do
 
       assert Solana.RPC.simulate_transaction(rpc(context), Base.encode64("x")) ==
                {:ok, %{err: %{"InstructionError" => [2, "Custom"]}, logs: nil}}
+    end
+
+    test "rejects a simulation value that is not a map", context do
+      expect_rpc(context.bypass, {:result, value_envelope("simulation unavailable")})
+
+      assert Solana.RPC.simulate_transaction(rpc(context), Base.encode64("x")) ==
+               {:error, {:invalid_response, "simulation unavailable"}}
     end
 
     test "passes node-side errors through as jsonrpc errors", context do

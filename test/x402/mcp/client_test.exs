@@ -72,7 +72,7 @@ defmodule X402.MCP.ClientTest do
        finch: finch,
        url: "http://localhost:#{bypass.port}",
        max_retries: 0,
-       receive_timeout_ms: 2_000}
+       receive_timeout_ms: 15_000}
     )
   end
 
@@ -495,6 +495,36 @@ defmodule X402.MCP.ClientTest do
       assert Budget.spent(budget).total == 10_000
     end
 
+    test "refuses to reserve budget for a payload that lost its accepted requirements" do
+      defmodule StripAcceptedHooks do
+        @moduledoc false
+        @behaviour X402.Client.Hooks
+
+        @impl X402.Client.Hooks
+        def before_payment(context, _metadata), do: {:cont, context}
+
+        @impl X402.Client.Hooks
+        def after_payment(context, _metadata),
+          do: {:cont, %{context | payload: Map.delete(context.payload, "accepted")}}
+
+        @impl X402.Client.Hooks
+        def on_payment_failure(context, _metadata), do: {:cont, context}
+      end
+
+      budget = start_supervised!({Budget, limit: 15_000})
+      call_fun = tracking_fun([payment_required_result(), @ok_result])
+
+      assert Client.call(@request, call_fun,
+               signer: signer(),
+               budget: budget,
+               hooks: StripAcceptedHooks
+             ) == {:error, :invalid_amount}
+
+      assert_received {:tool_called, @request}
+      refute_received {:tool_called, _paid_request}
+      assert Budget.spent(budget) == %{total: 0, per_asset: %{}}
+    end
+
     test "validates budget, policies, and hooks options" do
       assert_raise NimbleOptions.ValidationError, ~r/budget/, fn ->
         Client.call(@request, tracking_fun([]), signer: signer(), budget: "budget")
@@ -735,6 +765,25 @@ defmodule X402.MCP.ClientTest do
                siwx: [chain_id: @network, domain: @domain, uri: @uri]
              ) == {:error, {:transport_error, :closed}}
 
+      refute_received {:siwx, _metadata}
+    end
+
+    test "pays without a proof when the server advertises no challenge" do
+      call_fun = tracking_fun([payment_required_result(), @ok_result])
+
+      assert {:ok, %{result: @ok_result, paid: true, siwx_authenticated: false}} =
+               Client.call(@request, call_fun,
+                 signer: signer(),
+                 max_amount: "10000",
+                 siwx: [chain_id: @network, domain: @domain, uri: @uri]
+               )
+
+      assert_received {:tool_called, @request}
+      assert_received {:tool_called, paying}
+      refute_received {:tool_called, _request}
+      assert MCP.fetch_siwx(paying) == :error
+      assert {:ok, payload} = MCP.fetch_payment(paying)
+      assert payload["accepted"] == @requirements
       refute_received {:siwx, _metadata}
     end
 

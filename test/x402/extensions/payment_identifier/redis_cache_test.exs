@@ -68,6 +68,26 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCacheTest do
     end
   end
 
+  describe "validate_command_module/1" do
+    test "accepts a module implementing command/2" do
+      assert RedisCache.validate_command_module(RedisCommandMock) == {:ok, RedisCommandMock}
+    end
+
+    test "rejects modules without command/2 and non-module values with a descriptive message" do
+      for value <- [NotACommandModule, nil, "redix", 42, {:mod, :fun}] do
+        assert {:error, message} = RedisCache.validate_command_module(value)
+        assert message =~ "command/2"
+        assert message =~ "got: #{inspect(value)}"
+      end
+    end
+
+    test "new/1 surfaces a non-module command as an options error" do
+      assert_raise NimbleOptions.ValidationError, ~r/got: "redix"/, fn ->
+        RedisCache.new(conn: @conn, command: "redix")
+      end
+    end
+  end
+
   describe "put_new/3 command construction and response mapping" do
     test "issues a single SET NX PX and maps OK to :ok" do
       expect(RedisCommandMock, :command, fn @conn, command ->
@@ -141,6 +161,18 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCacheTest do
       end)
 
       assert :ok = RedisCache.put(mock_cache(), "payment-1", :verified)
+    end
+
+    test "reports unexpected replies without inventing success" do
+      RedisCommandMock
+      |> expect(:command, fn @conn, ["SET", @default_key, "verified", "PX", "3600000"] ->
+        {:ok, nil}
+      end)
+      |> expect(:command, fn @conn, _command -> {:ok, 7} end)
+
+      cache = mock_cache()
+      assert {:error, {:unexpected_response, nil}} = RedisCache.put(cache, "payment-1", :verified)
+      assert {:error, {:unexpected_response, 7}} = RedisCache.put(cache, "payment-1", :verified)
     end
 
     test "passes errors through and rejects invalid input" do
@@ -252,6 +284,16 @@ defmodule X402.Extensions.PaymentIdentifier.RedisCacheTest do
       cache = mock_cache()
       assert :ok = RedisCache.delete(cache, "payment-1")
       assert :ok = RedisCache.delete(cache, "payment-1")
+    end
+
+    test "reports non-integer replies as unexpected" do
+      RedisCommandMock
+      |> expect(:command, fn @conn, ["DEL", @default_key] -> {:ok, "OK"} end)
+      |> expect(:command, fn @conn, ["DEL", @default_key] -> {:ok, nil} end)
+
+      cache = mock_cache()
+      assert {:error, {:unexpected_response, "OK"}} = RedisCache.delete(cache, "payment-1")
+      assert {:error, {:unexpected_response, nil}} = RedisCache.delete(cache, "payment-1")
     end
 
     test "passes errors through and rejects invalid identifiers" do

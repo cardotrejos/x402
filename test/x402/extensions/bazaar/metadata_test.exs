@@ -100,6 +100,21 @@ defmodule X402.Extensions.Bazaar.MetadataTest do
       assert Metadata.sanitize_resource(resource) == resource
     end
 
+    test "leaves a resource without tags unchanged, adding no tags key" do
+      resource = %{"url" => "https://api.example.com/weather", "serviceName" => "Example"}
+
+      sanitized = Metadata.sanitize_resource(resource)
+
+      assert sanitized == resource
+      refute Map.has_key?(sanitized, "tags")
+    end
+
+    test "replaces tags with their sanitized form" do
+      resource = %{"tags" => ["weather", "WEATHER", "", "forecast", 42]}
+
+      assert Metadata.sanitize_resource(resource) == %{"tags" => ["weather", "forecast"]}
+    end
+
     test "drops each invalid field independently" do
       resource = %{
         "url" => "https://api.example.com/weather",

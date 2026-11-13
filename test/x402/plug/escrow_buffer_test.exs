@@ -2,6 +2,12 @@ defmodule X402.Plug.EscrowBufferTest do
   use ExUnit.Case, async: true
   alias X402.Plug.EscrowBuffer
 
+  defmodule UnreadableBody do
+    @moduledoc false
+    @spec read_req_body(term(), keyword()) :: {:error, :timeout}
+    def read_req_body(_payload, _opts), do: {:error, :timeout}
+  end
+
   test "bounds shared iodata before flattening or any real send" do
     conn = Plug.Test.conn(:get, "/")
     shared = String.duplicate("x", 1024)
@@ -72,5 +78,62 @@ defmodule X402.Plug.EscrowBufferTest do
 
     assert_raise ArgumentError, fn -> EscrowBuffer.chunk(nil, "private") end
     assert_raise ArgumentError, fn -> EscrowBuffer.push(nil, "/private", []) end
+  end
+
+  test "body read failures reach the handler without being observed as reads" do
+    test = self()
+    conn = %{Plug.Test.conn(:post, "/", "request") | adapter: {UnreadableBody, %{}}}
+
+    response =
+      EscrowBuffer.run(
+        conn,
+        fn buffered ->
+          assert Plug.Conn.read_body(buffered) == {:error, :timeout}
+          Plug.Conn.resp(buffered, 200, "unread")
+        end,
+        fn adapter -> send(test, {:observed, adapter}) end
+      )
+
+    assert response.resp_body == "unread"
+    assert response.adapter == {UnreadableBody, %{}}
+    refute_received {:observed, _}
+  end
+
+  test "the adapter owner exits when the calling process dies mid-handler" do
+    test = self()
+
+    {caller, caller_ref} =
+      spawn_monitor(fn ->
+        EscrowBuffer.run(Plug.Test.conn(:get, "/"), fn buffered ->
+          send(test, {:owner, buffered.owner})
+
+          receive do
+            :proceed -> Process.exit(self(), :kill)
+          end
+        end)
+      end)
+
+    assert_receive {:owner, owner}, 1_000
+    owner_ref = Process.monitor(owner)
+    send(caller, :proceed)
+
+    assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}, 1_000
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}, 1_000
+  end
+
+  test "the adapter owner exits once the handler returns" do
+    test = self()
+
+    result =
+      EscrowBuffer.run(Plug.Test.conn(:get, "/"), fn buffered ->
+        send(test, {:owner, buffered.owner})
+        Plug.Conn.resp(buffered, 200, "done")
+      end)
+
+    assert result.state == :set
+    assert_receive {:owner, owner}, 1_000
+    ref = Process.monitor(owner)
+    assert_receive {:DOWN, ^ref, :process, ^owner, reason}, 1_000
+    assert reason in [:normal, :noproc]
   end
 end

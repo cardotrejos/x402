@@ -4051,6 +4051,132 @@ defmodule X402.Plug.PaymentGateTest do
     end
   end
 
+  describe "route validation messages" do
+    test "validate_route/1 rejects non-list tags and non-string paths" do
+      assert PaymentGate.validate_route(Map.put(@route, :tags, "weather")) ==
+               {:error, "invalid value for :tags option: expected a list of strings"}
+
+      assert PaymentGate.validate_route(Map.put(@route, :path, 123)) ==
+               {:error, "invalid value for :path option: expected a string"}
+    end
+
+    test "validate_route/1 reports invalid static accepts entries" do
+      assert {:error, message} =
+               PaymentGate.validate_route(Map.put(@route, :accepts, [%{price: 1}]))
+
+      assert message =~ "invalid value for :accepts option"
+      assert message =~ "invalid list element at position 0"
+      assert message =~ "digit-only atomic-unit amount"
+    end
+
+    test "auth-capture accepts require the explicit escrow payment flow" do
+      accept = %{
+        scheme: "auth-capture",
+        price: @amount,
+        network: @network,
+        asset: @asset,
+        pay_to: @receiver,
+        extra: %{}
+      }
+
+      route = %{method: :get, path: "/escrow", accepts: [accept]}
+
+      assert PaymentGate.validate_route(route) ==
+               {:error, "auth-capture routes require explicit escrow flow"}
+
+      flow = put_in(accept, [:extra], %{"paymentFlow" => "authorization"})
+
+      assert PaymentGate.validate_route(%{route | accepts: [flow]}) ==
+               {:error, "auth-capture routes require explicit escrow flow"}
+    end
+  end
+
+  describe "glob routes" do
+    test "requests outside the glob pass through without a payment challenge" do
+      route = Map.put(@route, :path, "/api/*")
+
+      conn = run_request(conn(:get, "/public/items"), routes: [route], facilitator: self())
+
+      assert conn.status == 200
+      assert conn.resp_body == "ok"
+      assert get_resp_header(conn, "payment-required") == []
+    end
+  end
+
+  describe "invalid exact payments" do
+    test "a Permit2 amount that differs from the advertised amount is a 400 invalid_payload" do
+      facilitator = start_mock_facilitator()
+      handler_id = "payment-gate-exact-#{System.unique_integer([:positive, :monotonic])}"
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:x402, :plug, :payment_rejected],
+          fn _event, _measurements, metadata, _config ->
+            send(parent, {:rejected, metadata.reason})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      header =
+        valid_exact_permit2_payment_payload()
+        |> put_in(["payload", "permit2Authorization", "permitted", "amount"], "9999")
+        |> encode_header()
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", header)
+        |> run_request(
+          routes: [@permit2_route],
+          facilitator: facilitator,
+          local_prechecks: false
+        )
+
+      assert conn.status == 400
+      assert decode_payment_required!(conn)["error"] == "invalid_payload"
+      assert_receive {:rejected, {:invalid_exact_payment, :amount_mismatch}}
+      refute_received {:verify_called, _payload, _requirements}
+    end
+  end
+
+  describe "payment-identifier binding on facilitator failure" do
+    test "releases the binding when the facilitator call exits" do
+      # A dead facilitator pid makes Facilitator.verify exit with :noproc. The
+      # binding this request created must be released before the exit
+      # propagates, or the client's id stays bound until the cache TTL expires.
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
+
+      parent = self()
+      binding_key = "pid:" <> @spec_id
+
+      expect(CacheMock, :put_new, fn :mock_ref, ^binding_key, {:bound, _fingerprint} -> :ok end)
+
+      expect(CacheMock, :delete, fn :mock_ref, ^binding_key ->
+        send(parent, {:released, binding_key})
+        :ok
+      end)
+
+      opts =
+        PaymentGate.init(
+          routes: [Map.put(@route, :extensions, @advertised)],
+          facilitator: dead,
+          payment_identifier_cache: {CacheMock, :mock_ref}
+        )
+
+      conn =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", spec_id_header(@spec_id))
+
+      assert catch_exit(PaymentGate.call(conn, opts))
+      assert_receive {:released, ^binding_key}
+    end
+  end
+
   defp run_request(conn, opts) do
     conn
     |> gate_request(opts)

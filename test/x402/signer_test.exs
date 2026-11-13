@@ -62,6 +62,25 @@ defmodule X402.SignerTest do
     end
   end
 
+  defmodule ScriptedSigner do
+    @moduledoc false
+    # Returns whatever the test scripted for the message and Ed25519
+    # callbacks, so the dispatcher's output validation can be driven with
+    # arbitrary implementation results.
+    @behaviour X402.Signer
+
+    defstruct [:message_result, :ed25519_result]
+
+    @impl true
+    def address(_signer), do: {:ok, "0x1111111111111111111111111111111111111111"}
+
+    @impl true
+    def sign_message(%{message_result: result}, _message), do: result
+
+    @impl true
+    def sign_ed25519(%{ed25519_result: result}, _message), do: result
+  end
+
   defp local_key(key \\ :crypto.strong_rand_bytes(32)) do
     {:ok, signer} = LocalKey.new(key)
     signer
@@ -158,6 +177,63 @@ defmodule X402.SignerTest do
 
     test "sign_eip712/3 rejects non-struct signers" do
       assert Signer.sign_eip712(:signer, <<0::256>>, @typed_data) == {:error, :invalid_signer}
+    end
+
+    test "sign_message/2 normalizes a 0/1 recovery byte and lowercases the hex" do
+      compact = String.duplicate("AB", 64)
+
+      for {v, expected_v} <- [{"00", "1b"}, {"01", "1c"}, {"1B", "1b"}, {"1C", "1c"}] do
+        signer = %ScriptedSigner{message_result: {:ok, "0x" <> compact <> v}}
+
+        assert Signer.sign_message(signer, "hello") ==
+                 {:ok, "0x" <> String.downcase(compact) <> expected_v}
+      end
+    end
+
+    test "sign_message/2 rejects implementation output that is not a 65-byte hex signature" do
+      valid_length_bad_v = "0x" <> String.duplicate("ab", 64) <> "05"
+      valid_length_bad_hex = "0x" <> String.duplicate("zz", 65)
+
+      bad_results = [
+        {:ok, <<1, 2, 3>>},
+        {:ok, "0x1234"},
+        {:ok, String.duplicate("ab", 65)},
+        {:ok, valid_length_bad_v},
+        {:ok, valid_length_bad_hex},
+        {:ok, nil}
+      ]
+
+      for result <- bad_results do
+        signer = %ScriptedSigner{message_result: result}
+
+        assert Signer.sign_message(signer, "hello") == {:error, :invalid_signature_format},
+               inspect(result)
+      end
+    end
+
+    test "sign_message/2 passes implementation errors through" do
+      signer = %ScriptedSigner{message_result: {:error, :hsm_unavailable}}
+
+      assert Signer.sign_message(signer, "hello") == {:error, :hsm_unavailable}
+    end
+
+    test "sign_ed25519/2 accepts only 64-byte signatures" do
+      signature = :crypto.strong_rand_bytes(64)
+
+      assert Signer.sign_ed25519(%ScriptedSigner{ed25519_result: {:ok, signature}}, "msg") ==
+               {:ok, signature}
+
+      for bad <- [:crypto.strong_rand_bytes(63), :crypto.strong_rand_bytes(65), "", nil, 42] do
+        assert Signer.sign_ed25519(%ScriptedSigner{ed25519_result: {:ok, bad}}, "msg") ==
+                 {:error, :invalid_signature_format},
+               inspect(bad)
+      end
+    end
+
+    test "sign_ed25519/2 passes implementation errors through" do
+      signer = %ScriptedSigner{ed25519_result: {:error, :hsm_unavailable}}
+
+      assert Signer.sign_ed25519(signer, "msg") == {:error, :hsm_unavailable}
     end
 
     test "passes the digest and full typed data to the implementation" do

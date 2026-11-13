@@ -21,6 +21,28 @@ defmodule X402.AuthCapture.ResourceTest do
       do: LocalKey.sign_eip712(signer.inner, digest, typed_data)
   end
 
+  defmodule HookSigner do
+    @moduledoc false
+    @behaviour X402.Signer
+    defstruct [:address, :inner, :hook]
+    @impl true
+    def address(signer), do: {:ok, signer.address}
+    @impl true
+    def sign_eip712(signer, digest, typed_data) do
+      signer.hook.()
+      LocalKey.sign_eip712(signer.inner, digest, typed_data)
+    end
+  end
+
+  defmodule UnavailableStore do
+    @moduledoc false
+    @behaviour X402.AuthCapture.Store
+    @impl true
+    def fetch(_context, _key), do: {:error, :disk_unavailable}
+    @impl true
+    def transact_many(_context, _keys, _mutation), do: {:error, :disk_unavailable}
+  end
+
   setup context do
     mode = Map.get(context, :mode, :sync)
     ctx = Node.setup(__MODULE__, mode)
@@ -318,4 +340,160 @@ defmodule X402.AuthCapture.ResourceTest do
         ctx.engine.journal.store,
         {:auth_capture_resource, ctx.engine.network, ctx.payment_info_hash}
       )
+
+  test "an authorizer without a usable address is refused", ctx do
+    zero = "0x0000000000000000000000000000000000000000"
+    signer = %WrongConsentSigner{address: zero, inner: nil}
+
+    assert Resource.new(engine: ctx.engine, authorizer: signer) == {:error, :invalid_authorizer}
+  end
+
+  test "a signer that raises during consent preparation never reaches admission", ctx do
+    hook = fn -> raise "private signer failure" end
+    signer = %HookSigner{address: ctx.authorizer.address, inner: ctx.authorizer, hook: hook}
+    {:ok, resource} = Resource.new(engine: ctx.engine, authorizer: signer)
+
+    assert Resource.run(resource, ctx.envelope, ctx.requirements, fn -> flunk("not admitted") end) ==
+             {:error, :consent_preparation_failed}
+
+    assert read_entry(ctx) == {:ok, nil}
+    assert Agent.get(ctx.node, & &1.sends) == 0
+  end
+
+  test "an unreadable store is reported instead of an unknown payment", ctx do
+    {:ok, engine} = Engine.new(Keyword.put(ctx.opts, :store, {UnavailableStore, nil}))
+    {:ok, resource} = Resource.new(engine: engine, authorizer: ctx.authorizer)
+
+    assert Resource.resume(resource, ctx.payment_info_hash) == {:error, :disk_unavailable}
+
+    assert Resource.run(resource, ctx.envelope, ctx.requirements, fn -> flunk("no store") end) ==
+             {:error, :disk_unavailable}
+
+    assert Agent.get(ctx.node, & &1.sends) == 0
+  end
+
+  test "a payment admitted while consent was being prepared is not admitted twice", ctx do
+    Agent.update(ctx.node, &%{&1 | receipt_mode: :pending})
+    test = self()
+
+    hook = fn ->
+      send(test, {:racing, Resource.run(ctx.resource, ctx.envelope, ctx.requirements, &flunk/0)})
+    end
+
+    signer = %HookSigner{address: ctx.authorizer.address, inner: ctx.authorizer, hook: hook}
+    {:ok, resource} = Resource.new(engine: ctx.engine, authorizer: signer)
+
+    assert Resource.run(resource, ctx.envelope, ctx.requirements, fn -> flunk("duplicate") end) ==
+             {:error, :payment_already_admitted}
+
+    assert_received {:racing, {:pending, hash}}
+    assert hash == ctx.payment_info_hash
+    assert {:ok, %{phase: :funding}} = read_entry(ctx)
+    assert Agent.get(ctx.node, & &1.sends) == 1
+  end
+
+  test "capacity taken while consent was being prepared aborts the later admission", ctx do
+    Agent.update(ctx.node, &%{&1 | receipt_mode: :pending})
+    {:ok, payer} = LocalKey.new(<<1::256>>)
+
+    {:ok, payload} =
+      Scheme.sign(ctx.requirements, payer,
+        now: Fixture.fixture()["now"],
+        salt_nonce: Fixture.hex(<<7::256>>)
+      )
+
+    other = %{ctx.envelope | "payload" => payload}
+    {:ok, limited} = Resource.new(engine: ctx.engine, authorizer: ctx.authorizer, max_records: 1)
+    test = self()
+
+    hook = fn ->
+      send(test, {:racing, Resource.run(limited, other, ctx.requirements, &flunk/0)})
+    end
+
+    signer = %HookSigner{address: ctx.authorizer.address, inner: ctx.authorizer, hook: hook}
+    {:ok, resource} = Resource.new(engine: ctx.engine, authorizer: signer, max_records: 1)
+
+    assert Resource.run(resource, ctx.envelope, ctx.requirements, fn -> flunk("full") end) ==
+             {:error, :resource_capacity_exhausted}
+
+    assert_received {:racing, {:pending, other_hash}}
+    assert other_hash != ctx.payment_info_hash
+    assert read_entry(ctx) == {:ok, nil}
+    assert Agent.get(ctx.node, & &1.sends) == 1
+  end
+
+  test "a reverted funding transaction never runs the handler and is acknowledged", ctx do
+    Agent.update(ctx.node, &%{&1 | receipt_mode: :reverted})
+
+    assert Resource.run(ctx.resource, ctx.envelope, ctx.requirements, fn ->
+             flunk("reverted hold")
+           end) == {:error, :funding_reverted}
+
+    assert {:ok, %{phase: :funding_failed, funding: %{status: :reverted}}} = read_entry(ctx)
+    assert Journal.active(ctx.engine.journal) == {:ok, nil}
+    assert Agent.get(ctx.node, & &1.sends) == 1
+
+    assert Resource.resume(ctx.resource, ctx.payment_info_hash, fn -> flunk("again") end) ==
+             {:error, :funding_reverted}
+
+    assert Agent.get(ctx.node, & &1.sends) == 1
+  end
+
+  test "a funding transaction that cannot be built stays recoverable", ctx do
+    Agent.update(ctx.node, &%{&1 | gas: "0xffffff"})
+
+    assert Resource.run(ctx.resource, ctx.envelope, ctx.requirements, fn ->
+             flunk("no hold yet")
+           end) == {:error, :gas_limit_exceeded}
+
+    assert {:ok, %{phase: :funding}} = read_entry(ctx)
+    assert Agent.get(ctx.node, & &1.sends) == 0
+    Agent.update(ctx.node, &%{&1 | gas: "0x10000"})
+
+    assert {:ok, "paid", %{status: :settled, charged_amount: 1_000_000}} =
+             Resource.resume(ctx.resource, ctx.payment_info_hash, fn ->
+               {:ok, "paid", 1_000_000}
+             end)
+
+    assert Agent.get(ctx.node, & &1.sends) == 2
+  end
+
+  test "a reverted settlement withholds content and stays acknowledged", ctx do
+    handler = fn ->
+      Agent.update(ctx.node, &%{&1 | receipt_mode: :reverted})
+      {:ok, "paid", 750_000}
+    end
+
+    assert Resource.run(ctx.resource, ctx.envelope, ctx.requirements, handler) ==
+             {:error, :settlement_reverted}
+
+    assert {:ok, %{phase: :settlement_failed, settlement: %{status: :reverted}}} =
+             read_entry(ctx)
+
+    assert Journal.active(ctx.engine.journal) == {:ok, nil}
+    assert Agent.get(ctx.node, & &1.sends) == 2
+
+    assert Resource.resume(ctx.resource, ctx.payment_info_hash) == {:error, :settlement_reverted}
+    assert Agent.get(ctx.node, & &1.sends) == 2
+  end
+
+  test "a settlement transaction that cannot be built is retried by recovery", ctx do
+    handler = fn ->
+      Agent.update(ctx.node, &%{&1 | gas: "0xffffff"})
+      {:ok, "paid", 750_000}
+    end
+
+    assert Resource.run(ctx.resource, ctx.envelope, ctx.requirements, handler) ==
+             {:error, :gas_limit_exceeded}
+
+    assert {:ok, %{phase: :capturing, charged: 750_000}} = read_entry(ctx)
+    assert Agent.get(ctx.node, & &1.sends) == 1
+    Agent.update(ctx.node, &%{&1 | gas: "0x10000"})
+
+    assert {:ok, "paid", %{status: :settled, charged_amount: 750_000}} =
+             Resource.resume(ctx.resource, ctx.payment_info_hash)
+
+    assert Agent.get(ctx.node, & &1.sends) == 3
+    assert Agent.get(ctx.node, & &1.payment_state) == <<1::256, 0::256, 750_000::256>>
+  end
 end

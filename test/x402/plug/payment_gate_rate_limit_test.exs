@@ -17,6 +17,10 @@ defmodule X402.Plug.PaymentGateRateLimitTest do
   @network "eip155:84532"
   @amount "10000"
 
+  # A window the tests wait out. Two consecutive requests must land inside
+  # it, so it is far longer than a loaded CI runner stalls between them.
+  @short_window_ms 500
+
   @route %{
     method: :get,
     path: "/api/resource",
@@ -223,7 +227,7 @@ defmodule X402.Plug.PaymentGateRateLimitTest do
         routes: [@route],
         facilitator: facilitator,
         payment_identifier_cache: cache,
-        rate_limit: [limit: 1, window_ms: 40, store: {RateLimiter.ETS, table}]
+        rate_limit: [limit: 1, window_ms: @short_window_ms, store: {RateLimiter.ETS, table}]
       ]
 
       other_nonce = "0x" <> String.duplicate("ef", 32)
@@ -238,7 +242,7 @@ defmodule X402.Plug.PaymentGateRateLimitTest do
       assert run_request(second_proof.(), opts).status == 429
       refute_receive {:settle_called, _payload, _requirements}
 
-      Process.sleep(50)
+      Process.sleep(@short_window_ms + 50)
 
       # A claim still held from the denied attempt would answer 402 here; the
       # released one lets the same proof through once its window rolled over.
@@ -290,7 +294,7 @@ defmodule X402.Plug.PaymentGateRateLimitTest do
       opts = [
         routes: [@route],
         facilitator: facilitator,
-        rate_limit: [limit: 1, window_ms: 40, store: {RateLimiter.ETS, table}]
+        rate_limit: [limit: 1, window_ms: @short_window_ms, store: {RateLimiter.ETS, table}]
       ]
 
       assert run_request(paid_conn(), opts).status == 200
@@ -298,7 +302,7 @@ defmodule X402.Plug.PaymentGateRateLimitTest do
       assert denied.status == 429
       assert get_resp_header(denied, "retry-after") == ["1"]
 
-      Process.sleep(50)
+      Process.sleep(@short_window_ms + 50)
       assert run_request(paid_conn(), opts).status == 200
     end
 
