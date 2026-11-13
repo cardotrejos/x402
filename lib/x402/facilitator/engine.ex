@@ -768,8 +768,8 @@ defmodule X402.Facilitator.Engine do
           Utils.map_value(authorization, {"from", :from}),
           Utils.map_value(authorization, {"to", :to}),
           Utils.map_value(authorization, {"value", :value}),
-          Utils.map_value(authorization, {"validAfter", :validAfter}),
-          Utils.map_value(authorization, {"validBefore", :validBefore}),
+          Utils.map_value(authorization, {"validAfter", :valid_after}),
+          Utils.map_value(authorization, {"validBefore", :valid_before}),
           Utils.map_value(authorization, {"nonce", :nonce}),
           asset(requirements)
         ]

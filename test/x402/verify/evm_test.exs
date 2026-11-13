@@ -621,6 +621,20 @@ defmodule X402.Verify.EVMTest do
                {:error, {:invalid, :invalid_signature}}
     end
 
+    test "judges the signature bytes on the wire, not their text spelled out" do
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      # The wire value decodes to the ASCII text "0x<valid signature hex>".
+      # The token contract receives those 132 bytes, never the 65-byte
+      # signature they spell.
+      spelled = "0x" <> Base.encode16(payload["payload"]["signature"], case: :lower)
+      spelled_payload = put_in(payload, ["payload", "signature"], spelled)
+
+      assert EVM.verify(spelled_payload, requirements, level: :signature) ==
+               {:error, {:invalid, :smart_wallet_requires_rpc}}
+    end
+
     test "rejects a payload claiming a different payer" do
       requirements = requirements()
 

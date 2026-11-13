@@ -966,8 +966,11 @@ defmodule X402.Verify.EVM do
 
   @spec parse_signature(binary()) ::
           {:ok, ERC6492.parsed()} | {:error, {:invalid, :invalid_signature}}
+  # `extract_signature/1` already decoded the wire hex. `ERC6492.parse/1`
+  # would hex-decode bytes that start with ASCII "0x" a second time, so the
+  # bytes judged here would differ from the bytes the contract receives.
   defp parse_signature(signature_bytes) do
-    case ERC6492.parse(signature_bytes) do
+    case ERC6492.parse_bytes(signature_bytes) do
       {:ok, parsed} -> {:ok, parsed}
       {:error, _reason} -> {:error, {:invalid, :invalid_signature}}
     end
