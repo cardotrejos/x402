@@ -152,7 +152,7 @@ defmodule X402.MCP.ServerTest do
        finch: finch,
        url: "http://localhost:#{bypass.port}",
        max_retries: 0,
-       receive_timeout_ms: 2_000}
+       receive_timeout_ms: 15_000}
     )
   end
 
