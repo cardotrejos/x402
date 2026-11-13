@@ -43,6 +43,20 @@ defmodule X402.MCPTest do
     end
   end
 
+  describe "fetch_siwx/1" do
+    test "reads the proof from _meta and rejects empty or missing values" do
+      assert MCP.fetch_siwx(%{"_meta" => %{"x402/sign-in-with-x" => "abc"}}) == {:ok, "abc"}
+      assert MCP.fetch_siwx(%{"_meta" => %{"x402/sign-in-with-x" => ""}}) == :error
+      assert MCP.fetch_siwx(%{"_meta" => %{"x402/sign-in-with-x" => 42}}) == :error
+      assert MCP.fetch_siwx(%{"_meta" => %{}}) == :error
+    end
+
+    test "rejects non-map requests" do
+      assert MCP.fetch_siwx(nil) == :error
+      assert MCP.fetch_siwx("request") == :error
+    end
+  end
+
   describe "put_payment/2" do
     test "preserves existing _meta entries" do
       request = %{"name" => "search", "_meta" => %{"traceId" => "abc"}}

@@ -132,6 +132,27 @@ defmodule X402.Extensions.BuilderCodeTest do
       assert enriched["extensions"]["builder-code"]["info"] == %{"a" => "app", "s" => ["mine"]}
     end
 
+    test "treats a payment_required whose extensions are not a map as not advertising" do
+      quiet = BuilderCode.enricher(service_codes: "mine", always: false)
+      payload = %{"payload" => %{}}
+
+      for extensions <- ["junk", nil, [], 7] do
+        assert quiet.(payload, %{"extensions" => extensions}) == {:ok, payload}
+      end
+
+      eager = BuilderCode.enricher(service_codes: "mine")
+
+      assert {:ok, enriched} = eager.(payload, %{"extensions" => "junk"})
+      assert enriched["extensions"]["builder-code"]["info"] == %{"s" => ["mine"]}
+    end
+
+    test "treats a non-map payment_required as not advertising" do
+      quiet = BuilderCode.enricher(service_codes: "mine", always: false)
+
+      assert quiet.(%{}, "junk") == {:ok, %{}}
+      assert quiet.(%{}, nil) == {:ok, %{}}
+    end
+
     test "validates its options" do
       assert_raise NimbleOptions.ValidationError, fn -> BuilderCode.enricher([]) end
 

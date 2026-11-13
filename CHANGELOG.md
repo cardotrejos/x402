@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (requirements, deadlines, reason codes, lifecycle payloads, calldata, fees).
 - Receipt-log and Solana seed bounds use `Enum.count_until/2` instead of
   `length/1`. No behavior change.
+- CI enforces a 99% coverage floor through `coveralls.json`, runs
+  `mix hex.audit` and `mix deps.audit` in a separate advisory job, and runs
+  Dialyzer on Elixir 1.19 / OTP 27 as well as 1.20 / OTP 29. No package
+  code changes.
 
 
 ### Deprecated
@@ -60,6 +64,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `X402.Hooks.run_protected_request/3` and `run_verified_payment_canceled/3`
   skipped the hook. Whether it happened depended on module load order.
 
+### Security
+
+- Locked dependencies move to releases that fix open advisories: cowboy 2.21.0 (CVE-2026-115701), cowlib 2.22.0
+  (CVE-2026-113431, CVE-2026-43966, CVE-2026-43969, CVE-2026-43971), mint
+  1.11.0 (CVE-2026-91043, CVE-2026-92103, CVE-2026-94194) and plug_crypto
+  2.2.1 (CVE-2026-105963). `mix hex.audit` is clean, so the
+  `ignore_advisories` list in `mix.exs` is removed. The package's dependency
+  requirements are unchanged: applications resolve their own versions and
+  should update these packages too.
+
 ### Documentation
 
 - New guides: "Build a Paid API in 5 Minutes", "x402 for AI Agents", and
@@ -72,6 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Development
 
+- Line coverage rises from 96.6% to 99.3%, and the enforced floor rises from
+  95% to 99%. The new tests cover error and recovery paths in the
+  facilitator engines, auth-capture, local verification, the payment gate,
+  MCP, HTTP message signatures and SIWX.
 - Credo now runs the [ExSlop](https://hex.pm/packages/ex_slop) checks
   (`.credo.exs`): the recommended set, plus opt-in checks the code already
   passes. CI enforces them through `mix credo --strict`.

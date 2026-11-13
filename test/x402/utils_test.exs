@@ -59,6 +59,25 @@ defmodule X402.UtilsTest do
     end
   end
 
+  describe "nested_map_value/2" do
+    test "walks string and atom keys through nested maps" do
+      map = %{"a" => %{b: %{"c" => "deep"}}}
+
+      assert Utils.nested_map_value(map, [{"a", :a}, {"b", :b}, {"c", :c}]) == "deep"
+      assert Utils.nested_map_value(map, [{"a", :a}]) == %{b: %{"c" => "deep"}}
+    end
+
+    test "returns nil when an intermediate value is not a map" do
+      assert Utils.nested_map_value(%{"a" => "scalar"}, [{"a", :a}, {"b", :b}]) == nil
+    end
+
+    test "returns nil when the root is not a map" do
+      assert Utils.nested_map_value(nil, [{"a", :a}]) == nil
+      assert Utils.nested_map_value("string", [{"a", :a}, {"b", :b}]) == nil
+      assert Utils.nested_map_value([a: 1], [{"a", :a}, {"b", :b}]) == nil
+    end
+  end
+
   describe "parse_decimal/1" do
     test "parses non-negative integer" do
       assert Utils.parse_decimal(42) == {:ok, {42, 0}}

@@ -63,6 +63,86 @@ defmodule X402.Facilitator.SVMEngineTest do
     def on_settle_failure(context, _metadata), do: {:cont, context}
   end
 
+  # Hooks whose callbacks are driven by a script in the calling process's
+  # dictionary (the engine invokes hooks inline, in the caller's process).
+  # Unscripted callbacks pass through like `X402.Hooks.Default`.
+  defmodule ScriptedHooks do
+    @behaviour X402.Hooks
+
+    @impl true
+    def before_verify(context, metadata), do: run(:before_verify, context, metadata)
+
+    @impl true
+    def after_verify(context, metadata), do: run(:after_verify, context, metadata)
+
+    @impl true
+    def on_verify_failure(context, metadata), do: run(:on_verify_failure, context, metadata)
+
+    @impl true
+    def before_settle(context, metadata), do: run(:before_settle, context, metadata)
+
+    @impl true
+    def after_settle(context, metadata), do: run(:after_settle, context, metadata)
+
+    @impl true
+    def on_settle_failure(context, metadata), do: run(:on_settle_failure, context, metadata)
+
+    @doc false
+    def script(callbacks) when is_map(callbacks), do: Process.put(__MODULE__, callbacks)
+
+    defp run(callback, context, metadata) do
+      case Map.fetch(Process.get(__MODULE__, %{}), callback) do
+        {:ok, fun} -> fun.(context, metadata)
+        :error -> {:cont, context}
+      end
+    end
+  end
+
+  # A signer whose address and signing results are scripted.
+  defmodule ScriptedSigner do
+    @behaviour X402.Signer
+
+    defstruct address: {:ok, "9hSR6S7WPtxmTojgo6GG3k4yDPecgJY292j7xrsUGWBu"},
+              signature: {:error, :hsm_unavailable}
+
+    @impl true
+    def address(%__MODULE__{address: address}), do: address
+
+    @impl true
+    def sign_ed25519(%__MODULE__{signature: signature}, _message), do: signature
+  end
+
+  # A settlement cache that can never record a claim.
+  defmodule FullCache do
+    @behaviour X402.Extensions.PaymentIdentifier.Cache
+
+    @impl true
+    def get(_cache, _key), do: :miss
+
+    @impl true
+    def put(_cache, _key, _value), do: {:error, :cache_full}
+
+    @impl true
+    def put_new(_cache, _key, _value), do: {:error, :cache_full}
+
+    @impl true
+    def delete(_cache, _key), do: :ok
+  end
+
+  # A pending store whose reads fail while writes succeed.
+  defmodule UnreadablePendingStore do
+    @behaviour X402.Facilitator.PendingSettlementStore
+
+    @impl true
+    def get(_store, _key), do: {:error, :store_down}
+
+    @impl true
+    def put(_store, _key, _entry), do: :ok
+
+    @impl true
+    def delete(_store, _key), do: :ok
+  end
+
   setup [:setup_bypass, :setup_finch]
 
   defp requirements(overrides \\ %{}) do
@@ -810,6 +890,570 @@ defmodule X402.Facilitator.SVMEngineTest do
               }} = SVMEngine.settle(engine, signed_payload(requirements), requirements)
 
       refute_received {:solana_rpc, "sendTransaction", _params}
+    end
+  end
+
+  describe "configuration validators" do
+    test "new/1 rejects a signer that is not a struct", context do
+      rpc = X402.TestSolanaRPCStub.stub_rpc(context.bypass, context.finch)
+
+      assert {:error, %NimbleOptions.ValidationError{message: message}} =
+               SVMEngine.new(rpc: rpc, signer: :not_a_struct, networks: [@network])
+
+      assert message =~ "expected a struct implementing X402.Signer with sign_ed25519/2"
+    end
+
+    test "validate_config/1 accepts only engines built by new/1", context do
+      engine = engine(context)
+
+      assert SVMEngine.validate_config(engine) == {:ok, engine}
+
+      assert {:error, message} = SVMEngine.validate_config(%{rpc: :nope})
+      assert message =~ "expected an %X402.Facilitator.SVMEngine{}"
+    end
+  end
+
+  describe "a signer that cannot report its address" do
+    setup context do
+      {:ok, engine: engine(context, signer: %ScriptedSigner{address: {:error, :no_address}})}
+    end
+
+    test "supported/1 omits the fee payer and the signers", %{engine: engine} do
+      assert SVMEngine.supported(engine) == %{
+               "kinds" => [
+                 %{"x402Version" => 2, "scheme" => "exact", "network" => @network}
+               ],
+               "extensions" => [],
+               "signers" => %{}
+             }
+    end
+
+    test "verify/3 reports a signer infrastructure error", %{engine: engine} do
+      requirements = requirements()
+
+      assert SVMEngine.verify(engine, signed_payload(requirements), requirements) ==
+               {:error, {:signer_error, :no_address}}
+
+      refute_received {:solana_rpc, "simulateTransaction", _params}
+    end
+
+    test "settle/3 reports it and releases the claim", context do
+      cache = settlement_cache()
+
+      engine =
+        engine(context,
+          settlement_cache: cache,
+          signer: %ScriptedSigner{address: {:error, :no_address}}
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert SVMEngine.settle(engine, payload, requirements) ==
+               {:error, {:signer_error, :no_address}}
+
+      assert Cache.get(cache, "svm:" <> transaction_key(payload)) == :miss
+      refute_received {:solana_rpc, "sendTransaction", _params}
+    end
+  end
+
+  describe "settle/3 signing failures" do
+    test "a signer error broadcasts nothing and releases the claim", context do
+      cache = settlement_cache()
+      engine = engine(context, settlement_cache: cache, signer: %ScriptedSigner{})
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      assert SVMEngine.settle(engine, payload, requirements) ==
+               {:error, {:settle_error, :hsm_unavailable}}
+
+      assert Cache.get(cache, "svm:" <> transaction_key(payload)) == :miss
+      refute_received {:solana_rpc, "sendTransaction", _params}
+    end
+
+    test "a malformed signature is rejected before broadcast", context do
+      engine =
+        engine(context,
+          signer: %ScriptedSigner{signature: {:ok, <<1, 2, 3>>}},
+          settlement_cache: settlement_cache()
+        )
+
+      requirements = requirements()
+
+      assert SVMEngine.settle(engine, signed_payload(requirements), requirements) ==
+               {:error, {:settle_error, :invalid_signature_format}}
+
+      refute_received {:solana_rpc, "sendTransaction", _params}
+    end
+  end
+
+  describe "payloads without a decodable payer" do
+    test "verify/3 rejects a payload with no version and omits the payer", context do
+      engine = engine(context)
+
+      assert SVMEngine.verify(engine, %{}, requirements()) ==
+               {:ok, %{"isValid" => false, "invalidReason" => "invalid_x402_version"}}
+    end
+
+    test "settle/3 rejects a payload with no version and omits the payer", context do
+      engine = engine(context)
+
+      assert SVMEngine.settle(engine, %{}, requirements()) ==
+               {:ok,
+                %{
+                  "success" => false,
+                  "errorReason" => "invalid_x402_version",
+                  "transaction" => "",
+                  "network" => @network
+                }}
+    end
+
+    test "settle/3 rejects an undecodable transaction without keying a claim", context do
+      cache = settlement_cache()
+      engine = engine(context, settlement_cache: cache, pending_settlement_store: pending_store())
+      requirements = requirements()
+
+      payload = %{
+        "x402Version" => 2,
+        "accepted" => requirements,
+        "payload" => %{"transaction" => "!!!"}
+      }
+
+      assert SVMEngine.settle(engine, payload, requirements) ==
+               {:ok,
+                %{
+                  "success" => false,
+                  "errorReason" => "invalid_exact_svm_payload_transaction_could_not_be_decoded",
+                  "transaction" => "",
+                  "network" => @network
+                }}
+
+      refute_received {:solana_rpc, _method, _params}
+    end
+  end
+
+  describe "settlement cache and pending store failures" do
+    test "a cache that cannot record the claim fails closed before any RPC", context do
+      engine = engine(context, settlement_cache: {FullCache, :unused})
+      requirements = requirements()
+
+      assert SVMEngine.settle(engine, signed_payload(requirements), requirements) ==
+               {:error, {:settlement_cache_error, :cache_full}}
+
+      refute_received {:solana_rpc, _method, _params}
+    end
+
+    test "an unreadable pending store falls through to a normal settlement", context do
+      engine =
+        engine(context,
+          settlement_cache: settlement_cache(),
+          pending_settlement_store: {UnreadablePendingStore, :unused}
+        )
+
+      requirements = requirements()
+
+      assert {:ok, %{"success" => true, "payer" => @client}} =
+               SVMEngine.settle(engine, signed_payload(requirements), requirements)
+
+      assert_received {:solana_rpc, "sendTransaction", _params}
+    end
+
+    test "settle/3 reports the signature the node acknowledged", context do
+      signature = Base58.encode(:binary.copy(<<7>>, 64))
+      engine = engine(context, stub: %{send: {:ok, signature}})
+      requirements = requirements()
+
+      assert SVMEngine.settle(engine, signed_payload(requirements), requirements) ==
+               {:ok,
+                %{
+                  "success" => true,
+                  "transaction" => signature,
+                  "network" => @network,
+                  "payer" => @client
+                }}
+
+      assert_received {:solana_rpc, "getSignatureStatuses",
+                       [[^signature], %{"searchTransactionHistory" => true}]}
+    end
+  end
+
+  describe "settle/3 reconciling a pending settlement" do
+    setup do
+      cache = settlement_cache()
+      store = pending_store()
+      requirements = requirements()
+      payload = signed_payload(requirements)
+      txkey = transaction_key(payload)
+      signature = Base58.encode(:binary.copy(<<9>>, 64))
+
+      :ok =
+        PendingSettlementStore.put(store, txkey, %{
+          transaction: signature,
+          provenance: :node_acknowledged,
+          raw_transaction: nil
+        })
+
+      {:ok,
+       cache: cache,
+       store: store,
+       requirements: requirements,
+       payload: payload,
+       txkey: txkey,
+       signature: signature}
+    end
+
+    test "an on-chain failure is terminal and releases the claim", context do
+      %{cache: cache, store: store, payload: payload, requirements: requirements} = context
+      %{txkey: txkey, signature: signature} = context
+
+      failed_status = [
+        %{"confirmationStatus" => "finalized", "err" => %{"InstructionError" => [2, 1]}}
+      ]
+
+      engine =
+        engine(context,
+          settlement_cache: cache,
+          pending_settlement_store: store,
+          stub: %{statuses: [failed_status]}
+        )
+
+      assert SVMEngine.settle(engine, payload, requirements) ==
+               {:ok,
+                %{
+                  "success" => false,
+                  "errorReason" => "invalid_exact_svm_transaction_failed",
+                  "transaction" => signature,
+                  "network" => @network,
+                  "payer" => @client
+                }}
+
+      # Nothing was re-broadcast, the entry was consumed, and the claim is
+      # released so a retry with a fresh blockhash is not duplicate-blocked.
+      refute_received {:solana_rpc, "sendTransaction", _params}
+      assert PendingSettlementStore.get(store, txkey) == :miss
+      assert Cache.get(cache, "svm:" <> txkey) == :miss
+    end
+
+    test "a still-unconfirmed broadcast stays pending and is recorded again", context do
+      %{cache: cache, store: store, payload: payload, requirements: requirements} = context
+      %{txkey: txkey, signature: signature} = context
+
+      engine =
+        engine(context,
+          settlement_cache: cache,
+          pending_settlement_store: store,
+          confirm_timeout_ms: 50,
+          confirm_interval_ms: 10,
+          stub: %{statuses: []}
+        )
+
+      assert SVMEngine.settle(engine, payload, requirements) ==
+               {:ok,
+                %{
+                  "success" => false,
+                  "errorReason" => "settlement_pending",
+                  "transaction" => signature,
+                  "network" => @network,
+                  "payer" => @client
+                }}
+
+      refute_received {:solana_rpc, "sendTransaction", _params}
+
+      assert {:hit, %{transaction: ^signature, provenance: :node_acknowledged}} =
+               PendingSettlementStore.get(store, txkey)
+
+      # The claim made on entry is kept while the broadcast may still land.
+      assert {:hit, :verified} = Cache.get(cache, "svm:" <> txkey)
+    end
+  end
+
+  describe "verify/3 hooks" do
+    setup context do
+      {:ok, engine: engine(context, hooks: ScriptedHooks)}
+    end
+
+    test "an invalid before_verify return is an infrastructure error", %{engine: engine} do
+      ScriptedHooks.script(%{before_verify: fn _context, _metadata -> :bogus end})
+      requirements = requirements()
+
+      assert SVMEngine.verify(engine, signed_payload(requirements), requirements) ==
+               {:error, {:hook_invalid_return, :before_verify, :bogus}}
+
+      refute_received {:solana_rpc, _method, _params}
+    end
+
+    test "a before_verify exception or throw is reported with its callback", %{engine: engine} do
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      ScriptedHooks.script(%{before_verify: fn _context, _metadata -> raise "boom" end})
+
+      assert {:error,
+              {:hook_callback_failed, :before_verify,
+               {:exception, %RuntimeError{message: "boom"}}}} =
+               SVMEngine.verify(engine, payload, requirements)
+
+      ScriptedHooks.script(%{before_verify: fn _context, _metadata -> throw(:stop) end})
+
+      assert SVMEngine.verify(engine, payload, requirements) ==
+               {:error, {:hook_callback_failed, :before_verify, {:throw, :stop}}}
+    end
+
+    test "halt reasons are stringified", %{engine: engine} do
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      ScriptedHooks.script(%{
+        before_verify: fn _context, _metadata -> {:halt, :policy_denied} end
+      })
+
+      assert SVMEngine.verify(engine, payload, requirements) ==
+               {:ok,
+                %{"isValid" => false, "invalidReason" => "policy_denied", "payer" => @client}}
+
+      ScriptedHooks.script(%{
+        before_verify: fn _context, _metadata -> {:halt, {:denied, 7}} end
+      })
+
+      assert SVMEngine.verify(engine, payload, requirements) ==
+               {:ok, %{"isValid" => false, "invalidReason" => "{:denied, 7}", "payer" => @client}}
+    end
+
+    test "on_verify_failure can recover a rejected payment", %{engine: engine} do
+      test_pid = self()
+      recovered = %{"isValid" => true, "payer" => "recovered-payer"}
+
+      ScriptedHooks.script(%{
+        on_verify_failure: fn context, _metadata ->
+          send(test_pid, {:failure_context, context})
+          {:recover, recovered}
+        end
+      })
+
+      requirements = requirements()
+      payload = Map.put(signed_payload(requirements), "x402Version", 1)
+
+      assert SVMEngine.verify(engine, payload, requirements) == {:ok, recovered}
+
+      assert_received {:failure_context, %{error: "invalid_x402_version", result: nil}}
+    end
+
+    test "an invalid on_verify_failure return replaces the rejection with an error",
+         %{engine: engine} do
+      requirements = requirements()
+      payload = Map.put(signed_payload(requirements), "x402Version", 1)
+
+      ScriptedHooks.script(%{on_verify_failure: fn _context, _metadata -> :bogus end})
+
+      assert SVMEngine.verify(engine, payload, requirements) ==
+               {:error, {:hook_invalid_return, :on_verify_failure, :bogus}}
+
+      # Recovery results must be maps.
+      ScriptedHooks.script(%{
+        on_verify_failure: fn _context, _metadata -> {:recover, "not a map"} end
+      })
+
+      assert SVMEngine.verify(engine, payload, requirements) ==
+               {:error, {:hook_invalid_return, :on_verify_failure, {:recover, "not a map"}}}
+    end
+
+    test "on_verify_failure can recover an infrastructure error", context do
+      test_pid = self()
+      recovered = %{"isValid" => true, "payer" => "recovered-payer"}
+
+      engine =
+        engine(context,
+          hooks: ScriptedHooks,
+          signer: %ScriptedSigner{address: {:error, :no_address}}
+        )
+
+      ScriptedHooks.script(%{
+        on_verify_failure: fn context, _metadata ->
+          send(test_pid, {:failure_context, context})
+          {:recover, recovered}
+        end
+      })
+
+      requirements = requirements()
+
+      assert SVMEngine.verify(engine, signed_payload(requirements), requirements) ==
+               {:ok, recovered}
+
+      assert_received {:failure_context, %{error: {:signer_error, :no_address}}}
+    end
+
+    test "a crashing on_verify_failure hook replaces the infrastructure error", context do
+      engine =
+        engine(context,
+          hooks: ScriptedHooks,
+          signer: %ScriptedSigner{address: {:error, :no_address}}
+        )
+
+      ScriptedHooks.script(%{on_verify_failure: fn _context, _metadata -> raise "boom" end})
+      requirements = requirements()
+
+      assert {:error,
+              {:hook_callback_failed, :on_verify_failure,
+               {:exception, %RuntimeError{message: "boom"}}}} =
+               SVMEngine.verify(engine, signed_payload(requirements), requirements)
+    end
+
+    test "after_verify leaving the result unset returns the original response",
+         %{engine: engine} do
+      ScriptedHooks.script(%{
+        after_verify: fn context, _metadata -> {:cont, %{context | result: nil}} end
+      })
+
+      requirements = requirements()
+
+      assert SVMEngine.verify(engine, signed_payload(requirements), requirements) ==
+               {:ok, %{"isValid" => true, "payer" => @client}}
+    end
+
+    test "after_verify can replace the response", %{engine: engine} do
+      replacement = %{"isValid" => true, "payer" => @client, "note" => "audited"}
+
+      ScriptedHooks.script(%{
+        after_verify: fn context, _metadata -> {:cont, %{context | result: replacement}} end
+      })
+
+      requirements = requirements()
+
+      assert SVMEngine.verify(engine, signed_payload(requirements), requirements) ==
+               {:ok, replacement}
+    end
+
+    test "an invalid or failing after_verify is an infrastructure error", %{engine: engine} do
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      ScriptedHooks.script(%{after_verify: fn _context, _metadata -> :bogus end})
+
+      assert SVMEngine.verify(engine, payload, requirements) ==
+               {:error, {:hook_invalid_return, :after_verify, :bogus}}
+
+      ScriptedHooks.script(%{after_verify: fn _context, _metadata -> throw(:late) end})
+
+      assert SVMEngine.verify(engine, payload, requirements) ==
+               {:error, {:hook_callback_failed, :after_verify, {:throw, :late}}}
+    end
+  end
+
+  describe "settle/3 hooks" do
+    setup context do
+      {:ok, engine: engine(context, hooks: ScriptedHooks)}
+    end
+
+    test "before_settle failures are infrastructure errors that broadcast nothing",
+         %{engine: engine} do
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      ScriptedHooks.script(%{before_settle: fn _context, _metadata -> raise "boom" end})
+
+      assert {:error,
+              {:hook_callback_failed, :before_settle,
+               {:exception, %RuntimeError{message: "boom"}}}} =
+               SVMEngine.settle(engine, payload, requirements)
+
+      ScriptedHooks.script(%{before_settle: fn _context, _metadata -> :bogus end})
+
+      assert SVMEngine.settle(engine, payload, requirements) ==
+               {:error, {:hook_invalid_return, :before_settle, :bogus}}
+
+      refute_received {:solana_rpc, _method, _params}
+    end
+
+    test "halt reasons are stringified into the failure response", %{engine: engine} do
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      ScriptedHooks.script(%{
+        before_settle: fn _context, _metadata -> {:halt, :policy_denied} end
+      })
+
+      assert SVMEngine.settle(engine, payload, requirements) ==
+               {:ok,
+                %{
+                  "success" => false,
+                  "errorReason" => "policy_denied",
+                  "transaction" => "",
+                  "network" => @network,
+                  "payer" => @client
+                }}
+
+      ScriptedHooks.script(%{
+        before_settle: fn _context, _metadata -> {:halt, {:denied, 7}} end
+      })
+
+      assert {:ok, %{"errorReason" => "{:denied, 7}"}} =
+               SVMEngine.settle(engine, payload, requirements)
+    end
+
+    test "on_settle_failure can recover a failed settlement", %{engine: engine} do
+      test_pid = self()
+      recovered = %{"success" => true, "transaction" => "recovered-signature"}
+
+      ScriptedHooks.script(%{
+        on_settle_failure: fn context, _metadata ->
+          send(test_pid, {:failure_context, context})
+          {:recover, recovered}
+        end
+      })
+
+      requirements = requirements()
+      payload = Map.put(signed_payload(requirements), "x402Version", 1)
+
+      assert SVMEngine.settle(engine, payload, requirements) == {:ok, recovered}
+
+      assert_received {:failure_context, %{error: "invalid_x402_version", result: nil}}
+    end
+
+    test "an invalid on_settle_failure return replaces the failure with an error",
+         %{engine: engine} do
+      ScriptedHooks.script(%{on_settle_failure: fn _context, _metadata -> :bogus end})
+      requirements = requirements()
+      payload = Map.put(signed_payload(requirements), "x402Version", 1)
+
+      assert SVMEngine.settle(engine, payload, requirements) ==
+               {:error, {:hook_invalid_return, :on_settle_failure, :bogus}}
+    end
+
+    test "on_settle_failure can recover an infrastructure error", context do
+      test_pid = self()
+      recovered = %{"success" => true, "transaction" => "recovered-signature"}
+
+      engine =
+        engine(context,
+          hooks: ScriptedHooks,
+          signer: %ScriptedSigner{address: {:error, :no_address}}
+        )
+
+      ScriptedHooks.script(%{
+        on_settle_failure: fn context, _metadata ->
+          send(test_pid, {:failure_context, context})
+          {:recover, recovered}
+        end
+      })
+
+      requirements = requirements()
+
+      assert SVMEngine.settle(engine, signed_payload(requirements), requirements) ==
+               {:ok, recovered}
+
+      assert_received {:failure_context, %{error: {:signer_error, :no_address}}}
+    end
+
+    test "after_settle leaving the result unset returns the original response",
+         %{engine: engine} do
+      ScriptedHooks.script(%{
+        after_settle: fn context, _metadata -> {:cont, %{context | result: nil}} end
+      })
+
+      requirements = requirements()
+
+      assert {:ok, %{"success" => true, "payer" => @client, "network" => @network}} =
+               SVMEngine.settle(engine, signed_payload(requirements), requirements)
     end
   end
 end

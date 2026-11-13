@@ -418,6 +418,102 @@ defmodule X402.AuthCapture.TransportTest do
     assert {:ok, %{"error" => "payment_identifier_conflict"}} = MCP.fetch_payment_required(result)
   end
 
+  test "resource validation accepts an escrow resource or nil and nothing else", ctx do
+    assert Transport.validate_resource(nil) == {:ok, nil}
+    assert Transport.validate_resource(ctx.resource) == {:ok, ctx.resource}
+
+    for invalid <- [%{}, ctx.engine, :resource, "resource"] do
+      assert Transport.validate_resource(invalid) == {:error, "expected an auth-capture resource"}
+    end
+  end
+
+  test "verification without a resource is refused before any RPC", ctx do
+    assert Transport.verify(nil, ctx.envelope, ctx.requirements) ==
+             {:error, :auth_capture_resource_required}
+
+    refute_received {:auth_rpc, _, _}
+  end
+
+  test "verification reports the payer for a valid authorization", ctx do
+    assert Transport.verify(ctx.resource, ctx.envelope, ctx.requirements) ==
+             {:ok,
+              %{
+                status: 200,
+                body: %{
+                  "isValid" => true,
+                  "payer" => ctx.envelope["payload"]["authorization"]["from"]
+                }
+              }}
+
+    assert Agent.get(ctx.node, & &1.sends) == 0
+  end
+
+  test "replay identity is absent for malformed nonces", ctx do
+    payload = ctx.envelope["payload"]
+    assert {:ok, _key} = Transport.replay_key(payload, ctx.requirements)
+
+    for nonce <- [nil, 7, "0x1234", "1234", "0x" <> String.duplicate("zz", 32), %{}] do
+      assert Transport.replay_key(
+               put_in(payload, ["authorization", "nonce"], nonce),
+               ctx.requirements
+             ) ==
+               :error
+    end
+
+    permit =
+      Enum.find(
+        Fixture.fixture()["vectors"],
+        &(&1["requirements"]["extra"]["assetTransferMethod"] == "permit2")
+      )
+
+    assert {:ok, _key} = Transport.replay_key(permit["payload"], permit["requirements"])
+
+    for nonce <- [nil, "abc", "-1", "1.5", -1, String.duplicate("9", 79)] do
+      assert Transport.replay_key(
+               put_in(permit["payload"], ["permit2Authorization", "nonce"], nonce),
+               permit["requirements"]
+             ) == :error
+    end
+  end
+
+  test "an oversized encoded response is withheld and the hold is voided", ctx do
+    config =
+      gate(ctx, fn conn ->
+        {:ok, conn} = PaymentGate.put_settlement_amount(conn, 750_000)
+        resp(conn, 200, String.duplicate("x", 900_000))
+      end)
+
+    result = PaymentGate.call(paid_conn(ctx.envelope), config)
+    assert {500, _, "{}"} = Plug.Test.sent_resp(result)
+    assert get_resp_header(result, "payment-response") == []
+    assert Agent.get(ctx.node, & &1.sends) == 2
+    assert Agent.get(ctx.node, & &1.payment_state) == <<1::256, 0::256, 0::256>>
+    assert Resource.resume(ctx.resource, ctx.payment_info_hash) == {:error, :handler_failed}
+  end
+
+  test "malformed auth-capture options are rejected when the gate is built", ctx do
+    routes = [%{method: :get, path: "/paid", accepts: [accept(ctx)]}]
+    handler = fn conn -> conn end
+
+    assert_raise NimbleOptions.ValidationError, ~r/expected an auth-capture resource/, fn ->
+      PaymentGate.init(routes: routes, auth_capture: [resource: nil, handler: handler])
+    end
+
+    assert_raise NimbleOptions.ValidationError, ~r/required :resource option not found/, fn ->
+      PaymentGate.init(routes: routes, auth_capture: [handler: handler])
+    end
+
+    assert_raise NimbleOptions.ValidationError, ~r/expected resource and handler options/, fn ->
+      PaymentGate.init(routes: routes, auth_capture: :resource)
+    end
+
+    assert PaymentGate.init(
+             routes: routes,
+             auth_capture: nil,
+             payment_identifier_cache: ctx.cache
+           ).auth_capture == nil
+  end
+
   @spec accept(map()) :: map()
   defp accept(ctx) do
     req = ctx.requirements

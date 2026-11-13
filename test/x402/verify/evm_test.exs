@@ -696,6 +696,50 @@ defmodule X402.Verify.EVMTest do
     end
   end
 
+  describe "level :signature — optional crypto dependencies" do
+    test "a missing keccak implementation is an error, never a pass" do
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      with_unavailable_module(ExKeccak, fn ->
+        assert EVM.verify(payload, requirements, level: :signature) ==
+                 {:error, :missing_dependency}
+      end)
+
+      assert {:ok, %{level: :signature}} = EVM.verify(payload, requirements, level: :signature)
+    end
+
+    test "a missing secp256k1 implementation is an error, never a pass" do
+      requirements = requirements()
+      payload = signed_payload(requirements)
+
+      with_unavailable_module(ExSecp256k1, fn ->
+        assert EVM.verify(payload, requirements, level: :signature) ==
+                 {:error, :missing_dependency}
+      end)
+
+      assert {:ok, %{level: :signature}} = EVM.verify(payload, requirements, level: :signature)
+    end
+  end
+
+  # Replaces an optional dependency with an empty module for the duration of
+  # `fun`, then restores the original. Safe because this file is not async.
+  defp with_unavailable_module(module, fun) when is_atom(module) and is_function(fun, 0) do
+    {^module, original_binary, original_path} = :code.get_object_code(module)
+    original_conflict_setting = Code.get_compiler_option(:ignore_module_conflict)
+
+    Code.put_compiler_option(:ignore_module_conflict, true)
+
+    try do
+      Code.compile_string("defmodule #{inspect(module)} do\nend")
+      fun.()
+    after
+      :code.purge(module)
+      {:module, ^module} = :code.load_binary(module, original_path, original_binary)
+      Code.put_compiler_option(:ignore_module_conflict, original_conflict_setting)
+    end
+  end
+
   describe "level :full" do
     setup [:setup_bypass, :setup_finch]
 

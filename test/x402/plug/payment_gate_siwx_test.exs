@@ -652,6 +652,29 @@ defmodule X402.Plug.PaymentGateSIWXTest do
     end
   end
 
+  describe "payer recording on custom networks" do
+    test "records nothing for a non-EVM network whose settle response names no payer", %{
+      siwx: siwx,
+      storage: storage
+    } do
+      {:ok, %{body: body}} = @default_settle
+      settle = {:ok, %{status: 200, body: Map.delete(body, "payer")}}
+      facilitator = start_mock_facilitator(settle: settle)
+      route = Map.put(@route, :network, "othernet:1")
+      payload = put_in(valid_payment_payload(), ["accepted", "network"], "othernet:1")
+
+      paid =
+        conn(:get, "/api/resource")
+        |> put_req_header("payment-signature", encode_header(payload))
+        |> run_request(gate_opts(routes: [route], siwx: siwx, facilitator: facilitator))
+
+      assert paid.status == 200
+      assert_receive {:settle_called, _payload, %{"network" => "othernet:1"}}
+      assert ETSStorage.get(storage, @receiver, @access_resource) == {:error, :not_found}
+      assert ETSStorage.get(storage, @address, @access_resource) == {:error, :not_found}
+    end
+  end
+
   defp gate_opts(overrides \\ []) do
     Keyword.merge([routes: [@route], facilitator: self()], overrides)
   end

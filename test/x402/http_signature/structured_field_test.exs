@@ -27,6 +27,17 @@ defmodule X402.HTTPSignature.StructuredFieldTest do
       assert parsed == List.keyreplace(members, "dec", 0, {"dec", {3.142, []}})
     end
 
+    test "booleans serialize as ?1 and ?0 and parse back" do
+      assert {:ok, "?1"} = SF.serialize_bare(true)
+      assert {:ok, "?0"} = SF.serialize_bare(false)
+
+      assert {:ok, ~S|a;on;off=?0|} =
+               SF.serialize_dictionary([{"a", {true, [{"on", true}, {"off", false}]}}])
+
+      assert {:ok, [{"a", {true, [{"on", true}, {"off", false}]}}]} =
+               SF.parse_dictionary(~S|a;on;off=?0|)
+    end
+
     test "decimals are rounded to three places and keep at least one" do
       assert {:ok, "1.0"} = SF.serialize_bare(1.0)
       assert {:ok, "-0.5"} = SF.serialize_bare(-0.5)
