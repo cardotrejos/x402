@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (requirements, deadlines, reason codes, lifecycle payloads, calldata, fees).
 - Receipt-log and Solana seed bounds use `Enum.count_until/2` instead of
   `length/1`. No behavior change.
+- CI enforces the 95% coverage floor through `coveralls.json`, runs
+  `mix hex.audit` and `mix deps.audit` in a separate advisory job, and runs
+  Dialyzer on Elixir 1.19 / OTP 27 as well as 1.20 / OTP 29. No package
+  code changes.
 
 
 ### Deprecated
@@ -42,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `after_verify_all/4` and `after_settle_all/4` skipped its notifications, and
   `X402.Hooks.run_protected_request/3` and `run_verified_payment_canceled/3`
   skipped the hook. Whether it happened depended on module load order.
+
+### Security
+
+- Locked dependencies move to releases that fix open advisories: cowboy 2.21.0 (CVE-2026-115701), cowlib 2.22.0
+  (CVE-2026-113431, CVE-2026-43966, CVE-2026-43969, CVE-2026-43971), mint
+  1.11.0 (CVE-2026-91043, CVE-2026-92103, CVE-2026-94194) and plug_crypto
+  2.2.1 (CVE-2026-105963). `mix hex.audit` is clean, so the
+  `ignore_advisories` list in `mix.exs` is removed. The package's dependency
+  requirements are unchanged: applications resolve their own versions and
+  should update these packages too.
 
 ### Documentation
 
