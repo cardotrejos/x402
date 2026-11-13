@@ -130,7 +130,11 @@ defmodule X402.Extensions.PaymentIdentifier.Cache do
   @callback get(cache :: term(), key()) :: get_result()
 
   @doc """
-  Unconditionally stores `value` for `key`, resetting its TTL.
+  Stores `value` for `key`, resetting its TTL.
+
+  An adapter with a size bound must **never evict a live entry to admit a new
+  key**: a live entry can be another payment's replay lock. Refuse the write
+  with `{:error, :cache_full}` instead.
   """
   @callback put(cache :: term(), key(), value()) :: write_result()
 

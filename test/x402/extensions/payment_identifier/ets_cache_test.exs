@@ -230,7 +230,7 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
   end
 
   describe "max_size and capacity" do
-    test "enforces max_size limit" do
+    test "put/3 refuses a new key at max_size instead of evicting a live entry" do
       max_size = 10
       cache = start_cache(max_size: max_size, cleanup_interval_ms: 60_000)
 
@@ -238,12 +238,34 @@ defmodule X402.Extensions.PaymentIdentifier.ETSCacheTest do
         assert :ok = ETSCache.put(cache, "payment-#{i}", :verified)
       end
 
+      # A live entry can be another payment's replay lock, so put/3 follows
+      # the same rule as put_new/3.
+      assert {:error, :cache_full} = ETSCache.put(cache, "payment-#{max_size + 1}", :verified)
+
       %{table: table} = :sys.get_state(cache)
       assert :ets.info(table, :size) == max_size
+      assert :miss = ETSCache.get(cache, "payment-#{max_size + 1}")
 
+      for i <- 1..max_size do
+        assert {:hit, :verified} = ETSCache.get(cache, "payment-#{i}")
+      end
+
+      assert :ok = ETSCache.delete(cache, "payment-1")
       assert :ok = ETSCache.put(cache, "payment-#{max_size + 1}", :verified)
+    end
 
-      assert :ets.info(table, :size) == max_size
+    test "put/3 at max_size purges expired entries before refusing" do
+      # ttl_ms: 0 makes every entry expire as soon as it is written.
+      cache = start_cache(max_size: 3, ttl_ms: 0, cleanup_interval_ms: 60_000)
+
+      for i <- 1..3 do
+        assert :ok = ETSCache.put(cache, "payment-#{i}", :verified)
+      end
+
+      assert :ok = ETSCache.put(cache, "payment-4", :verified)
+
+      %{table: table} = :sys.get_state(cache)
+      assert :ets.info(table, :size) == 1
     end
 
     test "updating existing key does not evict another key when at max_size" do
