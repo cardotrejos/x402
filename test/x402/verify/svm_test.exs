@@ -105,6 +105,16 @@ defmodule X402.Verify.SVMTest do
                {:error, {:invalid, :missing_fee_payer}}
     end
 
+    test "treats non-map extra as a missing fee payer" do
+      {payload, reqs} = signed_payload()
+
+      for extra <- [nil, "not-a-map", [feePayer: @fee_payer]] do
+        assert SVM.verify(payload, Map.put(reqs, "extra", extra), structural_opts()) ==
+                 {:error, {:invalid, :missing_fee_payer}},
+               "extra #{inspect(extra)} must not yield a fee payer"
+      end
+    end
+
     test "rejects a fee payer this facilitator does not manage" do
       {payload, reqs} = signed_payload()
 
@@ -222,6 +232,47 @@ defmodule X402.Verify.SVMTest do
 
       assert SVM.verify(payload, Map.put(reqs, "payTo", "bogus"), structural_opts()) ==
                {:error, {:invalid, :invalid_requirements_pay_to}}
+    end
+
+    test "accepts and enforces integer amounts within the u64 range" do
+      {payload, reqs} = signed_payload()
+
+      assert SVM.verify(payload, Map.put(reqs, "amount", 1000), structural_opts()) ==
+               {:ok, %{payer: @client, level: :structural}}
+
+      assert SVM.verify(payload, Map.put(reqs, "amount", 2000), structural_opts()) ==
+               {:error, {:invalid, :amount_mismatch}}
+
+      for amount <- [-1, 0xFFFFFFFFFFFFFFFF + 1] do
+        assert SVM.verify(payload, Map.put(reqs, "amount", amount), structural_opts()) ==
+                 {:error, {:invalid, :invalid_requirements_amount}},
+               "amount #{amount} must fail closed"
+      end
+    end
+
+    test "collapses an out-of-range instruction index to the generic failure" do
+      {payload, reqs} = signed_payload()
+
+      {:ok, decoded} =
+        payload["payload"]["transaction"] |> Base.decode64!() |> Transaction.decode()
+
+      # Point the TransferChecked destination at account 200 (the message
+      # has only a handful) and RE-SIGN, so the signature check passes and
+      # the static layout check is the one that rejects it.
+      transfer = Enum.at(decoded.instructions, 2)
+      [source, mint, destination, authority] = transfer.account_indices
+      original = <<transfer.program_index, 4, source, mint, destination, authority>>
+      patched = <<transfer.program_index, 4, source, mint, 200, authority>>
+
+      assert :binary.match(decoded.message_bytes, original) != :nomatch
+      message = :binary.replace(decoded.message_bytes, original, patched)
+      client_signature = :crypto.sign(:eddsa, :none, message, [@client_seed, :ed25519])
+      wire = <<2>> <> <<0::512>> <> client_signature <> message
+
+      broken = put_in(payload["payload"], %{"transaction" => Base.encode64(wire)})
+
+      assert SVM.verify(broken, reqs, structural_opts()) ==
+               {:error, {:invalid, :verification_failed}}
     end
 
     test "raises on missing required options" do

@@ -180,10 +180,90 @@ defmodule X402.Extensions.EIP2612GasSponsoringTest do
                {:error, :invalid_signer}
     end
 
+    test "needs a positive maxTimeoutSeconds when no deadline is given" do
+      signer = signer()
+
+      for requirements <- [
+            Map.delete(@requirements, "maxTimeoutSeconds"),
+            Map.put(@requirements, "maxTimeoutSeconds", 0),
+            Map.put(@requirements, "maxTimeoutSeconds", "60")
+          ] do
+        assert EIP2612GasSponsoring.sign_permit(requirements, signer, nonce: "0") ==
+                 {:error, :invalid_requirements}
+      end
+
+      assert {:ok, %{"deadline" => "1740672154"}} =
+               EIP2612GasSponsoring.sign_permit(
+                 Map.delete(@requirements, "maxTimeoutSeconds"),
+                 signer,
+                 nonce: "0",
+                 deadline: "1740672154"
+               )
+    end
+
+    test "needs a requirements amount when no amount override is given" do
+      signer = signer()
+
+      assert EIP2612GasSponsoring.sign_permit(Map.delete(@requirements, "amount"), signer,
+               nonce: "0"
+             ) == {:error, :invalid_requirements}
+
+      assert {:ok, %{"amount" => "42"}} =
+               EIP2612GasSponsoring.sign_permit(Map.delete(@requirements, "amount"), signer,
+                 nonce: "0",
+                 amount: 42
+               )
+    end
+
+    test "rejects a requirements amount that is not a non-negative integer or decimal string" do
+      signer = signer()
+
+      for amount <- [-5, 1.5, :ten, ["10"], %{"v" => 10}] do
+        assert EIP2612GasSponsoring.sign_permit(Map.put(@requirements, "amount", amount), signer,
+                 nonce: "0"
+               ) == {:error, :invalid_amount},
+               inspect(amount)
+      end
+    end
+
     test "requires the nonce option" do
       assert_raise NimbleOptions.ValidationError, fn ->
         EIP2612GasSponsoring.sign_permit(@requirements, signer(), [])
       end
+    end
+  end
+
+  describe "permit_digest/2" do
+    @permit %{
+      "owner" => "0x857b06519E91e3A54538791bDbb0E22373e36b66",
+      "spender" => @permit2,
+      "value" => "10000",
+      "nonce" => "0",
+      "deadline" => "1740672154"
+    }
+
+    test "reports the first missing permit field by its wire name" do
+      {:ok, domain} = EIP712.domain(@requirements)
+
+      for field <- ~w(owner spender value nonce deadline) do
+        assert EIP2612GasSponsoring.permit_digest(domain, Map.delete(@permit, field)) ==
+                 {:error, {:missing_field, field}}
+      end
+    end
+
+    test "accepts snake-case atom keys" do
+      {:ok, domain} = EIP712.domain(@requirements)
+
+      atom_permit = %{
+        owner: @permit["owner"],
+        spender: @permit["spender"],
+        value: @permit["value"],
+        nonce: @permit["nonce"],
+        deadline: @permit["deadline"]
+      }
+
+      assert {:ok, digest} = EIP2612GasSponsoring.permit_digest(domain, @permit)
+      assert EIP2612GasSponsoring.permit_digest(domain, atom_permit) == {:ok, digest}
     end
   end
 

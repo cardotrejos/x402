@@ -65,6 +65,23 @@ defmodule X402.Plug.FacilitatorTest do
     end
   end
 
+  defmodule ConfigurableEngine do
+    @moduledoc false
+
+    # Canned engine whose supported/1 answer and verify/settle verdicts are
+    # chosen by the test, for the dispatch and merge paths that depend on
+    # engines answering with unusual shapes.
+    defstruct supported: %{}, verdict: :default
+
+    def verify(%__MODULE__{verdict: verdict}, _payload, _requirements),
+      do: {:ok, %{"isValid" => true, "verdict" => to_string(verdict)}}
+
+    def settle(%__MODULE__{verdict: verdict}, _payload, _requirements),
+      do: {:ok, %{"success" => true, "verdict" => to_string(verdict)}}
+
+    def supported(%__MODULE__{supported: supported}), do: supported
+  end
+
   defp requirements(overrides \\ %{}) do
     Map.merge(
       %{
@@ -120,6 +137,14 @@ defmodule X402.Plug.FacilitatorTest do
     :post
     |> conn(path, body)
     |> put_req_header("content-type", "application/json")
+    |> FacilitatorPlug.call(options)
+  end
+
+  defp authorized_post(options, path, body) do
+    :post
+    |> conn(path, body)
+    |> put_req_header("content-type", "application/json")
+    |> put_req_header("authorization", "Bearer secret")
     |> FacilitatorPlug.call(options)
   end
 
@@ -645,6 +670,98 @@ defmodule X402.Plug.FacilitatorTest do
                "errorReason" => "invalid_network",
                "transaction" => "",
                "network" => "eip155:1"
+             }
+    end
+
+    test "an engine whose supported kinds are unreadable is skipped when dispatching" do
+      kind = %{"x402Version" => 2, "scheme" => "exact", "network" => @network}
+
+      broken = %ConfigurableEngine{supported: %{"kinds" => "nope"}, verdict: :broken}
+      working = %ConfigurableEngine{supported: %{"kinds" => [kind]}, verdict: :working}
+
+      options = FacilitatorPlug.init(engines: [broken, working], auth_token: "secret")
+      requirements = requirements()
+      body = wire_body(signed_payload(requirements), requirements)
+
+      for {path, success_key} <- [{"/verify", "isValid"}, {"/settle", "success"}] do
+        conn = authorized_post(options, path, body)
+
+        assert conn.status == 200
+        assert %{^success_key => true, "verdict" => "working"} = json_response(conn)
+      end
+
+      only_broken = FacilitatorPlug.init(engines: [broken], auth_token: "secret")
+      conn = authorized_post(only_broken, "/verify", body)
+
+      assert conn.status == 200
+
+      assert json_response(conn) == %{
+               "isValid" => false,
+               "invalidReason" => "unsupported_scheme"
+             }
+    end
+
+    test "settle rejections report an empty network when the requirements name none" do
+      engine = %SidechannelEngine{verify_result: {:ok, %{}}, settle_result: {:ok, %{}}}
+      options = FacilitatorPlug.init(engines: [engine], auth_token: "secret")
+
+      for {sent_requirements, reason} <- [
+            {%{}, "unsupported_scheme"},
+            {%{"scheme" => "other", "network" => 42}, "unsupported_scheme"},
+            {%{"scheme" => "exact", "network" => 42}, "invalid_network"}
+          ] do
+        body = wire_body(signed_payload(requirements()), sent_requirements)
+        conn = authorized_post(options, "/settle", body)
+
+        assert conn.status == 200
+
+        assert json_response(conn) == %{
+                 "success" => false,
+                 "errorReason" => reason,
+                 "transaction" => "",
+                 "network" => ""
+               }
+      end
+    end
+
+    test "GET /supported unions signer families and ignores unreadable signer maps" do
+      shared = %ConfigurableEngine{
+        supported: %{
+          "kinds" => [%{"scheme" => "exact", "network" => "eip155:1"}],
+          "extensions" => ["bazaar"],
+          "signers" => %{"eip155:*" => ["0xaaa"]}
+        }
+      }
+
+      overlapping = %ConfigurableEngine{
+        supported: %{
+          "kinds" => [%{"scheme" => "exact", "network" => "eip155:1"}],
+          "extensions" => ["bazaar", "siwx"],
+          "signers" => %{"eip155:*" => ["0xaaa", "0xbbb"], "solana:*" => "SolSigner"}
+        }
+      }
+
+      unreadable = %ConfigurableEngine{supported: %{"signers" => "not-a-map"}}
+      silent = %ConfigurableEngine{supported: %{}}
+
+      options =
+        FacilitatorPlug.init(
+          engines: [shared, overlapping, unreadable, silent],
+          auth_token: "secret"
+        )
+
+      conn =
+        :get
+        |> conn("/supported")
+        |> put_req_header("authorization", "Bearer secret")
+        |> FacilitatorPlug.call(options)
+
+      assert conn.status == 200
+
+      assert json_response(conn) == %{
+               "kinds" => [%{"scheme" => "exact", "network" => "eip155:1"}],
+               "extensions" => ["bazaar", "siwx"],
+               "signers" => %{"eip155:*" => ["0xaaa", "0xbbb"], "solana:*" => ["SolSigner"]}
              }
     end
 

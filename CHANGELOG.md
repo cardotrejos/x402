@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (requirements, deadlines, reason codes, lifecycle payloads, calldata, fees).
 - Receipt-log and Solana seed bounds use `Enum.count_until/2` instead of
   `length/1`. No behavior change.
-- CI enforces the 95% coverage floor through `coveralls.json`, runs
+- CI enforces a 99% coverage floor through `coveralls.json`, runs
   `mix hex.audit` and `mix deps.audit` in a separate advisory job, and runs
   Dialyzer on Elixir 1.19 / OTP 27 as well as 1.20 / OTP 29. No package
   code changes.
@@ -69,6 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Development
 
+- Line coverage rises from 96.6% to 99.3%, and the enforced floor rises from
+  95% to 99%. The new tests cover error and recovery paths in the
+  facilitator engines, auth-capture, local verification, the payment gate,
+  MCP, HTTP message signatures and SIWX.
 - Credo now runs the [ExSlop](https://hex.pm/packages/ex_slop) checks
   (`.credo.exs`): the recommended set, plus opt-in checks the code already
   passes. CI enforces them through `mix credo --strict`.

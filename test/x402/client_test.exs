@@ -111,6 +111,17 @@ defmodule X402.ClientTest do
       assert Client.select_requirements(payment_required) == {:ok, @evm_requirements}
     end
 
+    test "skips entries without a usable extra map" do
+      no_extra = Map.delete(@evm_requirements, "extra")
+      bad_extra = Map.put(@evm_requirements, "extra", "USDC")
+      payment_required = %{"accepts" => [no_extra, bad_extra, @evm_requirements]}
+
+      assert Client.select_requirements(payment_required) == {:ok, @evm_requirements}
+
+      assert Client.select_requirements([no_extra, bad_extra]) ==
+               {:error, :no_acceptable_requirements}
+    end
+
     test "skips structurally invalid entries and non-map entries" do
       invalid = Map.delete(@evm_requirements, "payTo")
       payment_required = %{"accepts" => ["nope", invalid, @evm_requirements]}
@@ -687,6 +698,20 @@ defmodule X402.ClientTest do
 
       assert Client.build_payment(missing_domain, signer, hooks: ScriptedHooks) ==
                {:ok, recovered}
+    end
+
+    test "on_payment_failure clearing the error keeps the original failure", %{signer: signer} do
+      missing_domain = Map.put(@evm_requirements, "extra", %{})
+
+      Process.put({:hook_script, :on_payment_failure}, fn context, _metadata ->
+        {:cont, %{context | error: nil}}
+      end)
+
+      assert Client.build_payment(missing_domain, signer, hooks: ScriptedHooks) ==
+               {:error, {:missing_extra, "name"}}
+
+      assert_received {:hook, :on_payment_failure, %Context{error: {:missing_extra, "name"}},
+                       _metadata}
     end
 
     test "selection failures return before any hook runs", %{signer: signer} do

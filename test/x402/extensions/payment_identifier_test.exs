@@ -288,6 +288,27 @@ defmodule X402.Extensions.PaymentIdentifierTest do
                PaymentIdentifier.fingerprint(@requirements, %{method: "get", path: "/api"})
     end
 
+    test "renders components that are neither strings, atoms, nor integers with inspect/1" do
+      context = %{method: :get, path: "/api"}
+
+      requirements = %{@requirements | "amount" => 1.5}
+
+      expected =
+        :crypto.hash(:sha256, "exact\neip155:84532\n0xasset\n1.5\n0xreceiver\nget\n/api\n")
+        |> Base.encode16(case: :lower)
+
+      assert PaymentIdentifier.fingerprint(requirements, context) == expected
+
+      listed = %{@requirements | "amount" => [1, 2]}
+
+      expected_listed =
+        :crypto.hash(:sha256, "exact\neip155:84532\n0xasset\n[1, 2]\n0xreceiver\nget\n/api\n")
+        |> Base.encode16(case: :lower)
+
+      assert PaymentIdentifier.fingerprint(listed, context) == expected_listed
+      refute expected == expected_listed
+    end
+
     test "treats absent components as empty strings" do
       assert PaymentIdentifier.fingerprint(%{}, %{}) ==
                PaymentIdentifier.fingerprint(
@@ -429,6 +450,10 @@ defmodule X402.Extensions.PaymentIdentifierTest do
       assert {:error, :invalid_payment_id} = legacy.encode("")
       assert {:error, :invalid_payment_id} = legacy.encode(nil)
       assert {:error, :invalid_payment_id} = legacy.encode(123)
+    end
+
+    test "encode/1 rejects identifiers that cannot be encoded as JSON", %{legacy: legacy} do
+      assert {:error, :invalid_json} = legacy.encode(<<0xFF, 0xFE>>)
     end
 
     test "decode/1 returns payment identifier from encoded payload", %{legacy: legacy} do

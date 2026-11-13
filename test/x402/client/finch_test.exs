@@ -316,6 +316,22 @@ defmodule X402.Client.FinchTest do
                FinchClient.request(finch, url(bypass, "/paid"), signer: signer)
     end
 
+    test "returns a transport error when the Finch pool supervisor exits", %{
+      bypass: bypass,
+      signer: signer
+    } do
+      name = String.to_atom("finch_test_pool_down_#{System.unique_integer([:positive])}")
+      start_supervised!(Supervisor.child_spec({Finch, name: name}, id: name))
+
+      # Starting the pool for a new host needs the pool supervisor; without
+      # it the Finch call exits instead of returning an error tuple.
+      assert :ok =
+               Supervisor.terminate_child(:"#{name}.Supervisor", :"#{name}.PoolSupervisor")
+
+      assert {:error, {:transport_error, {:noproc, _call}}} =
+               FinchClient.request(name, url(bypass, "/paid"), signer: signer)
+    end
+
     test "a hook returning anything but :cancel continues the payment", %{
       bypass: bypass,
       finch: finch,
@@ -647,6 +663,42 @@ defmodule X402.Client.FinchTest do
                )
 
       assert Budget.spent(budget).total == 10_000
+    end
+
+    test "refuses to reserve budget for a payload that lost its accepted requirements", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      defmodule StripAcceptedHooks do
+        @moduledoc false
+        @behaviour X402.Client.Hooks
+
+        @impl X402.Client.Hooks
+        def before_payment(context, _metadata), do: {:cont, context}
+
+        @impl X402.Client.Hooks
+        def after_payment(context, _metadata),
+          do: {:cont, %{context | payload: Map.delete(context.payload, "accepted")}}
+
+        @impl X402.Client.Hooks
+        def on_payment_failure(context, _metadata), do: {:cont, context}
+      end
+
+      budget = start_supervised!({Budget, limit: "15000"})
+
+      Bypass.expect_once(bypass, "GET", "/paid", fn conn ->
+        assert Conn.get_req_header(conn, "payment-signature") == []
+        respond_402(conn)
+      end)
+
+      assert FinchClient.request(finch, url(bypass, "/paid"),
+               signer: signer,
+               budget: budget,
+               hooks: StripAcceptedHooks
+             ) == {:error, :invalid_amount}
+
+      assert Budget.spent(budget) == %{total: 0, per_asset: %{}}
     end
 
     test "validates budget, policies, and hooks options", %{finch: finch, signer: signer} do
@@ -990,6 +1042,59 @@ defmodule X402.Client.FinchTest do
                        }}
 
       refute_received {:siwx, _metadata}
+    end
+
+    test "a fresh challenge that fails origin checks aborts before any payment", %{
+      bypass: bypass,
+      finch: finch,
+      signer: signer
+    } do
+      test_pid = self()
+
+      Bypass.expect(bypass, "GET", "/premium", fn conn ->
+        send(test_pid, {:request, Conn.get_req_header(conn, "payment-signature")})
+
+        case Conn.get_req_header(conn, "sign-in-with-x") do
+          [] ->
+            respond_402_with_challenge(conn, bypass)
+
+          [_proof] ->
+            challenge =
+              SIWX.challenge(
+                domain: "evil.example.com",
+                uri: "http://localhost:#{bypass.port}",
+                supported_chains: [%{chain_id: @evm_chain}]
+              )
+
+            payment_required =
+              Map.put(@payment_required, "extensions", %{"sign-in-with-x" => challenge})
+
+            {:ok, header} = PaymentRequired.encode(payment_required)
+
+            conn
+            |> Conn.put_resp_header("payment-required", header)
+            |> Conn.resp(402, "{}")
+        end
+      end)
+
+      assert FinchClient.request(finch, url(bypass, "/premium"),
+               signer: signer,
+               max_amount: "10000",
+               siwx: [chain_id: @evm_chain]
+             ) == {:error, {:siwx, :domain_mismatch}}
+
+      # Only the unsigned probe and the proof request were sent; no payment.
+      assert_received {:request, []}
+      assert_received {:request, []}
+      refute_received {:request, _payment_signature}
+
+      assert_received {:siwx,
+                       %{
+                         status: :error,
+                         transport: :http,
+                         reason: :domain_mismatch,
+                         chain_id: nil
+                       }}
     end
 
     test "siwx: false and no challenge keep the plain payment flow", %{

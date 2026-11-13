@@ -120,6 +120,28 @@ defmodule X402.AuthCapture.ReceiptTest do
     assert {:ok, _} = Receipt.check(%{receipt | "logs" => [%{}, log]}, identity, expected)
   end
 
+  test "event identity and data must be canonical hex, not merely the right length" do
+    vector = Fixture.vector()
+    expected = event(vector, :authorize)
+    identity = identity(vector)
+    receipt = receipt(expected, identity)
+    [log] = receipt["logs"]
+    [signature, _hash] = expected.topics
+    not_hex = "0x" <> String.duplicate("zz", 32)
+    data_size = byte_size(expected.data) - 2
+
+    for {key, value} <- [
+          {"topics", [signature, not_hex]},
+          {"topics", [not_hex, hd(tl(expected.topics))]},
+          {"data", "0x" <> String.duplicate("z", data_size)}
+        ] do
+      assert Receipt.check(%{receipt | "logs" => [Map.put(log, key, value)]}, identity, expected) ==
+               {:error, :invalid_receipt}
+    end
+
+    assert {:ok, %{outcome: :confirmed}} = Receipt.check(receipt, identity, expected)
+  end
+
   @spec proof(map(), atom()) :: map()
   defp proof(vector, operation) do
     deployment = EVM.deployment(String.to_existing_atom(vector["deployment"]["version"]))
