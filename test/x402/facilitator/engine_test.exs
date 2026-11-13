@@ -991,6 +991,41 @@ defmodule X402.Facilitator.EngineTest do
       assert PendingSettlementStore.get(store, pending_key(payload, requirements)) == :miss
     end
 
+    test "an atom-keyed authorization records the same pending entry as its wire form",
+         context do
+      store = pending_store(__MODULE__.AtomKeyStore)
+      {:ok, queue} = Agent.start_link(fn -> [] end)
+
+      engine =
+        engine(context,
+          pending_settlement_store: store,
+          receipt_timeout_ms: 50,
+          receipt_interval_ms: 10,
+          stub: %{receipt_queue: queue}
+        )
+
+      requirements = requirements()
+      payload = signed_payload(requirements)
+      wire = payload["payload"]["authorization"]
+
+      atom_keyed = %{
+        from: wire["from"],
+        to: wire["to"],
+        value: wire["value"],
+        valid_after: wire["validAfter"],
+        valid_before: wire["validBefore"],
+        nonce: wire["nonce"]
+      }
+
+      atom_payload = put_in(payload, ["payload", "authorization"], atom_keyed)
+
+      assert {:ok, %{"errorReason" => "settlement_pending", "transaction" => @tx_hash}} =
+               Engine.settle(engine, atom_payload, requirements)
+
+      assert {:hit, %{transaction: @tx_hash}} =
+               PendingSettlementStore.get(store, pending_key(payload, requirements))
+    end
+
     test "a mutated retry misses the pending entry instead of burning it", context do
       store = pending_store(__MODULE__.MutationStore)
       {:ok, queue} = Agent.start_link(fn -> [] end)
