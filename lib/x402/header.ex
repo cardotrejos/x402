@@ -7,5 +7,6 @@ defmodule X402.Header do
   @max_header_bytes 8_192
 
   @doc false
+  @spec max_header_bytes() :: pos_integer()
   def max_header_bytes, do: @max_header_bytes
 end

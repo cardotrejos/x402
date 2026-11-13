@@ -113,7 +113,8 @@ defmodule X402.Facilitator.Auth.CDPTest do
                 {"correlation-context", context}
               ]} = Auth.headers(auth, %{method: :post, host: "h", path: "/verify"})
 
-      assert String.starts_with?(context, "sdkLanguage=elixir,source=x402,sourceVersion=")
+      assert context ==
+               "sdkLanguage=elixir,source=x402,sourceVersion=#{Mix.Project.config()[:version]}"
     end
 
     test "builds a valid JWT bound to the request method, host and path", %{auth: auth} do
