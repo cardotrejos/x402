@@ -190,10 +190,11 @@ defmodule X402.Facilitator.Auth.CDP do
   end
 
   defp correlation_context do
+    # Application.spec/2 returns the version as a charlist.
     version =
       case Application.spec(:x402, :vsn) do
-        vsn when is_binary(vsn) -> vsn
-        _ -> "unknown"
+        vsn when is_list(vsn) -> List.to_string(vsn)
+        _not_loaded -> "unknown"
       end
 
     "sdkLanguage=elixir,source=x402,sourceVersion=#{version}"
